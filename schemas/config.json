@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "notice-route/config",
+  "title": "notice-route config",
+  "type": "object",
+  "properties": {
+    "hooks": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": true
+}
