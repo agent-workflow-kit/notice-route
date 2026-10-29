@@ -1,6 +1,6 @@
 [project]
 name = "notice-route"
-version = "0.0.0"
+version = "0.0.1"
 description = "Routes notifications to channel tools by level, source, labels and time."
 readme = "README.md"
 requires-python = ">=3.12"
