@@ -8,7 +8,7 @@
 It must work fully standalone: no dependency on the `awkit` harness, a bus, a shared library or a
 shared contracts package. Its rules are in `docs/interface.md` (the single normative source); `docs/design.md` records why and how it is built.
 
-Safety reminders specific to this tool: config and state are found only from the password-database home (never `HOME` or `XDG_*`); a notifier is called with its own process group, a scrubbed environment and a bounded output reader; payload text never reaches argv or the environment; a payload value reaches a title only when it is plain (an integer, a boolean or a short word-like string) and other text reaches a message only through a rule's `include_text`; `--config` is accepted only by commands that run nothing; never call a notifier's `validate --test-message`.
+Safety reminders specific to this tool: config and state are found only from the password-database home (never `HOME` or `XDG_*`); a notifier is called with its own process group, a scrubbed environment and a bounded output reader; payload text never reaches argv or the environment; a payload value reaches a title only when it is plain (a number, a boolean or a word-like string of letters, digits and `._/#-`) and other text reaches a message only through a rule's `include_text`; `--config` is accepted only by commands that run nothing; no sandboxed session is allowed `notice-route send` (it writes the state directory that `flush` delivers from); never call a notifier's `validate --test-message`.
 
 ## Read first
 
