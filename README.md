@@ -12,12 +12,12 @@ L2 (composite). Works fully standalone; it does not need the `awkit` harness.
 
 ## What it does
 
-A producer's hook (or a script) sends one JSON object on stdin. notice-route finds the first rule that matches it, renders a title, message and link from the rule's template, decides per destination whether to send now, defer (quiet hours or the hourly cap), drop or suppress a repeat, and calls the notifier for each destination to send now. Deferred notices are delivered as one digest per destination by `flush`, which also retries failures. Everything it did is in `history`.
+A producer's hook (or a script) sends one JSON object on stdin. notice-route finds the first rule that matches it, renders a title, message and link from the rule's template (or, for a pass-through rule, sends a notice's own title and message), decides per destination whether to send now, defer (quiet hours or the hourly cap), drop or suppress a repeat, and calls the notifier for each destination to send now. Deferred notices are delivered as one digest per destination by `flush`, which also retries failures. Everything it did is in `history`.
 
 - Two input shapes, told apart by keys: a hook payload (has string `tool` and `hook`) or a channel notice (`title`, `message`, `level`, `link`).
 - Rules are an ordered list; the first match wins. A rule names destinations, a level and templates, or drops the notification.
 - Levels are ordered `info < warn < action < error`. The rule sets the level. In a destination's quiet window `info` is dropped, `warn` and `action` are deferred and `error` is delivered at once.
-- Titles never contain untrusted text. Free-text payload fields (an agent's report, a summary) are left out of notifications unless a rule opts in and the payload says it is not third-party or tainted.
+- Payload text never reaches a title: only short word-like values do. Free text reaches a message only when a rule opts in and the payload says it is not third-party or tainted.
 - Links are built only from your own host tables, never from a payload field.
 - It never sends a message to a destination it was not configured for, and never calls a notifier's `--test-message`.
 
@@ -39,11 +39,11 @@ Specified in [docs/interface.md](docs/interface.md#commands).
 
 ## Configuration
 
-`~/.config/notice-route/config.yaml` plus `config.d/*.yaml`, found only from your home directory in the password database (an environment variable cannot redirect it). The directory and files must be owned by you and not group- or world-writable. [config.example.yaml](config.example.yaml) is a complete worked configuration. Credentials for the notifiers are passed only through the variables a destination names, so under cron they must be in the env file the cron line sources.
+`~/.config/notice-route/config.yaml` plus `config.d/*.yaml`, found only from your home directory in the password database (an environment variable cannot redirect it). The directory and files must be owned by you and not group- or world-writable. [config.example.yaml](config.example.yaml) is a complete worked configuration, and [examples/awkit-wiring.yaml](examples/awkit-wiring.yaml) is its rules as a `config.d` drop-in for the awkit producers. Credentials are passed only through the variables a destination names, so a send that runs without them is delivered by `flush` from cron, whose env file must hold them.
 
 ## Wiring a producer
 
-One line in the producer's own config, for example `notice-route send --source agent-spawn --stdin-json` on its `post-state-change` hook. Wire either agent-spawn's or claude-session's state hooks to notifications, not both. Do not expose the notifiers or the router's `--config` to an agent profile.
+One line in the producer's own config, for example `notice-route send --source agent-spawn --stdin-json` on its `post-state-change` hook. Wire either agent-spawn's or claude-session's state hooks to notifications, not both. An agent profile may allow `notice-route send` and nothing else from this tool; never a notifier.
 
 ## Dependencies
 

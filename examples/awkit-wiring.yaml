@@ -1,0 +1,169 @@
+# A config.d drop-in: copy to ~/.config/notice-route/config.d/ after defining destinations phone,
+# team-chat and desktop in config.yaml. It holds rules only (a drop-in appends rules and refuses
+# any other key defined twice), and its rule names must not be used in your own config.
+# It is the rules block of config.example.yaml; CI keeps the two equal and renders every rule.
+
+rules:
+  # A launch is not worth a notification. drop allows only name and match.
+  - name: launch-drop
+    match:
+      source: agent-spawn
+      hook: post-launch
+    drop: true
+
+  - name: agent-done
+    match:
+      source: agent-spawn
+      hook: post-state-change
+      where:
+        state: reported
+    notify: [team-chat]
+    level: info
+    title: "Agent done"
+    message: "Agent {{object_id}} reported (state {{state}})."
+
+  # Attention is routed from post-escalate only: it fires once when needs_attention changes,
+  # while post-state-change repeats needs_attention on every later event.
+  - name: agent-failed
+    match:
+      source: agent-spawn
+      hook: post-escalate
+      where:
+        needs_attention: failed
+    notify: [phone, team-chat]
+    level: error
+    title: "Agent failed"
+    message: "Agent {{object_id}} failed."
+
+  # Covers needs-input too: a needs-input outcome sets needs_attention to escalated.
+  - name: agent-escalated
+    match:
+      source: agent-spawn
+      hook: post-escalate
+    notify: [phone, desktop]
+    level: action
+    title: "Agent needs attention"
+    message: "Agent {{object_id}} needs attention ({{needs_attention}})."
+    dedup_window: 30m
+
+  - name: review-draft-ready
+    match:
+      source: review-watch
+      hook: post-draft
+    notify: [team-chat]
+    level: info
+    title: "Review draft ready"
+    message: "Draft {{draft_id}} for {{pr}} is ready (tier {{tier}})."
+    link: "{{pr_url}}"
+
+  - name: review-escalated
+    match:
+      source: review-watch
+      hook: post-attention
+      where:
+        reason: escalated
+    notify: [phone, team-chat]
+    level: action
+    title: "Review escalated"
+    message: "Review attention ({{reason}}) for {{object_id}}."
+    link: "{{pr_url}}"
+
+  - name: review-failed
+    match:
+      source: review-watch
+      hook: post-attention
+      where:
+        reason: failed
+    notify: [phone, team-chat]
+    level: error
+    title: "Review failed"
+    message: "Review attention ({{reason}}) for {{object_id}}."
+    link: "{{pr_url}}"
+
+  - name: ticket-attention
+    match:
+      source: ticket-work
+      hook: post-attention
+    notify: [phone, team-chat]
+    level: action
+    title: "Ticket needs attention"
+    message: "Ticket {{key}} needs attention ({{reason}}, phase {{phase}})."
+    link: "{{ticket_url}}"
+
+  - name: ticket-pending
+    match:
+      source: ticket-work
+      hook: post-pending
+    notify: [phone, team-chat]
+    level: action
+    title: "Confirmation pending"
+    message: "Ticket {{key}} has a pending {{action}} confirmation."
+    link: "{{ticket_url}}"
+
+  - name: ticket-start-failed
+    match:
+      source: ticket-work
+      hook: post-start-failed
+    notify: [phone, team-chat]
+    level: error
+    title: "Ticket start failed"
+    message: "Starting ticket {{key}} failed."
+    link: "{{ticket_url}}"
+
+  - name: job-held
+    match:
+      source: jobsctl
+      hook: post-held
+    notify: [phone, team-chat]
+    level: action
+    title: "Job held"
+    message: "Job {{object_id}} (attempt {{attempt.attempt}}) is held."
+
+  # job.status queued is also a failure, with a retry scheduled: only a final failure is routed.
+  - name: job-failed
+    match:
+      source: jobsctl
+      hook: post-fail
+      where:
+        job.status: failed
+    notify: [phone, team-chat]
+    level: error
+    title: "Job failed"
+    message: "Job {{object_id}} failed (attempt {{attempt.attempt}})."
+
+  - name: pr-approved
+    match:
+      source: pr-watch
+      hook: on-approved
+    notify: [team-chat]
+    level: info
+    title: "PR approved"
+    message: "{{pr}} was approved by {{reviewer.login}}."
+    link: "{{pr_url}}"
+
+  - name: pr-changes-requested
+    match:
+      source: pr-watch
+      hook: on-changes_requested
+    notify: [team-chat]
+    level: warn
+    title: "Changes requested"
+    message: "{{reviewer.login}} requested changes on {{pr}}."
+    link: "{{pr_url}}"
+
+  # The router's own failure alerts (source notice-route). Delivered by the next flush.
+  - name: router-failures
+    match:
+      source: notice-route
+      hook: post-fail
+    notify: [team-chat]
+    level: warn
+    title: "Notification channel failed"
+    message: "Destination {{object_id}} ({{kind}}): {{code}}, {{outcome}} after {{attempts}} attempts."
+
+  # A pass-through rule: a notice of level error from any source goes to the phone with its own
+  # title and message.
+  - name: direct-errors
+    match:
+      level_min: error
+    notify: [phone]

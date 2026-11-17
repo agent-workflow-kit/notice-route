@@ -37,6 +37,10 @@
           "drop": {
             "type": "boolean"
           },
+          "pass_through": {
+            "type": "boolean",
+            "description": "True for a rule without message: it must have level_min and sends a channel notice's own title and message."
+          },
           "dedup_window_s": {
             "type": [
               "number",
@@ -53,7 +57,53 @@
           "destinations",
           "level",
           "drop",
+          "pass_through",
           "dedup_window_s"
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "pass_through": {
+                  "const": true
+                }
+              },
+              "required": [
+                "pass_through"
+              ]
+            },
+            "then": {
+              "properties": {
+                "drop": {
+                  "const": false
+                },
+                "match": {
+                  "required": [
+                    "level_min"
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "drop": {
+                  "const": true
+                }
+              },
+              "required": [
+                "drop"
+              ]
+            },
+            "then": {
+              "properties": {
+                "pass_through": {
+                  "const": false
+                }
+              }
+            }
+          }
         ]
       }
     },

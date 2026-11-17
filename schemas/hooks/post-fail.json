@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "notice-route/hooks/post-fail.json",
   "title": "post-fail hook payload (stdin)",
-  "description": "Fired after a destination's failure was surfaced (once per code and destination per day, plus rate_limited once per destination per hour). Carries no title, message, link or payload text.",
+  "description": "Fired after a destination's failure was surfaced (at most once per code and destination per UTC day, rate_capped once per destination per UTC hour). Carries no title, message, link or payload text. The router also routes this payload through its own rules as source notice-route.",
   "type": "object",
   "properties": {
     "tool": {
@@ -18,7 +18,17 @@
       "$ref": "../defs.json#/$defs/destination_name"
     },
     "event_id": {
-      "$ref": "../defs.json#/$defs/event_id"
+      "type": "integer",
+      "minimum": 1,
+      "description": "The id of the failing deliveries row."
+    },
+    "labels": {
+      "type": "array",
+      "items": {
+        "$ref": "../defs.json#/$defs/label"
+      },
+      "x-untrusted": true,
+      "maxItems": 96
     },
     "code": {
       "$ref": "../defs.json#/$defs/notifier_code"
@@ -26,7 +36,10 @@
     "outcome": {
       "enum": [
         "failed",
-        "unknown"
+        "unknown",
+        "deferred",
+        "dropped",
+        "expired"
       ]
     },
     "attempts": {
@@ -51,11 +64,71 @@
     "object_type",
     "object_id",
     "event_id",
+    "labels",
     "code",
     "outcome",
     "attempts",
     "source",
     "level",
     "kind"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "deferred"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "code": {
+            "const": "rate_capped"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "dropped"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "code": {
+            "const": "overflow"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "expired"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "code": {
+            "const": "expired"
+          }
+        }
+      }
+    }
   ]
 }

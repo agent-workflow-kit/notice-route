@@ -27,6 +27,10 @@
           "type": "integer",
           "minimum": 0
         },
+        "rate": {
+          "type": "integer",
+          "minimum": 0
+        },
         "queue": {
           "type": "integer",
           "minimum": 0
@@ -38,8 +42,10 @@
         "event_ids",
         "dedup",
         "surfaced",
+        "rate",
         "queue"
-      ]
+      ],
+      "description": "Rows deleted per table: history is the deliveries table, rate the counters of past hours, queue the rows 24 hours old or more."
     }
   },
   "additionalProperties": false,

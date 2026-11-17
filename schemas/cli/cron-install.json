@@ -13,7 +13,8 @@
     },
     "block": {
       "type": "string",
-      "description": "The managed block as it is in the crontab after the command, or would be with --dry-run."
+      "pattern": "^\\#\\ notice\\-route\\ managed\\ v1\\ flush=1m\\n[\\s\\S]*\\#\\ notice\\-route\\ managed\\ end\\n?(?![\\s\\S])",
+      "description": "The managed block as it is in the crontab after the command, or would be with --dry-run: the line '# notice-route managed v1 flush=1m' first and '# notice-route managed end' last."
     },
     "dry_run": {
       "type": "boolean"

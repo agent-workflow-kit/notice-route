@@ -2,13 +2,13 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "notice-route/cli/validate.json",
   "title": "validate --json output",
-  "description": "Exit 0 (ok) and exit 12 (a probe failed). A config that does not load is exit 2 and prints the error envelope instead.",
+  "description": "Exit 0 (ok) and exit 12 (failed: a cmd_ok or probe check failed). A config that does not load is exit 2 and prints the error envelope instead; no config is exit 22.",
   "type": "object",
   "properties": {
     "outcome": {
       "enum": [
         "ok",
-        "probe_failed"
+        "failed"
       ]
     },
     "probe": {
@@ -25,7 +25,7 @@
           },
           "cmd_ok": {
             "type": "boolean",
-            "description": "cmd[0] exists and is acceptable."
+            "description": "cmd[0] and its parent directories pass the ownership and mode check."
           },
           "env_unset": {
             "type": "array",
@@ -75,6 +75,14 @@
                 "type": "null"
               }
             ]
+          },
+          "surfaced_today": {
+            "type": "array",
+            "items": {
+              "$ref": "../defs.json#/$defs/notifier_code"
+            },
+            "uniqueItems": true,
+            "description": "Codes surfaced for this destination in the current UTC day, read from state.db read-only."
           }
         },
         "additionalProperties": false,
@@ -82,7 +90,8 @@
           "name",
           "cmd_ok",
           "env_unset",
-          "probe"
+          "probe",
+          "surfaced_today"
         ]
       }
     },
@@ -96,11 +105,8 @@
               "destination_unused",
               "rule_without_level",
               "rule_unreachable",
-              "unknown_template_field",
-              "dedup_window_over_cap_hour",
-              "timeout_shorter_than_notifier",
               "worst_case_over_hook_timeout",
-              "duplicate_wiring"
+              "cron_block_missing"
             ]
           },
           "rule": {
@@ -157,7 +163,7 @@
       "if": {
         "properties": {
           "outcome": {
-            "const": "probe_failed"
+            "const": "failed"
           }
         },
         "required": [
@@ -166,8 +172,64 @@
       },
       "then": {
         "properties": {
+          "destinations": {
+            "contains": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "cmd_ok": {
+                      "const": false
+                    }
+                  },
+                  "required": [
+                    "cmd_ok"
+                  ]
+                },
+                {
+                  "properties": {
+                    "probe": {
+                      "type": "object",
+                      "properties": {
+                        "status": {
+                          "const": "failed"
+                        }
+                      },
+                      "required": [
+                        "status"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "probe"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
           "probe": {
-            "const": true
+            "const": false
+          }
+        },
+        "required": [
+          "probe"
+        ]
+      },
+      "then": {
+        "properties": {
+          "destinations": {
+            "items": {
+              "properties": {
+                "probe": {
+                  "type": "null"
+                }
+              }
+            }
           }
         }
       }

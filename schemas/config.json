@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "notice-route/config.json",
   "title": "notice-route config",
-  "description": ".config/notice-route/config.yaml under the home directory from the password database (HOME and XDG_CONFIG_HOME are not read; an unusable home directory is exit 2 with key home) plus config.d/*.yaml beside it in lexical order (maps merge, hook lists append). Invalid config exits 2 (config_invalid), naming the key. Files are parsed with a strict YAML loader (no anchors, aliases or explicit tags, no duplicate keys; yes, on and dates are strings). Constraints between keys (a rule's destinations exist, unique rule names, a quiet name exists, ranges of durations) are checked by the loader and by validate, not by this schema. Self-contained: no external references.",
+  "description": ".config/notice-route/config.yaml under the home directory from the password database (HOME and XDG_CONFIG_HOME are not read; an unusable home directory is exit 2 with key home) plus config.d/*.yaml beside it in lexical order (rules and hooks.post-fail lists append; a rule name used twice or any other key defined in two files is config_invalid). A drop-in that holds only rules is valid against this schema. Invalid config exits 2 (config_invalid), naming the key. Files are parsed with a strict YAML loader (no anchors, aliases or explicit tags, no duplicate keys; yes, on and dates are strings). Constraints between keys (a rule's destinations exist, unique rule names, a quiet name exists, ranges of durations, retention of at least 1d, time zones, end different from start) are checked by the loader and by validate, not by this schema. Self-contained: no external references.",
   "$defs": {
     "destination_kind": {
       "enum": [
@@ -61,7 +61,7 @@
     "quiet_name": {
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9_-]{0,31}(?![\\s\\S])",
-      "description": "The name of a quiet_hours window (same shape as a destination name; the interface names no pattern)."
+      "description": "The name of a quiet_hours window (the destination name grammar)."
     },
     "rule_match": {
       "type": "object",
@@ -106,7 +106,7 @@
           },
           "minProperties": 1,
           "maxProperties": 16,
-          "description": "A map from payload field name (top-level or dotted scalar path) to a string, integer or boolean; every pair must equal. Never matches a channel notice."
+          "description": "A map from payload field path to a string, integer or boolean; every pair must equal (same JSON type and value). Applies to hook payloads only; a condition that does not apply to a shape never matches it."
         },
         "level_min": {
           "$ref": "#/$defs/level"
@@ -138,7 +138,7 @@
           }
         }
       ],
-      "description": "All present conditions must hold. An empty match matches everything. level_min never matches a hook payload and may not be combined with hook or where."
+      "description": "All present conditions must hold. An empty match matches everything. source and labels apply to both shapes; hook, repo and where to hook payloads only; level_min to channel notices only (a notice without level counts as info) and may not be combined with hook or where."
     },
     "rule_name": {
       "type": "string",
@@ -150,11 +150,16 @@
       "minLength": 1,
       "maxLength": 256,
       "pattern": "^[^*]*\\*?(?![\\s\\S])",
-      "description": "An exact value, or a value ending in one * (prefix match). A * is allowed only as the last character; matching is case-sensitive."
+      "description": "An exact value of 1 to 256 characters, or a value ending in one * (prefix match; a lone * matches any present value). A * is allowed only as the last character (** or an inner * is config_invalid); matching is case-sensitive."
     }
   },
   "type": "object",
   "properties": {
+    "enabled": {
+      "type": "boolean",
+      "default": true,
+      "description": "false makes send exit 22 (disabled) before reading state and flush do nothing."
+    },
     "destinations": {
       "type": "object",
       "propertyNames": {
@@ -173,7 +178,7 @@
               {
                 "type": "string",
                 "pattern": "^/[^\\x00]+(?![\\s\\S])",
-                "description": "An absolute path to an executable owned by the user or root and not group- or world-writable (checked at load and at each call)."
+                "description": "An absolute path (load error otherwise). At each call the file and every parent directory must be owned by the user or root and not group- or world-writable, and the file must have no setuid or setgid bit (else exec_failed)."
               }
             ],
             "items": {
@@ -186,12 +191,13 @@
                 "pattern": "^(?:send|--stdin-json|--json|--actor|--dedupe-key)(?:=[\\s\\S]*)?(?![\\s\\S])"
               }
             },
-            "description": "An argv list; no shell. The notifier's --config <path> belongs here. It may not contain send, --stdin-json, --json, --actor or --dedupe-key (config_invalid)."
+            "maxItems": 32,
+            "description": "An argv list of at most 32 elements of at most 4096 characters; no shell. cmd[0] is absolute; the ownership and mode check runs at each call. The notifier's --config <path> belongs here. An element equal to send, --stdin-json, --json, --actor or --dedupe-key, or starting with one of those flags and =, is config_invalid."
           },
           "timeout": {
             "$ref": "#/$defs/duration",
             "default": "10s",
-            "description": "The notifier's own timeout; must equal what the notifier's config says. Range 3s to 120s. The kill deadline is this plus 10 s."
+            "description": "The notifier's own timeout or more (the router does not pass it). Range 1s to 120s. The kill deadline is this plus 10 s."
           },
           "floor": {
             "$ref": "#/$defs/level",
@@ -207,7 +213,7 @@
             "minimum": 0,
             "maximum": 3600,
             "default": 30,
-            "description": "Sliding-hour cap on sent or unknown notifications; 0 disables it."
+            "description": "Notifier calls started per UTC clock hour, counted separately for error and for the other levels; 0 means no cap."
           },
           "env": {
             "type": "array",
@@ -215,12 +221,18 @@
               "type": "string",
               "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}(?![\\s\\S])",
               "not": {
-                "pattern": "^(?:HOME|PATH|IFS|ENV|BASH_ENV|OPENSSL_CONF|SSL_CERT_FILE|SSL_CERT_DIR)|(?:LD_|PYTHON|XDG_|LC_|NOTICE_ROUTE_)[A-Za-z0-9_]*|(?:[Hh][Tt][Tt][Pp][Ss]?|[Aa][Ll][Ll]|[Nn][Oo]|[Ff][Tt][Pp]|[Ss][Oo][Cc][Kk][Ss])_[Pp][Rr][Oo][Xx][Yy](?![\\s\\S])"
+                "enum": [
+                  "PATH",
+                  "LANG",
+                  "LC_ALL",
+                  "WSL_INTEROP",
+                  "WSL_DISTRO_NAME"
+                ]
               }
             },
             "uniqueItems": true,
             "default": [],
-            "description": "The only variables passed to the notifier besides the fixed set. May not name HOME, PATH, IFS, ENV, BASH_ENV, OPENSSL_CONF, SSL_CERT_FILE, SSL_CERT_DIR, a proxy variable, or start with LD_, PYTHON, XDG_, LC_ or NOTICE_ROUTE_."
+            "description": "The only variables passed to the notifier besides the fixed set (PATH, LANG, LC_ALL, WSL_INTEROP, WSL_DISTRO_NAME), which may not be named. The names are trusted configuration. A send that finds one unset defers the notification to flush."
           },
           "enabled": {
             "type": "boolean",
@@ -250,7 +262,7 @@
             "minLength": 1,
             "maxLength": 64,
             "pattern": "^[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+){0,2}(?![\\s\\S])",
-            "description": "Required IANA zone name; no default and no reading of the system zone. An unknown name is config_invalid."
+            "description": "Required IANA zone name; no default and no reading of the system zone. Loaded only from the system database; localtime, posixrules, Factory and any name that fails to load are config_invalid."
           },
           "days": {
             "type": "array",
@@ -287,7 +299,7 @@
           "end": {
             "type": "string",
             "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9](?![\\s\\S])",
-            "description": "HH:MM; equal to or earlier than start means the window ends the next day."
+            "description": "HH:MM; earlier than start means the window ends the next day; equal to start is config_invalid (checked by the loader)."
           }
         },
         "required": [
@@ -305,7 +317,8 @@
         "hosts": {
           "type": "object",
           "propertyNames": {
-            "pattern": "^[a-z0-9][a-z0-9.-]{0,252}(?![\\s\\S])"
+            "maxLength": 259,
+            "pattern": "^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?(?![\\s\\S])"
           },
           "additionalProperties": {
             "enum": [
@@ -313,7 +326,7 @@
               "gitlab"
             ]
           },
-          "description": "Host name (lowercase) to forge type; builds pr_url."
+          "description": "<host>[:<port>] (lowercase, the pr grammar) to forge type; builds pr_url."
         },
         "tickets": {
           "type": "object",
@@ -339,7 +352,7 @@
         "properties": {
           "name": {
             "$ref": "#/$defs/rule_name",
-            "description": "Required, unique among rules (uniqueness is checked by the loader)."
+            "description": "Required, unique among rules and across drop-ins (uniqueness is checked by the loader)."
           },
           "match": {
             "$ref": "#/$defs/rule_match"
@@ -347,7 +360,7 @@
           "drop": {
             "type": "boolean",
             "default": false,
-            "description": "When true, no other key except name and match is allowed; the outcome is dropped with reason rule_drop."
+            "description": "When true, no other key except name and match is allowed; the outcome is dropped with reason rule_drop, one history row without a destination."
           },
           "notify": {
             "type": "array",
@@ -361,34 +374,38 @@
           },
           "level": {
             "$ref": "#/$defs/level",
-            "description": "The final level when set; else the channel notice's own level, else info. A rule that can match hook payloads should set one."
+            "description": "The final level when set; else the channel notice's own level, else info. A rule without level and without level_min draws a validate warning."
           },
           "title": {
             "type": "string",
             "minLength": 1,
             "maxLength": 2000,
-            "pattern": "^(?:(?!\\{\\{)[\\s\\S]|\\{\\{[A-Za-z_][A-Za-z0-9_]{0,63}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,3}\\}\\})*(?![\\s\\S])",
-            "description": "Template for the title, optional. A {{name}} token naming a deny-listed field (report, message, summary, details, output_tail, error, or below one, also under payload.) is config_invalid.",
-            "not": {
-              "pattern": "\\{\\{(?:payload\\.)?(?:report|message|summary|details|output_tail|error)(?:\\.[A-Za-z0-9_.]+)?\\}\\}"
-            }
+            "pattern": "^(?:(?!\\{\\{)[\\s\\S]|\\{\\{(?:labels\\.[a-z0-9][a-z0-9_.-]{0,63}|(?!labels\\.)[A-Za-z_][A-Za-z0-9_]{0,63}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,3})\\}\\})*(?![\\s\\S])",
+            "description": "Template for the title, optional; needs message. A token renders a payload value only when it is plain (an integer, a boolean or a string matching [A-Za-z0-9][A-Za-z0-9._/#@+=-]{0,63}); other text renders empty in a title. The rendered title is cut to 256 characters."
           },
           "message": {
             "type": "string",
             "minLength": 1,
             "maxLength": 2000,
-            "pattern": "^(?:(?!\\{\\{)[\\s\\S]|\\{\\{[A-Za-z_][A-Za-z0-9_]{0,63}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,3}\\}\\})*(?![\\s\\S])",
-            "description": "Template for the message. Required unless drop. A token naming a deny-listed field is config_invalid unless include_text lists that top-level name."
+            "pattern": "^(?:(?!\\{\\{)[\\s\\S]|\\{\\{(?:labels\\.[a-z0-9][a-z0-9_.-]{0,63}|(?!labels\\.)[A-Za-z_][A-Za-z0-9_]{0,63}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,3})\\}\\})*(?![\\s\\S])",
+            "description": "Template for the message; a rule without message is a pass-through rule and must have match.level_min. Text values render only through include_text. The rendered message is cut to 4000 characters."
           },
           "link": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 2000,
-            "pattern": "^(?:(?!\\{\\{)[\\s\\S]|\\{\\{[A-Za-z_][A-Za-z0-9_]{0,63}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,3}\\}\\})*(?![\\s\\S])",
-            "description": "Template for the link, optional; usually {{pr_url}} or {{ticket_url}}. A token naming a deny-listed field is config_invalid. A link that renders empty means no link.",
-            "not": {
-              "pattern": "\\{\\{(?:payload\\.)?(?:report|message|summary|details|output_tail|error)(?:\\.[A-Za-z0-9_.]+)?\\}\\}"
-            }
+            "anyOf": [
+              {
+                "enum": [
+                  "{{pr_url}}",
+                  "{{ticket_url}}"
+                ]
+              },
+              {
+                "type": "string",
+                "minLength": 9,
+                "maxLength": 1024,
+                "pattern": "^https://(?:(?!\\{\\{)[!-~])+(?![\\s\\S])"
+              }
+            ],
+            "description": "Exactly {{pr_url}}, exactly {{ticket_url}}, or a literal https URL of 1 to 1024 printable ASCII characters with no token. A link that renders empty means no link."
           },
           "dedup_window": {
             "$ref": "#/$defs/duration_long",
@@ -397,18 +414,13 @@
           "include_text": {
             "type": "array",
             "items": {
-              "enum": [
-                "report",
-                "message",
-                "summary",
-                "details",
-                "output_tail",
-                "error"
-              ]
+              "type": "string",
+              "pattern": "^(?:labels\\.[a-z0-9][a-z0-9_.-]{0,63}|(?!labels\\.)[A-Za-z_][A-Za-z0-9_]{0,63}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,3})(?![\\s\\S])"
             },
             "minItems": 1,
+            "maxItems": 16,
             "uniqueItems": true,
-            "description": "Opt-in for untrusted text in the message: deny-listed top-level field names. The text is inserted only when the payload has reads_third_party false and tainted false."
+            "description": "Opt-in for untrusted text in the message: token paths. The text of a listed token renders only when the payload has reads_third_party false and tainted false as booleans. An entry that no message token uses has no effect."
           }
         },
         "required": [
@@ -416,6 +428,11 @@
           "match"
         ],
         "additionalProperties": false,
+        "dependentRequired": {
+          "title": [
+            "message"
+          ]
+        },
         "allOf": [
           {
             "if": {
@@ -439,153 +456,24 @@
             },
             "else": {
               "required": [
-                "notify",
-                "message"
-              ]
-            }
-          },
-          {
-            "if": {
-              "properties": {
-                "message": {
-                  "pattern": "\\{\\{(?:payload\\.)?(?:report)(?:\\.[A-Za-z0-9_.]+)?\\}\\}"
-                }
-              },
-              "required": [
-                "message"
-              ]
-            },
-            "then": {
-              "required": [
-                "include_text"
+                "notify"
               ],
-              "properties": {
-                "include_text": {
-                  "contains": {
-                    "const": "report"
+              "anyOf": [
+                {
+                  "required": [
+                    "message"
+                  ]
+                },
+                {
+                  "properties": {
+                    "match": {
+                      "required": [
+                        "level_min"
+                      ]
+                    }
                   }
                 }
-              }
-            }
-          },
-          {
-            "if": {
-              "properties": {
-                "message": {
-                  "pattern": "\\{\\{(?:payload\\.)?(?:message)(?:\\.[A-Za-z0-9_.]+)?\\}\\}"
-                }
-              },
-              "required": [
-                "message"
               ]
-            },
-            "then": {
-              "required": [
-                "include_text"
-              ],
-              "properties": {
-                "include_text": {
-                  "contains": {
-                    "const": "message"
-                  }
-                }
-              }
-            }
-          },
-          {
-            "if": {
-              "properties": {
-                "message": {
-                  "pattern": "\\{\\{(?:payload\\.)?(?:summary)(?:\\.[A-Za-z0-9_.]+)?\\}\\}"
-                }
-              },
-              "required": [
-                "message"
-              ]
-            },
-            "then": {
-              "required": [
-                "include_text"
-              ],
-              "properties": {
-                "include_text": {
-                  "contains": {
-                    "const": "summary"
-                  }
-                }
-              }
-            }
-          },
-          {
-            "if": {
-              "properties": {
-                "message": {
-                  "pattern": "\\{\\{(?:payload\\.)?(?:details)(?:\\.[A-Za-z0-9_.]+)?\\}\\}"
-                }
-              },
-              "required": [
-                "message"
-              ]
-            },
-            "then": {
-              "required": [
-                "include_text"
-              ],
-              "properties": {
-                "include_text": {
-                  "contains": {
-                    "const": "details"
-                  }
-                }
-              }
-            }
-          },
-          {
-            "if": {
-              "properties": {
-                "message": {
-                  "pattern": "\\{\\{(?:payload\\.)?(?:output_tail)(?:\\.[A-Za-z0-9_.]+)?\\}\\}"
-                }
-              },
-              "required": [
-                "message"
-              ]
-            },
-            "then": {
-              "required": [
-                "include_text"
-              ],
-              "properties": {
-                "include_text": {
-                  "contains": {
-                    "const": "output_tail"
-                  }
-                }
-              }
-            }
-          },
-          {
-            "if": {
-              "properties": {
-                "message": {
-                  "pattern": "\\{\\{(?:payload\\.)?(?:error)(?:\\.[A-Za-z0-9_.]+)?\\}\\}"
-                }
-              },
-              "required": [
-                "message"
-              ]
-            },
-            "then": {
-              "required": [
-                "include_text"
-              ],
-              "properties": {
-                "include_text": {
-                  "contains": {
-                    "const": "error"
-                  }
-                }
-              }
             }
           }
         ]
@@ -608,7 +496,7 @@
     },
     "lock_wait": {
       "$ref": "#/$defs/duration",
-      "default": "5s",
+      "default": "2s",
       "description": "How long a send polls for a destination's lock; range 1s to 60s."
     },
     "retention": {
@@ -617,12 +505,12 @@
         "history": {
           "$ref": "#/$defs/duration_long",
           "default": "30d",
-          "description": "Age at which prune deletes history rows."
+          "description": "Age at which prune deletes history rows; at least 1d (checked by the loader)."
         },
         "event_ids": {
           "$ref": "#/$defs/duration_long",
           "default": "14d",
-          "description": "Age at which prune forgets event ids."
+          "description": "Age at which prune forgets event ids; at least 1d (checked by the loader)."
         }
       },
       "additionalProperties": false
@@ -659,7 +547,7 @@
         }
       },
       "additionalProperties": false,
-      "description": "Hook entries per hook as in the design guide; lists from config.d append."
+      "description": "Hook entries per hook as in the design guide: exactly cmd, timeout and async; lists from config.d append."
     },
     "cron": {
       "type": "object",

@@ -21,7 +21,7 @@
     "quiet_name": {
       "type": "string",
       "pattern": "^[a-z0-9][a-z0-9_-]{0,31}(?![\\s\\S])",
-      "description": "The name of a quiet_hours window (same shape as a destination name; the interface names no pattern)."
+      "description": "The name of a quiet_hours window (the destination name grammar)."
     },
     "source_name": {
       "type": "string",
@@ -37,9 +37,8 @@
     },
     "hook_name": {
       "type": "string",
-      "minLength": 1,
-      "maxLength": 128,
-      "description": "The hook name of a hook payload. The interface sets no pattern, so the router reports it as received (cut to 128 characters); untrusted where it comes from a payload."
+      "pattern": "^[a-z][a-z0-9_-]{0,63}(?![\\s\\S])",
+      "description": "The hook name of a hook payload: [a-z][a-z0-9_-]{0,63} (else payload_invalid with pointer /hook); untrusted where it comes from a payload."
     },
     "label_key": {
       "type": "string",
@@ -122,7 +121,7 @@
           "maxLength": 256
         }
       ],
-      "description": "A producer's event id: an integer or a string of at most 256 characters, as the producers define it."
+      "description": "A producer's event id: an integer (a boolean is not one) or a string of 1 to 256 characters. The redelivery key compares its JSON text, so 17 and \"17\" differ."
     },
     "destination_kind": {
       "enum": [
@@ -156,37 +155,74 @@
         "disabled",
         "failed",
         "unknown",
+        "sending",
         "expired"
       ],
-      "description": "A destination outcome as recorded in history and the log; expired (a deferred row older than 24 hours when due) is added by flush."
+      "description": "A destination outcome as recorded in history: the eight of send plus sending (a row whose call is in progress or whose process died; never in send output) and expired (a queue row 24 hours old or more)."
+    },
+    "log_outcome": {
+      "enum": [
+        "sent",
+        "deferred",
+        "queued_retry",
+        "suppressed",
+        "dropped",
+        "disabled",
+        "failed",
+        "unknown",
+        "expired"
+      ],
+      "description": "A destination outcome as logged: the eight of send plus expired."
+    },
+    "history_reason": {
+      "enum": [
+        "below_floor",
+        "quiet",
+        "rate_capped",
+        "overflow",
+        "lock_busy",
+        "env_missing",
+        "rule_drop",
+        "no_rule",
+        "digest",
+        "link_refused",
+        "keyword_refused"
+      ],
+      "description": "The closed reasons of history rows."
     },
     "destination_reason": {
       "enum": [
         "below_floor",
         "quiet",
-        "redelivered",
-        "repeat",
-        "rate_limited",
+        "rate_capped",
         "overflow",
         "lock_busy",
-        "rule_drop"
+        "env_missing",
+        "rule_drop",
+        "no_rule",
+        "digest",
+        "link_refused",
+        "keyword_refused",
+        "redelivered",
+        "repeat"
       ],
-      "description": "A fixed reason string: below_floor, quiet, redelivered, repeat, rate_limited, overflow, lock_busy, rule_drop."
+      "description": "The closed reasons of send output and the log: the history reasons plus redelivered and repeat."
     },
     "notifier_code": {
       "type": "string",
       "pattern": "^[a-z][a-z0-9_]{0,63}(?![\\s\\S])",
       "x-untrusted": true,
-      "description": "Untrusted. A notifier's error.code (read from its envelope and checked against this shape) or a router code: retries_exhausted, rate_limited, deployment_fault, exec_failed, output_overflow, killed."
+      "description": "Untrusted. A notifier's error.code or refusal reason (read from its envelope and checked against this shape) or a router code: retries_exhausted, rate_capped, deployment_fault, exec_failed, output_overflow, killed, signal, expired, overflow."
     },
     "noop_reason": {
       "enum": [
         "unconfigured",
         "no_rule",
         "all_disabled",
-        "disabled"
+        "disabled",
+        "rule_drop"
       ],
-      "description": "Exit 22."
+      "description": "Why no destination was called at the top level of send and test: unconfigured, no_rule, all_disabled, disabled (exit 22) or rule_drop (exit 0)."
     },
     "error_code": {
       "enum": [
@@ -217,12 +253,12 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 4096,
-          "description": "config_invalid and config_unsafe: the config key (dotted path), --config, home, or the file path."
+          "description": "config_invalid and config_unsafe: a key path, home, --config, or the file path relative to the config directory (config_unsafe and unreadable files)."
         },
         "pointer": {
           "type": "string",
-          "pattern": "^(?:|/[A-Za-z0-9_-]{1,64}|/\\?|--source)(?![\\s\\S])",
-          "description": "payload_invalid: empty for the whole input, /<field> (/? when the name does not match [A-Za-z0-9_-]{1,64}), or --source. Never an input value."
+          "pattern": "^(?:|/[A-Za-z0-9_-]{1,64}|/\\?|--source|--label)(?![\\s\\S])",
+          "description": "payload_invalid: empty for the whole input, /<field> (/? when the name does not match [A-Za-z0-9_-]{1,64}), --source or --label. Never an input value."
         }
       },
       "additionalProperties": false,
@@ -380,7 +416,7 @@
           },
           "minProperties": 1,
           "maxProperties": 16,
-          "description": "A map from payload field name (top-level or dotted scalar path) to a string, integer or boolean; every pair must equal. Never matches a channel notice."
+          "description": "A map from payload field path to a string, integer or boolean; every pair must equal (same JSON type and value). Applies to hook payloads only; a condition that does not apply to a shape never matches it."
         },
         "level_min": {
           "$ref": "#/$defs/level"
@@ -412,14 +448,14 @@
           }
         }
       ],
-      "description": "All present conditions must hold. An empty match matches everything. level_min never matches a hook payload and may not be combined with hook or where."
+      "description": "All present conditions must hold. An empty match matches everything. source and labels apply to both shapes; hook, repo and where to hook payloads only; level_min to channel notices only (a notice without level counts as info) and may not be combined with hook or where."
     },
     "wildcard": {
       "type": "string",
       "minLength": 1,
       "maxLength": 256,
       "pattern": "^[^*]*\\*?(?![\\s\\S])",
-      "description": "An exact value, or a value ending in one * (prefix match). A * is allowed only as the last character; matching is case-sensitive."
+      "description": "An exact value of 1 to 256 characters, or a value ending in one * (prefix match; a lone * matches any present value). A * is allowed only as the last character (** or an inner * is config_invalid); matching is case-sensitive."
     },
     "hook_payload": {
       "type": "object",
@@ -428,36 +464,19 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 64,
+          "pattern": "^[a-z0-9][a-z0-9_-]*(?![\\s\\S])",
           "x-untrusted": true,
-          "description": "The source of a hook payload (1 to 64 characters of [a-z0-9][a-z0-9_-]*, checked by the router)."
+          "description": "The source of a hook payload (1 to 64 characters of [a-z0-9][a-z0-9_-]*, else payload_invalid with pointer /tool). The source notice-route is reserved: send refuses it with source_mismatch."
         },
         "hook": {
           "type": "string",
-          "minLength": 1,
-          "x-untrusted": true
+          "pattern": "^[a-z][a-z0-9_-]{0,63}(?![\\s\\S])",
+          "x-untrusted": true,
+          "description": "[a-z][a-z0-9_-]{0,63}, else payload_invalid with pointer /hook."
         },
         "event_id": {
-          "$ref": "#/$defs/event_id",
           "x-untrusted": true,
-          "description": "Read for the redelivery check."
-        },
-        "dedupe_key": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 1024,
-          "x-untrusted": true,
-          "description": "Read for the repeat check."
-        },
-        "object_id": {
-          "type": [
-            "string",
-            "integer"
-          ],
-          "x-untrusted": true
-        },
-        "object_type": {
-          "type": "string",
-          "x-untrusted": true
+          "description": "Read for the redelivery check, compared per destination, source and hook as its JSON text. Anything that is not an integer (a boolean is not) or a string of 1 to 256 characters is ignored."
         },
         "repo": {
           "type": [
@@ -468,28 +487,18 @@
           "description": "Matched by a rule's repo condition; null counts as absent."
         },
         "labels": {
-          "type": "array",
           "items": {
             "type": "string",
             "x-untrusted": true,
             "description": "A key=value string; a malformed one is ignored and counted in labels_ignored."
           },
-          "description": "Array of key=value strings (split at the first =)."
+          "description": "Array of key=value strings (split at the first =). A value that is not an array is ignored and counted once in labels_ignored; at most 64 are read."
         },
         "reads_third_party": {
           "description": "Text opt-in needs the boolean false; any other value (missing, null, non-boolean) is unknown and excludes the text."
         },
         "tainted": {
           "description": "Text opt-in needs the boolean false; any other value is unknown and excludes the text."
-        },
-        "ts": {
-          "type": [
-            "string",
-            "integer",
-            "number"
-          ],
-          "x-untrusted": true,
-          "description": "The producer's timestamp."
         }
       },
       "required": [
@@ -497,7 +506,7 @@
         "hook"
       ],
       "additionalProperties": true,
-      "description": "A hook payload: required string tool and hook; any other keys are free. Every field is untrusted unless the producer's interface says otherwise."
+      "description": "A hook payload: required string tool and hook; any other keys are free, and the router reads only the scalar fields a rule or template names plus event_id, repo, labels, reads_third_party and tainted. Every field is untrusted unless the producer's interface says otherwise."
     },
     "channel_notice": {
       "type": "object",
@@ -520,15 +529,16 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 1024,
-          "pattern": "^[Hh][Tt][Tt][Pp][Ss]?://[!-~]*(?![\\s\\S])",
-          "x-untrusted": true
+          "pattern": "^https?://[!-~]*(?![\\s\\S])",
+          "x-untrusted": true,
+          "description": "Lowercase http or https scheme, printable ASCII. Validated and never sent."
         }
       },
       "required": [
         "message"
       ],
       "additionalProperties": false,
-      "description": "A channel notice: only title, message, level and link; message is required."
+      "description": "A channel notice: only title, message, level and link; message is required. A pass-through rule sends its title and message; its link is never sent."
     }
   }
 }

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "notice-route/cli/test.json",
   "title": "test --json output (and send --dry-run --json)",
-  "description": "What send would do, with no state change. rule is null when none matched; then title, message and link are null and destinations is empty.",
+  "description": "What send would do, with no state change. reason is null when a rule matched and destinations were decided, rule_drop for a drop rule, and unconfigured, no_rule or disabled when nothing was decided (exit 22; all_disabled when every decision is disabled). Then title, message and link are null and destinations is empty, except for all_disabled.",
   "type": "object",
   "properties": {
     "shape": {
@@ -36,13 +36,15 @@
         }
       ]
     },
-    "no_rule_reason": {
-      "enum": [
-        null,
-        "unconfigured",
-        "no_rule"
-      ],
-      "description": "Why no rule applied; null when one matched."
+    "reason": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/noop_reason"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "title": {
       "type": [
@@ -58,7 +60,7 @@
         "string",
         "null"
       ],
-      "maxLength": 100000,
+      "maxLength": 4000,
       "x-untrusted": true,
       "description": "Untrusted. The rendered message."
     },
@@ -75,10 +77,19 @@
       "type": "array",
       "items": {
         "type": "string",
-        "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,3}(?![\\s\\S])"
+        "pattern": "^(?:labels\\.[a-z0-9][a-z0-9_.-]{0,63}|(?!labels\\.)[A-Za-z_][A-Za-z0-9_]{0,63}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,3})(?![\\s\\S])"
       },
       "uniqueItems": true,
-      "description": "Template field paths that rendered empty."
+      "description": "Token paths that rendered empty because the field is absent, null, a list or an object."
+    },
+    "excluded": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^(?:labels\\.[a-z0-9][a-z0-9_.-]{0,63}|(?!labels\\.)[A-Za-z_][A-Za-z0-9_]{0,63}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,3})(?![\\s\\S])"
+      },
+      "uniqueItems": true,
+      "description": "Token paths whose text was left out (a title token that is not plain, a message token without include_text or with unknown or true flags)."
     },
     "text_excluded": {
       "type": "boolean"
@@ -117,7 +128,6 @@
               "defer",
               "drop",
               "suppress",
-              "rate_limit",
               "disabled"
             ]
           },
@@ -148,6 +158,34 @@
           "decision",
           "reason",
           "deliver_after"
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "decision": {
+                  "const": "defer"
+                }
+              },
+              "required": [
+                "decision"
+              ]
+            },
+            "then": {
+              "properties": {
+                "deliver_after": {
+                  "$ref": "../defs.json#/$defs/epoch_seconds"
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "deliver_after": {
+                  "type": "null"
+                }
+              }
+            }
+          }
         ]
       },
       "maxItems": 8
@@ -159,14 +197,118 @@
     "source",
     "hook",
     "rule",
-    "no_rule_reason",
+    "reason",
     "title",
     "message",
     "link",
     "missing",
+    "excluded",
     "text_excluded",
     "level",
     "dedupe",
     "destinations"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "reason": {
+            "enum": [
+              "unconfigured",
+              "no_rule",
+              "disabled"
+            ]
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
+      "then": {
+        "properties": {
+          "rule": {
+            "type": "null"
+          },
+          "title": {
+            "type": "null"
+          },
+          "message": {
+            "type": "null"
+          },
+          "link": {
+            "type": "null"
+          },
+          "level": {
+            "type": "null"
+          },
+          "dedupe": {
+            "type": "null"
+          },
+          "destinations": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "reason": {
+            "const": "rule_drop"
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
+      "then": {
+        "properties": {
+          "rule": {
+            "$ref": "../defs.json#/$defs/rule_name"
+          },
+          "title": {
+            "type": "null"
+          },
+          "message": {
+            "type": "null"
+          },
+          "link": {
+            "type": "null"
+          },
+          "dedupe": {
+            "type": "null"
+          },
+          "destinations": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "reason": {
+            "const": "all_disabled"
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
+      "then": {
+        "properties": {
+          "destinations": {
+            "minItems": 1,
+            "items": {
+              "properties": {
+                "decision": {
+                  "const": "disabled"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
   ]
 }

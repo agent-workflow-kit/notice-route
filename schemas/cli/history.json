@@ -7,6 +7,10 @@
   "items": {
     "type": "object",
     "properties": {
+      "id": {
+        "type": "integer",
+        "minimum": 1
+      },
       "ts": {
         "$ref": "../defs.json#/$defs/ts"
       },
@@ -24,6 +28,16 @@
             "type": "null"
           }
         ]
+      },
+      "object_id": {
+        "type": [
+          "string",
+          "integer",
+          "null"
+        ],
+        "x-untrusted": true,
+        "maxLength": 256,
+        "description": "The payload's object_id, or null."
       },
       "rule": {
         "oneOf": [
@@ -46,7 +60,14 @@
         ]
       },
       "level": {
-        "$ref": "../defs.json#/$defs/level"
+        "oneOf": [
+          {
+            "$ref": "../defs.json#/$defs/level"
+          },
+          {
+            "type": "null"
+          }
+        ]
       },
       "outcome": {
         "$ref": "../defs.json#/$defs/history_outcome"
@@ -54,7 +75,7 @@
       "reason": {
         "oneOf": [
           {
-            "$ref": "../defs.json#/$defs/destination_reason"
+            "$ref": "../defs.json#/$defs/history_reason"
           },
           {
             "type": "null"
@@ -74,6 +95,11 @@
       "attempts": {
         "type": "integer",
         "minimum": 0
+      },
+      "count": {
+        "type": "integer",
+        "minimum": 1,
+        "description": "1 plus the repeats suppressed in the window this row opened."
       },
       "event_id": {
         "oneOf": [
@@ -102,7 +128,7 @@
           "$ref": "../defs.json#/$defs/label"
         },
         "x-untrusted": true,
-        "maxItems": 64
+        "maxItems": 96
       },
       "surfaced": {
         "type": "boolean"
@@ -116,13 +142,24 @@
             "type": "null"
           }
         ]
+      },
+      "title": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "maxLength": 100,
+        "x-untrusted": true,
+        "description": "Untrusted. The rendered title of a templated rule cut to 100 characters; null for a pass-through row."
       }
     },
     "additionalProperties": false,
     "required": [
+      "id",
       "ts",
       "source",
       "hook",
+      "object_id",
       "rule",
       "destination",
       "level",
@@ -130,13 +167,52 @@
       "reason",
       "code",
       "attempts",
+      "count",
       "event_id",
       "dedupe",
       "labels",
       "surfaced",
-      "deliver_after"
+      "deliver_after",
+      "title"
     ],
-    "description": "One history row. Never contains title or message text."
+    "description": "One history row. Holds the rendered title of a templated rule (cut to 100 characters) and never message text.",
+    "allOf": [
+      {
+        "if": {
+          "properties": {
+            "reason": {
+              "enum": [
+                "rule_drop",
+                "no_rule"
+              ]
+            }
+          },
+          "required": [
+            "reason"
+          ]
+        },
+        "then": {
+          "properties": {
+            "destination": {
+              "type": "null"
+            },
+            "outcome": {
+              "const": "dropped"
+            }
+          }
+        },
+        "else": {
+          "properties": {
+            "destination": {
+              "$ref": "../defs.json#/$defs/destination_name"
+            },
+            "level": {
+              "$ref": "../defs.json#/$defs/level"
+            }
+          }
+        }
+      }
+    ]
   },
   "maxItems": 1000
 }
