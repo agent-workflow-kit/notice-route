@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "notice-route/hooks/post-fail.json",
+  "title": "post-fail hook payload (stdin)",
+  "description": "Fired after a destination's failure was surfaced (once per code and destination per day, plus rate_limited once per destination per hour). Carries no title, message, link or payload text.",
+  "type": "object",
+  "properties": {
+    "tool": {
+      "const": "notice-route"
+    },
+    "hook": {
+      "const": "post-fail"
+    },
+    "object_type": {
+      "const": "destination"
+    },
+    "object_id": {
+      "$ref": "../defs.json#/$defs/destination_name"
+    },
+    "event_id": {
+      "$ref": "../defs.json#/$defs/event_id"
+    },
+    "code": {
+      "$ref": "../defs.json#/$defs/notifier_code"
+    },
+    "outcome": {
+      "enum": [
+        "failed",
+        "unknown"
+      ]
+    },
+    "attempts": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source": {
+      "$ref": "../defs.json#/$defs/source_name",
+      "x-untrusted": true
+    },
+    "level": {
+      "$ref": "../defs.json#/$defs/level"
+    },
+    "kind": {
+      "$ref": "../defs.json#/$defs/destination_kind"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "tool",
+    "hook",
+    "object_type",
+    "object_id",
+    "event_id",
+    "code",
+    "outcome",
+    "attempts",
+    "source",
+    "level",
+    "kind"
+  ]
+}

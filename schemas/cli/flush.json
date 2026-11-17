@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "notice-route/cli/flush.json",
+  "title": "flush --json output",
+  "description": "Exit 0 (ok), 12 (partial: a call ended failed or unknown) and 22 (no_op: nothing was due). With --dry-run the due_* counts are filled and the result counts are 0.",
+  "type": "object",
+  "properties": {
+    "outcome": {
+      "enum": [
+        "ok",
+        "partial",
+        "no_op"
+      ]
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "destinations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "$ref": "../defs.json#/$defs/destination_name"
+          },
+          "state": {
+            "enum": [
+              "done",
+              "already_running",
+              "nothing_due",
+              "quiet"
+            ]
+          },
+          "due_retry": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "due_deferred": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sent": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "queued_retry": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "failed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "unknown": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "dropped": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "expired": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "digests": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Digest notifications built from deferred rows."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "state",
+          "due_retry",
+          "due_deferred",
+          "sent",
+          "queued_retry",
+          "failed",
+          "unknown",
+          "dropped",
+          "expired",
+          "digests"
+        ]
+      }
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "outcome",
+    "dry_run",
+    "destinations",
+    "duration_ms"
+  ]
+}

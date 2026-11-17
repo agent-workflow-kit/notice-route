@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "notice-route/cli/validate.json",
+  "title": "validate --json output",
+  "description": "Exit 0 (ok) and exit 12 (a probe failed). A config that does not load is exit 2 and prints the error envelope instead.",
+  "type": "object",
+  "properties": {
+    "outcome": {
+      "enum": [
+        "ok",
+        "probe_failed"
+      ]
+    },
+    "probe": {
+      "type": "boolean",
+      "description": "Whether --probe was given."
+    },
+    "destinations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "$ref": "../defs.json#/$defs/destination_name"
+          },
+          "cmd_ok": {
+            "type": "boolean",
+            "description": "cmd[0] exists and is acceptable."
+          },
+          "env_unset": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}(?![\\s\\S])"
+            },
+            "description": "Names in env that are not set in the router's environment (reported, not an error)."
+          },
+          "probe": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "ok",
+                      "failed",
+                      "disabled"
+                    ],
+                    "description": "disabled is the notifier's exit 22, information only."
+                  },
+                  "exit": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "minimum": 0,
+                    "maximum": 255
+                  },
+                  "enabled": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ],
+                    "description": "The notifier's own enabled value, or null when unreadable."
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "status",
+                  "exit",
+                  "enabled"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "cmd_ok",
+          "env_unset",
+          "probe"
+        ]
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "enum": [
+              "destination_unused",
+              "rule_without_level",
+              "rule_unreachable",
+              "unknown_template_field",
+              "dedup_window_over_cap_hour",
+              "timeout_shorter_than_notifier",
+              "worst_case_over_hook_timeout",
+              "duplicate_wiring"
+            ]
+          },
+          "rule": {
+            "oneOf": [
+              {
+                "$ref": "../defs.json#/$defs/rule_name"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "destination": {
+            "oneOf": [
+              {
+                "$ref": "../defs.json#/$defs/destination_name"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "A fixed string naming the key, never a value."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "rule",
+          "destination",
+          "message"
+        ]
+      }
+    },
+    "send_worst_case_s": {
+      "type": "number",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "outcome",
+    "probe",
+    "destinations",
+    "warnings",
+    "send_worst_case_s"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "probe_failed"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "probe": {
+            "const": true
+          }
+        }
+      }
+    }
+  ]
+}

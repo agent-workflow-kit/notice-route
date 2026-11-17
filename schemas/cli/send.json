@@ -1,0 +1,313 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "notice-route/cli/send.json",
+  "title": "send --json output",
+  "description": "Printed on exit 0 (ok) and exit 12 (partial) as the full object, and on exit 22 as {outcome: no_op, reason}. A drop rule is exit 0 with an empty destinations list. send --dry-run prints cli/test.json instead. Errors (exit 2, 20, 1) print the error envelope.",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "enum": [
+            "ok",
+            "partial"
+          ],
+          "description": "ok is exit 0, partial is exit 12."
+        },
+        "shape": {
+          "enum": [
+            "hook",
+            "notice"
+          ]
+        },
+        "source": {
+          "$ref": "../defs.json#/$defs/source_name",
+          "x-untrusted": true
+        },
+        "hook": {
+          "oneOf": [
+            {
+              "$ref": "../defs.json#/$defs/hook_name",
+              "x-untrusted": true
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "rule": {
+          "oneOf": [
+            {
+              "$ref": "../defs.json#/$defs/rule_name"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "level": {
+          "$ref": "../defs.json#/$defs/level"
+        },
+        "text_excluded": {
+          "type": "boolean"
+        },
+        "labels_ignored": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "destinations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "$ref": "../defs.json#/$defs/destination_name"
+              },
+              "outcome": {
+                "$ref": "../defs.json#/$defs/destination_outcome"
+              },
+              "reason": {
+                "oneOf": [
+                  {
+                    "$ref": "../defs.json#/$defs/destination_reason"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "attempts": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "code": {
+                "oneOf": [
+                  {
+                    "$ref": "../defs.json#/$defs/notifier_code"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "count": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1,
+                "description": "The repeat count for suppressed with reason repeat, else null."
+              },
+              "deliver_after": {
+                "oneOf": [
+                  {
+                    "$ref": "../defs.json#/$defs/epoch_seconds"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "notifier_outcome": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "pattern": "^[a-z_]{1,32}(?![\\s\\S])",
+                "x-untrusted": true,
+                "description": "Untrusted. The notifier's own outcome for exit 0 or 22, or null."
+              }
+            },
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "outcome",
+              "reason",
+              "attempts",
+              "code",
+              "count",
+              "deliver_after",
+              "notifier_outcome"
+            ],
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "outcome": {
+                      "const": "deferred"
+                    }
+                  },
+                  "required": [
+                    "outcome"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "deliver_after": {
+                      "$ref": "../defs.json#/$defs/epoch_seconds"
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "outcome": {
+                      "const": "suppressed"
+                    }
+                  },
+                  "required": [
+                    "outcome"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "count": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "outcome": {
+                      "const": "suppressed"
+                    }
+                  },
+                  "required": [
+                    "outcome"
+                  ]
+                },
+                "else": {
+                  "properties": {
+                    "count": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "maxItems": 8,
+          "description": "One entry per selected destination; empty for a drop rule."
+        },
+        "dedupe": {
+          "oneOf": [
+            {
+              "$ref": "../defs.json#/$defs/sha256_64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "outcome",
+        "shape",
+        "source",
+        "hook",
+        "rule",
+        "level",
+        "text_excluded",
+        "labels_ignored",
+        "destinations",
+        "dedupe",
+        "duration_ms"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "outcome": {
+                "const": "partial"
+              }
+            },
+            "required": [
+              "outcome"
+            ]
+          },
+          "then": {
+            "properties": {
+              "destinations": {
+                "contains": {
+                  "properties": {
+                    "outcome": {
+                      "enum": [
+                        "failed",
+                        "unknown"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "outcome"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "shape": {
+                "const": "notice"
+              }
+            },
+            "required": [
+              "shape"
+            ]
+          },
+          "then": {
+            "properties": {
+              "hook": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "shape": {
+                "const": "hook"
+              }
+            },
+            "required": [
+              "shape"
+            ]
+          },
+          "then": {
+            "properties": {
+              "hook": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "const": "no_op"
+        },
+        "reason": {
+          "$ref": "../defs.json#/$defs/noop_reason"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "outcome",
+        "reason"
+      ]
+    }
+  ]
+}

@@ -1,2 +1,285 @@
-# Example config for notice-route. Location: ~/.config/notice-route/config.yaml (drop-ins: config.d/*.yaml). Keys are defined in docs/interface.md once designed.
-hooks: {}
+# Example config for notice-route: a complete worked configuration.
+# Location: ~/.config/notice-route/config.yaml (drop-ins: config.d/*.yaml, lexical order,
+# maps merge, hook lists append). The directory, this file and every drop-in must be owned by
+# you and not group- or world-writable. Keys and defaults are defined in docs/interface.md and
+# checked by schemas/config.json (CI validates this file against it).
+
+# --- destinations -------------------------------------------------------------
+# Named channels and the command that reaches each. At most 32. A name is
+# [a-z0-9][a-z0-9_-]{0,31}.
+destinations:
+  phone:
+    # kind (required): slack-notice, ha-notice, wsl-notice or generic. It selects the retry rules.
+    kind: ha-notice
+    # cmd (required): an argv list, no shell. cmd[0] is an absolute path to an executable owned by
+    # you or root and not group- or world-writable. The notifier's own --config belongs here, one
+    # config file per destination. It may not contain send, --stdin-json, --json, --actor or
+    # --dedupe-key.
+    cmd:
+      - /usr/local/bin/ha-notice
+      - --config
+      - /home/example/.config/ha-notice/config.yaml
+    # timeout (default 10s, range 3s to 120s): must equal the notifier's own timeout. The router
+    # kills the call at this value plus 10 seconds.
+    timeout: 10s
+    # floor (default info): the lowest level delivered here (info < warn < action < error).
+    floor: warn
+    # quiet (default none): the name of a quiet_hours window for this destination.
+    quiet: night
+    # max_per_hour (default 30, 0 to 3600, 0 disables the cap): sliding-hour cap on sent notices.
+    max_per_hour: 20
+    # env (default []): the only variables passed to the notifier besides PATH, LANG, LC_ALL (and
+    # WSL_INTEROP, WSL_DISTRO_NAME for wsl-notice). Credentials go here by name, never by value.
+    env:
+      - HA_TOKEN
+    # enabled (default true): false skips the destination with outcome disabled.
+    enabled: true
+
+  team-chat:
+    kind: slack-notice
+    cmd:
+      - /usr/local/bin/slack-notice
+      - --config
+      - /home/example/.config/slack-notice/config.yaml
+    timeout: 15s
+    floor: info
+    # No quiet window: delivered at any hour. Keep the default cap.
+    max_per_hour: 30
+    env:
+      - SLACK_WEBHOOK
+
+  desktop:
+    kind: wsl-notice
+    cmd:
+      - /usr/local/bin/wsl-notice
+    floor: action
+    quiet: night
+    enabled: true
+
+# --- quiet hours ----------------------------------------------------------------
+# Named windows. Inside a destination's window: info is dropped, warn and action are deferred
+# to the end of the window, error is delivered at once.
+quiet_hours:
+  night:
+    # timezone (required): an IANA name; no default, the system zone is never read.
+    timezone: America/New_York
+    # days (default every day): the days on which the window starts.
+    days: [mon, tue, wed, thu, fri, sat, sun]
+    # start and end (required): HH:MM, 24-hour local time. An end equal to or earlier than start
+    # means the window ends the next day.
+    start: "22:00"
+    end: "07:00"
+
+# --- links ----------------------------------------------------------------------
+# The router's own link tables, the only source of links. Hosts are lowercase names; ticket base
+# URLs are https and end in a slash.
+links:
+  # hosts: host name -> github or gitlab; builds pr_url from a payload's pr (host/path#n).
+  hosts:
+    github.example.com: github
+    gitlab.example.com: gitlab
+  # tickets: site name -> base URL; builds ticket_url from a payload's site and key.
+  tickets:
+    example-site: https://tickets.example.com/browse/
+
+# --- defaults and limits ----------------------------------------------------------
+defaults:
+  # dedup_window (default 10m, range 1s to 24h): the default repeat-check window of a rule.
+  dedup_window: 10m
+
+# lock_wait (default 5s, range 1s to 60s): how long a send polls for a destination's lock.
+lock_wait: 5s
+
+retention:
+  # history (default 30d): age at which prune deletes history rows.
+  history: 30d
+  # event_ids (default 14d): age at which prune forgets event ids.
+  event_ids: 14d
+
+# log (default true): write log.jsonl under the state directory.
+log: true
+
+# --- cron ---------------------------------------------------------------------------
+cron:
+  # env_file (default none): an absolute path to a mode-0600 file that the cron lines source.
+  # The notifiers' credentials must be in it, because the router passes only the variables a
+  # destination names.
+  env_file: /home/example/.config/notice-route/cron.env
+
+# --- hooks --------------------------------------------------------------------------
+# post-fail fires after a destination's failure was surfaced. It cannot route through the router
+# (send refuses with hook_recursion): call a notifier directly.
+hooks:
+  post-fail:
+    - cmd: /usr/local/bin/ha-notice --config /home/example/.config/ha-notice/config.yaml send --stdin-json --json --actor auto:post-fail
+      # timeout (default 30s) and async (default false).
+      timeout: 30s
+      async: true
+
+# --- rules --------------------------------------------------------------------------
+# Ordered. The first rule whose match holds decides everything; no later rule is consulted.
+# A rule that can match a hook payload (it has hook or where) sets a level. Templates use only
+# safe fields: free-text fields (report, message, summary, details, output_tail, error) are not
+# used. Tokens that render empty make the notice still go out, and `test` lists them as missing.
+# name: [a-z0-9][a-z0-9_-]{0,63}, unique. notify: 1 to 8 destinations. dedup_window default: the
+# defaults.dedup_window value.
+rules:
+  - name: agent-needs-input
+    match:
+      source: agent-spawn
+      hook: post-state-change
+      where:
+        state: needs-input
+    notify: [phone, desktop]
+    level: action
+    title: "Agent needs input"
+    message: "Agent {{object_id}} ({{kind}}) is waiting for input."
+    dedup_window: 30m
+
+  - name: agent-done
+    match:
+      source: agent-spawn
+      hook: post-state-change
+      where:
+        state: reported
+    notify: [team-chat]
+    level: info
+    title: "Agent done"
+    message: "Agent {{object_id}} reported (state {{state}})."
+
+  - name: agent-failed
+    match:
+      source: agent-spawn
+      hook: post-state-change
+      where:
+        needs_attention: failed
+    notify: [phone, team-chat]
+    level: error
+    title: "Agent failed"
+    message: "Agent {{object_id}} failed."
+
+  - name: agent-escalated
+    match:
+      source: agent-spawn
+      hook: post-escalate
+    notify: [phone, desktop]
+    level: action
+    title: "Agent needs attention"
+    message: "Agent {{object_id}} needs attention: {{needs_attention}}."
+
+  - name: review-draft-ready
+    match:
+      source: review-watch
+      hook: post-draft
+    notify: [team-chat, desktop]
+    level: info
+    title: "Review draft ready"
+    message: "Draft {{draft_id}} for {{pr}} is ready (tier {{tier}}, verdict {{verdict}})."
+    link: "{{pr_url}}"
+
+  - name: review-escalated
+    match:
+      source: review-watch
+      hook: post-attention
+      where:
+        reason: escalated
+    notify: [phone, team-chat]
+    level: action
+    title: "Review escalated"
+    message: "Review of {{pr}} was escalated."
+    link: "{{pr_url}}"
+
+  - name: review-failed
+    match:
+      source: review-watch
+      hook: post-attention
+      where:
+        reason: failed
+    notify: [phone, team-chat]
+    level: error
+    title: "Review failed"
+    message: "Review of {{pr}} failed."
+    link: "{{pr_url}}"
+
+  - name: ticket-attention
+    match:
+      source: ticket-work
+      hook: post-attention
+    notify: [phone, team-chat]
+    level: action
+    title: "Ticket needs attention"
+    message: "Ticket {{key}} needs attention ({{reason}}, phase {{phase}})."
+    link: "{{ticket_url}}"
+
+  - name: ticket-pending
+    match:
+      source: ticket-work
+      hook: post-pending
+    notify: [phone, team-chat]
+    level: action
+    title: "Confirmation pending"
+    message: "Ticket {{key}} has a pending {{action}} confirmation."
+    link: "{{ticket_url}}"
+
+  - name: ticket-start-failed
+    match:
+      source: ticket-work
+      hook: post-start-failed
+    notify: [phone, team-chat]
+    level: error
+    title: "Ticket start failed"
+    message: "Starting ticket {{key}} failed ({{reason}})."
+    link: "{{ticket_url}}"
+
+  - name: job-held
+    match:
+      source: jobsctl
+      hook: post-held
+    notify: [phone, team-chat]
+    level: action
+    title: "Job held"
+    message: "Job {{job}} (attempt {{attempt}}) is held."
+
+  - name: job-failed
+    match:
+      source: jobsctl
+      hook: post-fail
+    notify: [phone, team-chat]
+    level: error
+    title: "Job failed"
+    message: "Job {{job}} failed (attempt {{attempt}})."
+
+  - name: pr-approved
+    match:
+      source: pr-watch
+      hook: on-approved
+    notify: [team-chat, desktop]
+    level: info
+    title: "PR approved"
+    message: "{{pr}} was approved by {{reviewer}}."
+    link: "{{pr_url}}"
+
+  - name: pr-changes-requested
+    match:
+      source: pr-watch
+      hook: on-changes_requested
+    notify: [team-chat, desktop]
+    level: warn
+    title: "Changes requested"
+    message: "{{reviewer}} requested changes on {{pr}}."
+    link: "{{pr_url}}"
+
+  # A channel notice (no hook) of level error or higher from any source goes to the phone.
+  - name: direct-errors
+    match:
+      level_min: error
+    notify: [phone]
+    title: "Notice"
+    message: "A source reported an error."
+
+  # Catch-all drop: a launch is not worth a notification. drop allows only name and match.
+  - name: launch-drop
+    match:
+      source: agent-spawn
+      hook: post-launch
+    drop: true

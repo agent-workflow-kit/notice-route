@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "notice-route/cli/test.json",
+  "title": "test --json output (and send --dry-run --json)",
+  "description": "What send would do, with no state change. rule is null when none matched; then title, message and link are null and destinations is empty.",
+  "type": "object",
+  "properties": {
+    "shape": {
+      "enum": [
+        "hook",
+        "notice"
+      ]
+    },
+    "source": {
+      "$ref": "../defs.json#/$defs/source_name",
+      "x-untrusted": true
+    },
+    "hook": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/hook_name",
+          "x-untrusted": true
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "rule": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/rule_name"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "no_rule_reason": {
+      "enum": [
+        null,
+        "unconfigured",
+        "no_rule"
+      ],
+      "description": "Why no rule applied; null when one matched."
+    },
+    "title": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 256,
+      "x-untrusted": true,
+      "description": "Untrusted. The rendered title."
+    },
+    "message": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 100000,
+      "x-untrusted": true,
+      "description": "Untrusted. The rendered message."
+    },
+    "link": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 1024,
+      "x-untrusted": true,
+      "description": "Untrusted. The rendered link; null means no link."
+    },
+    "missing": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,3}(?![\\s\\S])"
+      },
+      "uniqueItems": true,
+      "description": "Template field paths that rendered empty."
+    },
+    "text_excluded": {
+      "type": "boolean"
+    },
+    "level": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/level"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "dedupe": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/sha256_64"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "destinations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "$ref": "../defs.json#/$defs/destination_name"
+          },
+          "decision": {
+            "enum": [
+              "send",
+              "defer",
+              "drop",
+              "suppress",
+              "rate_limit",
+              "disabled"
+            ]
+          },
+          "reason": {
+            "oneOf": [
+              {
+                "$ref": "../defs.json#/$defs/destination_reason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "deliver_after": {
+            "oneOf": [
+              {
+                "$ref": "../defs.json#/$defs/epoch_seconds"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "decision",
+          "reason",
+          "deliver_after"
+        ]
+      },
+      "maxItems": 8
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "shape",
+    "source",
+    "hook",
+    "rule",
+    "no_rule_reason",
+    "title",
+    "message",
+    "link",
+    "missing",
+    "text_excluded",
+    "level",
+    "dedupe",
+    "destinations"
+  ]
+}

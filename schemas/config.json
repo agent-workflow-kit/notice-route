@@ -1,12 +1,683 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "notice-route/config",
+  "$id": "notice-route/config.json",
   "title": "notice-route config",
-  "type": "object",
-  "properties": {
-    "hooks": {
-      "type": "object"
+  "description": ".config/notice-route/config.yaml under the home directory from the password database (HOME and XDG_CONFIG_HOME are not read; an unusable home directory is exit 2 with key home) plus config.d/*.yaml beside it in lexical order (maps merge, hook lists append). Invalid config exits 2 (config_invalid), naming the key. Files are parsed with a strict YAML loader (no anchors, aliases or explicit tags, no duplicate keys; yes, on and dates are strings). Constraints between keys (a rule's destinations exist, unique rule names, a quiet name exists, ranges of durations) are checked by the loader and by validate, not by this schema. Self-contained: no external references.",
+  "$defs": {
+    "destination_kind": {
+      "enum": [
+        "slack-notice",
+        "ha-notice",
+        "wsl-notice",
+        "generic"
+      ],
+      "description": "Selects the retry rules."
+    },
+    "destination_name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,31}(?![\\s\\S])",
+      "description": "A destination name: 1 to 32 characters of [a-z0-9][a-z0-9_-]*."
+    },
+    "duration": {
+      "anyOf": [
+        {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        {
+          "type": "string",
+          "pattern": "^(?=.*[1-9])[0-9]+(?:\\.[0-9]+)?(?:ms|s|m)?(?![\\s\\S])"
+        }
+      ],
+      "description": "Seconds as a positive finite number, or a string matching [0-9]+(\\.[0-9]+)?(ms|s|m)? (no unit means seconds); zero is refused. Booleans are never accepted. Ranges are enforced by the loader and named in the key's description."
+    },
+    "duration_long": {
+      "anyOf": [
+        {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        {
+          "type": "string",
+          "pattern": "^(?=.*[1-9])[0-9]+(?:\\.[0-9]+)?(?:ms|s|m|h|d)?(?![\\s\\S])"
+        }
+      ],
+      "description": "As duration, plus the h and d suffixes; used only by the keys that name hours and days (retention.* and dedup_window). Ranges are enforced by the loader."
+    },
+    "label": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_.-]{0,63}=[A-Za-z0-9._:/#@+=,-]{0,256}(?![\\s\\S])",
+      "description": "A key=value label, split at the first =. Key [a-z0-9][a-z0-9_.-]{0,63}; value 0 to 256 characters of [A-Za-z0-9._:/#@+=,-]."
+    },
+    "level": {
+      "enum": [
+        "info",
+        "warn",
+        "action",
+        "error"
+      ],
+      "description": "Ordered info < warn < action < error. The order matters to destination floors and quiet hours; the notifiers do not use it."
+    },
+    "quiet_name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,31}(?![\\s\\S])",
+      "description": "The name of a quiet_hours window (same shape as a destination name; the interface names no pattern)."
+    },
+    "rule_match": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "$ref": "#/$defs/wildcard"
+        },
+        "hook": {
+          "$ref": "#/$defs/wildcard"
+        },
+        "repo": {
+          "$ref": "#/$defs/wildcard"
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/label"
+          },
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "description": "All must be present among the notification's labels."
+        },
+        "where": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,3}(?![\\s\\S])"
+          },
+          "additionalProperties": {
+            "oneOf": [
+              {
+                "type": "string",
+                "maxLength": 1024
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "boolean"
+              }
+            ]
+          },
+          "minProperties": 1,
+          "maxProperties": 16,
+          "description": "A map from payload field name (top-level or dotted scalar path) to a string, integer or boolean; every pair must equal. Never matches a channel notice."
+        },
+        "level_min": {
+          "$ref": "#/$defs/level"
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "level_min"
+            ]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "hook"
+                  ]
+                },
+                {
+                  "required": [
+                    "where"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "description": "All present conditions must hold. An empty match matches everything. level_min never matches a hook payload and may not be combined with hook or where."
+    },
+    "rule_name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}(?![\\s\\S])",
+      "description": "A rule name: 1 to 64 characters of [a-z0-9][a-z0-9_-]*."
+    },
+    "wildcard": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[^*]*\\*?(?![\\s\\S])",
+      "description": "An exact value, or a value ending in one * (prefix match). A * is allowed only as the last character; matching is case-sensitive."
     }
   },
-  "additionalProperties": true
+  "type": "object",
+  "properties": {
+    "destinations": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/destination_name"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "$ref": "#/$defs/destination_kind"
+          },
+          "cmd": {
+            "type": "array",
+            "minItems": 1,
+            "prefixItems": [
+              {
+                "type": "string",
+                "pattern": "^/[^\\x00]+(?![\\s\\S])",
+                "description": "An absolute path to an executable owned by the user or root and not group- or world-writable (checked at load and at each call)."
+              }
+            ],
+            "items": {
+              "type": "string",
+              "maxLength": 4096
+            },
+            "not": {
+              "contains": {
+                "type": "string",
+                "pattern": "^(?:send|--stdin-json|--json|--actor|--dedupe-key)(?:=[\\s\\S]*)?(?![\\s\\S])"
+              }
+            },
+            "description": "An argv list; no shell. The notifier's --config <path> belongs here. It may not contain send, --stdin-json, --json, --actor or --dedupe-key (config_invalid)."
+          },
+          "timeout": {
+            "$ref": "#/$defs/duration",
+            "default": "10s",
+            "description": "The notifier's own timeout; must equal what the notifier's config says. Range 3s to 120s. The kill deadline is this plus 10 s."
+          },
+          "floor": {
+            "$ref": "#/$defs/level",
+            "default": "info",
+            "description": "The lowest level delivered here."
+          },
+          "quiet": {
+            "$ref": "#/$defs/quiet_name",
+            "description": "Name of a quiet_hours window; none by default."
+          },
+          "max_per_hour": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3600,
+            "default": 30,
+            "description": "Sliding-hour cap on sent or unknown notifications; 0 disables it."
+          },
+          "env": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}(?![\\s\\S])",
+              "not": {
+                "pattern": "^(?:HOME|PATH|IFS|ENV|BASH_ENV|OPENSSL_CONF|SSL_CERT_FILE|SSL_CERT_DIR)|(?:LD_|PYTHON|XDG_|LC_|NOTICE_ROUTE_)[A-Za-z0-9_]*|(?:[Hh][Tt][Tt][Pp][Ss]?|[Aa][Ll][Ll]|[Nn][Oo]|[Ff][Tt][Pp]|[Ss][Oo][Cc][Kk][Ss])_[Pp][Rr][Oo][Xx][Yy](?![\\s\\S])"
+              }
+            },
+            "uniqueItems": true,
+            "default": [],
+            "description": "The only variables passed to the notifier besides the fixed set. May not name HOME, PATH, IFS, ENV, BASH_ENV, OPENSSL_CONF, SSL_CERT_FILE, SSL_CERT_DIR, a proxy variable, or start with LD_, PYTHON, XDG_, LC_ or NOTICE_ROUTE_."
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "When false the destination is skipped with outcome disabled."
+          }
+        },
+        "required": [
+          "kind",
+          "cmd"
+        ],
+        "additionalProperties": false
+      },
+      "maxProperties": 32,
+      "description": "Named channels and the command that reaches each; at most 32."
+    },
+    "quiet_hours": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/quiet_name"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "timezone": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+){0,2}(?![\\s\\S])",
+            "description": "Required IANA zone name; no default and no reading of the system zone. An unknown name is config_invalid."
+          },
+          "days": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "mon",
+                "tue",
+                "wed",
+                "thu",
+                "fri",
+                "sat",
+                "sun"
+              ]
+            },
+            "minItems": 1,
+            "maxItems": 7,
+            "uniqueItems": true,
+            "default": [
+              "mon",
+              "tue",
+              "wed",
+              "thu",
+              "fri",
+              "sat",
+              "sun"
+            ],
+            "description": "The days on which the window starts; default every day."
+          },
+          "start": {
+            "type": "string",
+            "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9](?![\\s\\S])",
+            "description": "HH:MM, 24-hour local time."
+          },
+          "end": {
+            "type": "string",
+            "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9](?![\\s\\S])",
+            "description": "HH:MM; equal to or earlier than start means the window ends the next day."
+          }
+        },
+        "required": [
+          "timezone",
+          "start",
+          "end"
+        ],
+        "additionalProperties": false
+      },
+      "description": "Named quiet windows."
+    },
+    "links": {
+      "type": "object",
+      "properties": {
+        "hosts": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[a-z0-9][a-z0-9.-]{0,252}(?![\\s\\S])"
+          },
+          "additionalProperties": {
+            "enum": [
+              "github",
+              "gitlab"
+            ]
+          },
+          "description": "Host name (lowercase) to forge type; builds pr_url."
+        },
+        "tickets": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(?![\\s\\S])"
+          },
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 1024,
+            "pattern": "^https://[!-~]+/(?![\\s\\S])",
+            "description": "An https base URL ending in /; the ticket key is appended."
+          },
+          "description": "Ticket site name to base URL; builds ticket_url."
+        }
+      },
+      "additionalProperties": false,
+      "description": "The router's own link tables; the only source of links. Hold only host names and base URLs of your own systems."
+    },
+    "rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "$ref": "#/$defs/rule_name",
+            "description": "Required, unique among rules (uniqueness is checked by the loader)."
+          },
+          "match": {
+            "$ref": "#/$defs/rule_match"
+          },
+          "drop": {
+            "type": "boolean",
+            "default": false,
+            "description": "When true, no other key except name and match is allowed; the outcome is dropped with reason rule_drop."
+          },
+          "notify": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/destination_name"
+            },
+            "minItems": 1,
+            "maxItems": 8,
+            "uniqueItems": true,
+            "description": "Destination names, each defined (checked by the loader). Required unless drop."
+          },
+          "level": {
+            "$ref": "#/$defs/level",
+            "description": "The final level when set; else the channel notice's own level, else info. A rule that can match hook payloads should set one."
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000,
+            "pattern": "^(?:(?!\\{\\{)[\\s\\S]|\\{\\{[A-Za-z_][A-Za-z0-9_]{0,63}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,3}\\}\\})*(?![\\s\\S])",
+            "description": "Template for the title, optional. A {{name}} token naming a deny-listed field (report, message, summary, details, output_tail, error, or below one, also under payload.) is config_invalid.",
+            "not": {
+              "pattern": "\\{\\{(?:payload\\.)?(?:report|message|summary|details|output_tail|error)(?:\\.[A-Za-z0-9_.]+)?\\}\\}"
+            }
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000,
+            "pattern": "^(?:(?!\\{\\{)[\\s\\S]|\\{\\{[A-Za-z_][A-Za-z0-9_]{0,63}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,3}\\}\\})*(?![\\s\\S])",
+            "description": "Template for the message. Required unless drop. A token naming a deny-listed field is config_invalid unless include_text lists that top-level name."
+          },
+          "link": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2000,
+            "pattern": "^(?:(?!\\{\\{)[\\s\\S]|\\{\\{[A-Za-z_][A-Za-z0-9_]{0,63}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,3}\\}\\})*(?![\\s\\S])",
+            "description": "Template for the link, optional; usually {{pr_url}} or {{ticket_url}}. A token naming a deny-listed field is config_invalid. A link that renders empty means no link.",
+            "not": {
+              "pattern": "\\{\\{(?:payload\\.)?(?:report|message|summary|details|output_tail|error)(?:\\.[A-Za-z0-9_.]+)?\\}\\}"
+            }
+          },
+          "dedup_window": {
+            "$ref": "#/$defs/duration_long",
+            "description": "Window of the repeat check; range 1s to 24h; default the defaults.dedup_window key (10m)."
+          },
+          "include_text": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "report",
+                "message",
+                "summary",
+                "details",
+                "output_tail",
+                "error"
+              ]
+            },
+            "minItems": 1,
+            "uniqueItems": true,
+            "description": "Opt-in for untrusted text in the message: deny-listed top-level field names. The text is inserted only when the payload has reads_third_party false and tainted false."
+          }
+        },
+        "required": [
+          "name",
+          "match"
+        ],
+        "additionalProperties": false,
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "drop": {
+                  "const": true
+                }
+              },
+              "required": [
+                "drop"
+              ]
+            },
+            "then": {
+              "propertyNames": {
+                "enum": [
+                  "name",
+                  "match",
+                  "drop"
+                ]
+              }
+            },
+            "else": {
+              "required": [
+                "notify",
+                "message"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "message": {
+                  "pattern": "\\{\\{(?:payload\\.)?(?:report)(?:\\.[A-Za-z0-9_.]+)?\\}\\}"
+                }
+              },
+              "required": [
+                "message"
+              ]
+            },
+            "then": {
+              "required": [
+                "include_text"
+              ],
+              "properties": {
+                "include_text": {
+                  "contains": {
+                    "const": "report"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "message": {
+                  "pattern": "\\{\\{(?:payload\\.)?(?:message)(?:\\.[A-Za-z0-9_.]+)?\\}\\}"
+                }
+              },
+              "required": [
+                "message"
+              ]
+            },
+            "then": {
+              "required": [
+                "include_text"
+              ],
+              "properties": {
+                "include_text": {
+                  "contains": {
+                    "const": "message"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "message": {
+                  "pattern": "\\{\\{(?:payload\\.)?(?:summary)(?:\\.[A-Za-z0-9_.]+)?\\}\\}"
+                }
+              },
+              "required": [
+                "message"
+              ]
+            },
+            "then": {
+              "required": [
+                "include_text"
+              ],
+              "properties": {
+                "include_text": {
+                  "contains": {
+                    "const": "summary"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "message": {
+                  "pattern": "\\{\\{(?:payload\\.)?(?:details)(?:\\.[A-Za-z0-9_.]+)?\\}\\}"
+                }
+              },
+              "required": [
+                "message"
+              ]
+            },
+            "then": {
+              "required": [
+                "include_text"
+              ],
+              "properties": {
+                "include_text": {
+                  "contains": {
+                    "const": "details"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "message": {
+                  "pattern": "\\{\\{(?:payload\\.)?(?:output_tail)(?:\\.[A-Za-z0-9_.]+)?\\}\\}"
+                }
+              },
+              "required": [
+                "message"
+              ]
+            },
+            "then": {
+              "required": [
+                "include_text"
+              ],
+              "properties": {
+                "include_text": {
+                  "contains": {
+                    "const": "output_tail"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "message": {
+                  "pattern": "\\{\\{(?:payload\\.)?(?:error)(?:\\.[A-Za-z0-9_.]+)?\\}\\}"
+                }
+              },
+              "required": [
+                "message"
+              ]
+            },
+            "then": {
+              "required": [
+                "include_text"
+              ],
+              "properties": {
+                "include_text": {
+                  "contains": {
+                    "const": "error"
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "maxItems": 256,
+      "default": [],
+      "description": "Ordered; the first rule whose match holds decides everything."
+    },
+    "defaults": {
+      "type": "object",
+      "properties": {
+        "dedup_window": {
+          "$ref": "#/$defs/duration_long",
+          "default": "10m",
+          "description": "The default for a rule's dedup_window; range 1s to 24h."
+        }
+      },
+      "additionalProperties": false,
+      "description": "Defaults for rule keys."
+    },
+    "lock_wait": {
+      "$ref": "#/$defs/duration",
+      "default": "5s",
+      "description": "How long a send polls for a destination's lock; range 1s to 60s."
+    },
+    "retention": {
+      "type": "object",
+      "properties": {
+        "history": {
+          "$ref": "#/$defs/duration_long",
+          "default": "30d",
+          "description": "Age at which prune deletes history rows."
+        },
+        "event_ids": {
+          "$ref": "#/$defs/duration_long",
+          "default": "14d",
+          "description": "Age at which prune forgets event ids."
+        }
+      },
+      "additionalProperties": false
+    },
+    "hooks": {
+      "type": "object",
+      "properties": {
+        "post-fail": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "cmd": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Run via sh -c in its own process group; JSON payload on stdin."
+              },
+              "timeout": {
+                "$ref": "#/$defs/duration",
+                "default": "30s"
+              },
+              "async": {
+                "type": "boolean",
+                "default": false,
+                "description": "Do not wait for the hook."
+              }
+            },
+            "required": [
+              "cmd"
+            ],
+            "additionalProperties": false
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false,
+      "description": "Hook entries per hook as in the design guide; lists from config.d append."
+    },
+    "cron": {
+      "type": "object",
+      "properties": {
+        "env_file": {
+          "type": "string",
+          "maxLength": 4096,
+          "pattern": "^/[^\\x00]+(?![\\s\\S])",
+          "description": "Absolute path of a mode-0600 file the cron lines source."
+        }
+      },
+      "additionalProperties": false
+    },
+    "log": {
+      "type": "boolean",
+      "default": true,
+      "description": "false writes no log.jsonl."
+    }
+  },
+  "additionalProperties": false
 }

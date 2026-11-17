@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "notice-route/cli/rules.json",
+  "title": "rules --json output",
+  "description": "The rules in order, plus the destinations and quiet windows they reference.",
+  "type": "object",
+  "properties": {
+    "rules": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "$ref": "../defs.json#/$defs/rule_name"
+          },
+          "match": {
+            "$ref": "../defs.json#/$defs/rule_match"
+          },
+          "destinations": {
+            "type": "array",
+            "items": {
+              "$ref": "../defs.json#/$defs/destination_name"
+            },
+            "maxItems": 8
+          },
+          "level": {
+            "oneOf": [
+              {
+                "$ref": "../defs.json#/$defs/level"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "drop": {
+            "type": "boolean"
+          },
+          "dedup_window_s": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "exclusiveMinimum": 0,
+            "description": "The effective window in seconds; null for a drop rule."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "match",
+          "destinations",
+          "level",
+          "drop",
+          "dedup_window_s"
+        ]
+      }
+    },
+    "destinations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "$ref": "../defs.json#/$defs/destination_name"
+          },
+          "kind": {
+            "$ref": "../defs.json#/$defs/destination_kind"
+          },
+          "floor": {
+            "$ref": "../defs.json#/$defs/level"
+          },
+          "quiet": {
+            "oneOf": [
+              {
+                "$ref": "../defs.json#/$defs/quiet_name"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "max_per_hour": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3600
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "kind",
+          "floor",
+          "quiet",
+          "max_per_hour",
+          "enabled"
+        ]
+      }
+    },
+    "quiet_hours": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "$ref": "../defs.json#/$defs/quiet_name"
+          },
+          "timezone": {
+            "type": "string"
+          },
+          "days": {
+            "type": "array",
+            "items": {
+              "enum": [
+                "mon",
+                "tue",
+                "wed",
+                "thu",
+                "fri",
+                "sat",
+                "sun"
+              ]
+            }
+          },
+          "start": {
+            "type": "string",
+            "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9](?![\\s\\S])"
+          },
+          "end": {
+            "type": "string",
+            "pattern": "^(?:[01][0-9]|2[0-3]):[0-5][0-9](?![\\s\\S])"
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "timezone",
+          "days",
+          "start",
+          "end"
+        ]
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "rules",
+    "destinations",
+    "quiet_hours"
+  ]
+}

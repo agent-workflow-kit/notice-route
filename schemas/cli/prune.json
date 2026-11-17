@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "notice-route/cli/prune.json",
+  "title": "prune --json output",
+  "description": "Exit 0. With --dry-run the counts are what would be deleted.",
+  "type": "object",
+  "properties": {
+    "dry_run": {
+      "type": "boolean"
+    },
+    "deleted": {
+      "type": "object",
+      "properties": {
+        "history": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "event_ids": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "dedup": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "surfaced": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "queue": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "history",
+        "event_ids",
+        "dedup",
+        "surfaced",
+        "queue"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "dry_run",
+    "deleted"
+  ]
+}
