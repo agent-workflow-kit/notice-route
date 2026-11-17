@@ -6,7 +6,9 @@
 
 `notice-route` is a Layer 2 (composite) awkit tool: routes notifications to channel tools by level, source, labels and time.
 It must work fully standalone: no dependency on the `awkit` harness, a bus, a shared library or a
-shared contracts package.
+shared contracts package. Its rules are in `docs/interface.md` (the single normative source); `docs/design.md` records why and how it is built.
+
+Safety reminders specific to this tool: config and state are found only from the password-database home (never `HOME` or `XDG_*`); a notifier is called with its own process group, a scrubbed environment and a bounded output reader; payload text never reaches argv or the environment; free-text payload fields never reach a title and reach a message only through a rule's `include_text`; never call a notifier's `validate --test-message`.
 
 ## Read first
 
