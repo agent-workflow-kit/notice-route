@@ -110,18 +110,21 @@
       "pattern": "^[A-Za-z0-9._:-]{1,128}(?![\\s\\S])",
       "description": "A caller's --decision-id, recorded in the log only."
     },
+    "plain_string": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._/#-]{0,255}(?![\\s\\S])",
+      "description": "A plain string: [A-Za-z0-9][A-Za-z0-9._/#-]{0,255}. Plain values render in titles and messages and may be stored (event ids, object ids, label values)."
+    },
     "event_id": {
       "oneOf": [
         {
           "type": "integer"
         },
         {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 256
+          "$ref": "#/$defs/plain_string"
         }
       ],
-      "description": "A producer's event id: an integer (a boolean is not one) or a string of 1 to 256 characters. The redelivery key compares its JSON text, so 17 and \"17\" differ."
+      "description": "A producer's event id: an integer (not a boolean) or a plain string; anything else is ignored. A redelivery matches on the id and the repeat digest; the id is compared as its JSON text, so 17 and \"17\" differ."
     },
     "destination_kind": {
       "enum": [
@@ -150,7 +153,6 @@
         "sent",
         "deferred",
         "queued_retry",
-        "suppressed",
         "dropped",
         "disabled",
         "failed",
@@ -158,7 +160,7 @@
         "sending",
         "expired"
       ],
-      "description": "A destination outcome as recorded in history: the eight of send plus sending (a row whose call is in progress or whose process died; never in send output) and expired (a queue row 24 hours old or more)."
+      "description": "The outcomes of send except suppressed (a suppressed notification writes no row), plus sending (a row whose call is in progress, or whose process died during it; never in send output) and expired (an unclaimed queue row 24 hours old or more). history --outcome takes this enum, so --outcome suppressed is exit 2."
     },
     "log_outcome": {
       "enum": [
@@ -172,7 +174,7 @@
         "unknown",
         "expired"
       ],
-      "description": "A destination outcome as logged: the eight of send plus expired."
+      "description": "A destination outcome as logged: the eight of send (suppressed included) plus expired."
     },
     "history_reason": {
       "enum": [
@@ -212,7 +214,7 @@
       "type": "string",
       "pattern": "^[a-z][a-z0-9_]{0,63}(?![\\s\\S])",
       "x-untrusted": true,
-      "description": "Untrusted. A notifier's error.code or refusal reason (read from its envelope and checked against this shape) or a router code: retries_exhausted, rate_capped, deployment_fault, exec_failed, output_overflow, killed, signal, expired, overflow."
+      "description": "Untrusted. A notifier's error.code or refusal reason (read from its envelope and checked against this shape) or a router code: retries_exhausted, rate_capped, env_missing, overflow, expired, deployment_fault, exec_failed, generic_failed, envelope_invalid, output_overflow, killed, signal, other."
     },
     "noop_reason": {
       "enum": [
@@ -222,7 +224,7 @@
         "disabled",
         "rule_drop"
       ],
-      "description": "Why no destination was called at the top level of send and test: unconfigured, no_rule, all_disabled, disabled (exit 22) or rule_drop (exit 0)."
+      "description": "Why no destination was called at the top level of send and test: unconfigured, no_rule, all_disabled, disabled (exit 22) or rule_drop (exit 0). all_disabled is decided before any call: every selected destination has enabled false in the router's config."
     },
     "error_code": {
       "enum": [
@@ -440,6 +442,11 @@
                 },
                 {
                   "required": [
+                    "repo"
+                  ]
+                },
+                {
+                  "required": [
                     "where"
                   ]
                 }
@@ -448,7 +455,7 @@
           }
         }
       ],
-      "description": "All present conditions must hold. An empty match matches everything. source and labels apply to both shapes; hook, repo and where to hook payloads only; level_min to channel notices only (a notice without level counts as info) and may not be combined with hook or where."
+      "description": "All present conditions must hold. An empty match matches everything. source and labels apply to both shapes; hook, repo and where to hook payloads only; level_min to channel notices only (a notice without level counts as info) and may not be combined with hook, repo or where. In where, an integer is a number written without a fraction or exponent, so 1.0 never equals 1."
     },
     "wildcard": {
       "type": "string",
@@ -476,7 +483,11 @@
         },
         "event_id": {
           "x-untrusted": true,
-          "description": "Read for the redelivery check, compared per destination, source and hook as its JSON text. Anything that is not an integer (a boolean is not) or a string of 1 to 256 characters is ignored."
+          "description": "Read for the redelivery check: an integer (not a boolean) or a plain string; anything else is ignored. A redelivery matches on the id and the repeat digest, per destination, source and hook; the id is compared as its JSON text."
+        },
+        "object_id": {
+          "x-untrusted": true,
+          "description": "Stored (and shown by history) only when it is an integer or a plain string, else null."
         },
         "repo": {
           "type": [
@@ -492,7 +503,7 @@
             "x-untrusted": true,
             "description": "A key=value string; a malformed one is ignored and counted in labels_ignored."
           },
-          "description": "Array of key=value strings (split at the first =). A value that is not an array is ignored and counted once in labels_ignored; at most 64 are read."
+          "description": "Array of key=value strings (split at the first =). A value that is not an array is ignored and counted once in labels_ignored. The first 64 elements are examined; each one that is not a string or not a valid label, and each element beyond 64, adds 1 to labels_ignored; a pair given twice counts once."
         },
         "reads_third_party": {
           "description": "Text opt-in needs the boolean false; any other value (missing, null, non-boolean) is unknown and excludes the text."
@@ -506,7 +517,7 @@
         "hook"
       ],
       "additionalProperties": true,
-      "description": "A hook payload: required string tool and hook; any other keys are free, and the router reads only the scalar fields a rule or template names plus event_id, repo, labels, reads_third_party and tainted. Every field is untrusted unless the producer's interface says otherwise."
+      "description": "A hook payload: required string tool and hook; any other keys are free, and the router reads only the scalar fields a rule or template names plus event_id, object_id, repo, labels, reads_third_party and tainted. Every field is untrusted unless the producer's interface says otherwise."
     },
     "channel_notice": {
       "type": "object",

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "notice-route/cli/flush.json",
   "title": "flush --json output",
-  "description": "Exit 0 (ok), 12 (partial: a call ended failed or unknown) and 22 (no_op: no destination had a due row). With --dry-run the due_* counts are filled and the result counts are 0.",
+  "description": "Exit 0 (ok), 12 (partial: a call ended failed or unknown) and 22 (no_op: every destination nothing_due or disabled, or no config, or enabled false; the destinations list is empty for the last two). With --dry-run the due_* counts are filled and the result counts and digests are 0. A destination in state already_running, disabled or env_missing was skipped and has every count 0.",
   "type": "object",
   "properties": {
     "outcome": {
@@ -29,14 +29,15 @@
               "already_running",
               "nothing_due",
               "quiet",
-              "disabled"
+              "disabled",
+              "env_missing"
             ]
           },
-          "due_retry": {
+          "due_single": {
             "type": "integer",
             "minimum": 0
           },
-          "due_deferred": {
+          "due_held": {
             "type": "integer",
             "minimum": 0
           },
@@ -67,15 +68,15 @@
           "digests": {
             "type": "integer",
             "minimum": 0,
-            "description": "Digest notifications built from deferred rows."
+            "description": "Digest notifications built from held rows."
           }
         },
         "additionalProperties": false,
         "required": [
           "name",
           "state",
-          "due_retry",
-          "due_deferred",
+          "due_single",
+          "due_held",
           "sent",
           "queued_retry",
           "failed",
@@ -136,6 +137,223 @@
                   ]
                 }
               ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "enum": [
+              "ok",
+              "no_op"
+            ]
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "destinations": {
+            "not": {
+              "contains": {
+                "anyOf": [
+                  {
+                    "properties": {
+                      "failed": {
+                        "minimum": 1
+                      }
+                    },
+                    "required": [
+                      "failed"
+                    ]
+                  },
+                  {
+                    "properties": {
+                      "unknown": {
+                        "minimum": 1
+                      }
+                    },
+                    "required": [
+                      "unknown"
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "no_op"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "destinations": {
+            "items": {
+              "properties": {
+                "state": {
+                  "enum": [
+                    "nothing_due",
+                    "disabled"
+                  ]
+                },
+                "sent": {
+                  "const": 0
+                },
+                "queued_retry": {
+                  "const": 0
+                },
+                "failed": {
+                  "const": 0
+                },
+                "unknown": {
+                  "const": 0
+                },
+                "dropped": {
+                  "const": 0
+                },
+                "expired": {
+                  "const": 0
+                },
+                "digests": {
+                  "const": 0
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "dry_run": {
+            "const": true
+          }
+        },
+        "required": [
+          "dry_run"
+        ]
+      },
+      "then": {
+        "properties": {
+          "destinations": {
+            "items": {
+              "properties": {
+                "sent": {
+                  "const": 0
+                },
+                "queued_retry": {
+                  "const": 0
+                },
+                "failed": {
+                  "const": 0
+                },
+                "unknown": {
+                  "const": 0
+                },
+                "dropped": {
+                  "const": 0
+                },
+                "expired": {
+                  "const": 0
+                },
+                "digests": {
+                  "const": 0
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "destinations": {
+            "contains": {
+              "properties": {
+                "state": {
+                  "enum": [
+                    "already_running",
+                    "disabled",
+                    "env_missing"
+                  ]
+                }
+              },
+              "required": [
+                "state"
+              ]
+            }
+          }
+        },
+        "required": [
+          "destinations"
+        ]
+      },
+      "then": {
+        "properties": {
+          "destinations": {
+            "items": {
+              "if": {
+                "properties": {
+                  "state": {
+                    "enum": [
+                      "already_running",
+                      "disabled",
+                      "env_missing"
+                    ]
+                  }
+                },
+                "required": [
+                  "state"
+                ]
+              },
+              "then": {
+                "properties": {
+                  "due_single": {
+                    "const": 0
+                  },
+                  "due_held": {
+                    "const": 0
+                  },
+                  "sent": {
+                    "const": 0
+                  },
+                  "queued_retry": {
+                    "const": 0
+                  },
+                  "failed": {
+                    "const": 0
+                  },
+                  "unknown": {
+                    "const": 0
+                  },
+                  "dropped": {
+                    "const": 0
+                  },
+                  "expired": {
+                    "const": 0
+                  },
+                  "digests": {
+                    "const": 0
+                  }
+                }
+              }
             }
           }
         }

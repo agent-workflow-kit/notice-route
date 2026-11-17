@@ -2,14 +2,16 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "notice-route/cli/validate.json",
   "title": "validate --json output",
-  "description": "Exit 0 (ok) and exit 12 (failed: a cmd_ok or probe check failed). A config that does not load is exit 2 and prints the error envelope instead; no config is exit 22.",
+  "description": "Exit 0 (ok) and exit 12 (failed: a cmd_ok or probe check failed). A config that does not load is exit 2 and prints the error envelope instead; no config is exit 22 with outcome no_op and no destinations.",
   "type": "object",
   "properties": {
     "outcome": {
       "enum": [
         "ok",
-        "failed"
-      ]
+        "failed",
+        "no_op"
+      ],
+      "description": "no config is exit 22 with outcome no_op."
     },
     "probe": {
       "type": "boolean",
@@ -33,7 +35,7 @@
               "type": "string",
               "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}(?![\\s\\S])"
             },
-            "description": "Names in env that are not set in the router's environment (reported, not an error)."
+            "description": "Names in env that are unset or empty in the router's environment (reported, not an error). A destination with a non-empty list is not probed."
           },
           "probe": {
             "oneOf": [
@@ -54,7 +56,8 @@
                       "null"
                     ],
                     "minimum": 0,
-                    "maximum": 255
+                    "maximum": 255,
+                    "description": "The exit code, or null when the call was killed or never started."
                   },
                   "enabled": {
                     "type": [
@@ -103,10 +106,13 @@
           "code": {
             "enum": [
               "destination_unused",
-              "rule_without_level",
+              "level_from_notice",
               "rule_unreachable",
               "worst_case_over_hook_timeout",
-              "cron_block_missing"
+              "flush_stale",
+              "env_file_unsafe",
+              "alert_unrouted",
+              "orphaned_queue"
             ]
           },
           "rule": {
@@ -148,6 +154,14 @@
     "send_worst_case_s": {
       "type": "number",
       "minimum": 0
+    },
+    "flush_age_s": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "description": "Seconds since the last flush started; null when none has run."
     }
   },
   "additionalProperties": false,
@@ -156,7 +170,8 @@
     "probe",
     "destinations",
     "warnings",
-    "send_worst_case_s"
+    "send_worst_case_s",
+    "flush_age_s"
   ],
   "allOf": [
     {
@@ -205,6 +220,25 @@
                 }
               ]
             }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "no_op"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "destinations": {
+            "maxItems": 0
           }
         }
       }

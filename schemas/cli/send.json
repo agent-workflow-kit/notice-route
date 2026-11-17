@@ -131,7 +131,7 @@
             ],
             "pattern": "^[a-z_]{1,32}(?![\\s\\S])",
             "x-untrusted": true,
-            "description": "Untrusted. The notifier's own outcome for exit 0 or 22, or null."
+            "description": "Untrusted. The notifier's own outcome for exit 0 or 22, or null. A notifier's own exit 22 is outcome disabled with a non-null notifier_outcome (exit 0 of send)."
           }
         },
         "additionalProperties": false,
@@ -204,11 +204,123 @@
                 }
               }
             }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "enum": [
+                    "failed",
+                    "unknown"
+                  ]
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "code": {
+                  "$ref": "../defs.json#/$defs/notifier_code"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "enum": [
+                    "deferred",
+                    "dropped",
+                    "suppressed"
+                  ]
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "reason": {
+                  "$ref": "../defs.json#/$defs/destination_reason"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "enum": [
+                    "sent",
+                    "disabled"
+                  ]
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "code": {
+                  "type": "null"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "deferred"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "reason": {
+                  "enum": [
+                    "quiet",
+                    "env_missing",
+                    "rate_capped"
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "outcome": {
+                  "const": "suppressed"
+                }
+              },
+              "required": [
+                "outcome"
+              ]
+            },
+            "then": {
+              "properties": {
+                "reason": {
+                  "enum": [
+                    "redelivered",
+                    "repeat"
+                  ]
+                }
+              }
+            }
           }
         ]
       },
       "maxItems": 8,
-      "description": "One entry per selected destination; empty for rule_drop, no_rule, unconfigured and disabled."
+      "description": "One entry per selected destination; empty for rule_drop, no_rule, unconfigured and disabled. Names are unique (checked by tests; JSON Schema cannot express it). outcome partial exactly when a destination ended failed or unknown."
     },
     "dedupe": {
       "oneOf": [
@@ -324,6 +436,42 @@
     {
       "if": {
         "properties": {
+          "outcome": {
+            "enum": [
+              "ok",
+              "no_op"
+            ]
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "destinations": {
+            "not": {
+              "contains": {
+                "properties": {
+                  "outcome": {
+                    "enum": [
+                      "failed",
+                      "unknown"
+                    ]
+                  }
+                },
+                "required": [
+                  "outcome"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
           "reason": {
             "enum": [
               "rule_drop",
@@ -367,6 +515,9 @@
               "properties": {
                 "outcome": {
                   "const": "disabled"
+                },
+                "notifier_outcome": {
+                  "type": "null"
                 }
               }
             }

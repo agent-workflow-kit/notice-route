@@ -1,14 +1,11 @@
-# Example config for notice-route: a complete worked configuration.
+# Example config for notice-route: every key, documented (the rules for the awkit producers are in the drop-in).
 # Location: ~/.config/notice-route/config.yaml (drop-ins: config.d/*.yaml, lexical order; rules and
-# hooks.post-fail lists append, any other key defined in two files is an error). The directory,
-# this file and every drop-in must be owned by you and not group- or world-writable. Keys and
-# defaults are defined in docs/interface.md and checked by schemas/config.json (CI validates this
-# file against it and renders every rule against the producers' hook examples).
-#
-# The rules below are also in examples/awkit-wiring.yaml as a drop-in. Use one or the other: a
-# rule name used twice is an error.
+# hooks.post-fail lists append, destinations, quiet_hours and link entries merge by name, and
+# anything defined twice is an error). The directory, this file and every drop-in must be owned by
+# you and not group- or world-writable. Keys and defaults are defined in docs/interface.md and
+# checked by schemas/config.json.
 
-# enabled (default true): false makes send exit 22 (disabled) and flush do nothing.
+# enabled (default true): false makes send exit 22 (disabled) and flush exit 22 doing nothing.
 enabled: true
 
 # --- destinations -------------------------------------------------------------
@@ -19,7 +16,8 @@ destinations:
     # kind (required): slack-notice, ha-notice, wsl-notice or generic. It selects the retry rules.
     kind: ha-notice
     # cmd (required): an argv list, no shell. cmd[0] is an absolute path to an executable owned by
-    # you or root and not group- or world-writable (uv tool install puts it in ~/.local/bin). The
+    # you or root and not group- or world-writable (uv tool install puts a symlink in ~/.local/bin;
+    # the resolved file is checked and run). The
     # notifier's own --config belongs here, one config file per destination. It may not contain
     # send, --stdin-json, --json, --actor or --dedupe-key.
     cmd:
@@ -38,7 +36,8 @@ destinations:
     max_per_hour: 20
     # env (default []): the only variables passed to the notifier besides PATH, LANG, LC_ALL (and
     # WSL_INTEROP, WSL_DISTRO_NAME for wsl-notice). Credentials go here by name, never by value.
-    # A send that runs without them is delivered by flush from cron, whose env file must hold them.
+    # A send that runs without them queues the notification for flush from cron (sent as itself
+    # within a minute); an empty value counts as unset.
     env:
       - HA_TOKEN
     # enabled (default true): false skips the destination with outcome disabled.
@@ -67,7 +66,8 @@ destinations:
 
 # --- quiet hours ----------------------------------------------------------------
 # Named windows. Inside a destination's window: info is dropped, warn and action are deferred
-# to the end of the window, error is delivered at once.
+# to the end of the window, error is delivered at once. start and end must be quoted: an unquoted
+# 22:00 is not a string and is an error.
 quiet_hours:
   night:
     # timezone (required): an IANA name from the system database; no default.
@@ -81,7 +81,7 @@ quiet_hours:
 
 # --- links ----------------------------------------------------------------------
 # The router's own link tables, the only source of links. Hosts are <host>[:<port>] in lowercase;
-# ticket base URLs are https and end in a slash.
+# ticket base URLs are https URLs that end in a slash. A port is 1 to 65535.
 links:
   # hosts: host name -> github or gitlab; builds pr_url from a payload's pr (host/path#n).
   hosts:
@@ -111,15 +111,16 @@ log: true
 # --- cron ---------------------------------------------------------------------------
 cron:
   # env_file (default none): an absolute path to a mode-0600 file that the cron lines source.
-  # The notifiers' credentials must be in it, because the router passes only the variables a
-  # destination names and a send without them is delivered by flush from cron.
+  # The cron lines export what it assigns (set -a), so plain NAME=value lines work. The notifiers'
+  # credentials must be in it.
   env_file: /home/example/.config/notice-route/cron.env
 
 # --- hooks --------------------------------------------------------------------------
-# post-fail fires after a destination's failure was surfaced (the failure is also routed through
-# the rules below as source notice-route). It is for scripts; the command runs with sh -c and the
-# router's environment minus the destinations' credential variables. Entries have exactly cmd,
-# timeout (default 30s) and async (default false). Example, left out:
+# post-fail runs from the next flush after a destination's failure was surfaced (the failure is
+# also routed through the rules below as source notice-route). It is for scripts; the command runs
+# with sh -c and the router's environment minus the destinations' credential variables. Entries
+# have cmd, timeout (default 30s) and async (default false: flush waits for the hook before it
+# exits). Example, left out:
 #
 # hooks:
 #   post-fail:
@@ -128,171 +129,29 @@ cron:
 #       async: true
 
 # --- rules --------------------------------------------------------------------------
+# The rules for the awkit producers are in examples/awkit-wiring.yaml, a config.d drop-in; CI
+# validates this file and the drop-in as one config and renders every rule against the producers'
+# hook examples.
+#
 # Ordered. The first rule whose match holds decides everything; no later rule is consulted.
-# A rule that can match a hook payload (it has neither level nor level_min) should set a level.
-# A token renders a payload value only when it is plain (a number, a boolean or a short word-like
-# string, at most 64 characters); other text needs include_text and a payload that says it is not
-# third-party or tainted. A token that renders empty still sends the notice, and `test` lists it as
-# missing or excluded. A {{pr}} longer than 64 characters renders empty: the link carries the PR.
+# A rule that can match a hook payload (it has no level_min) must set a level.
+# A token renders a payload value only when it is plain (a number, a boolean, or a string of
+# letters, digits and . _ / # - of at most 256 characters); other text needs include_text and a
+# payload that says it is not third-party or tainted. A token that renders empty still sends the
+# notice, and `test` lists it as missing or excluded. A {{pr}} with a port renders empty: the link
+# carries the PR.
 # name: [a-z0-9][a-z0-9_-]{0,63}, unique. notify: 1 to 8 destinations. dedup_window default: the
 # defaults.dedup_window value.
 rules:
-  # A launch is not worth a notification. drop allows only name and match.
-  - name: launch-drop
-    match:
-      source: agent-spawn
-      hook: post-launch
-    drop: true
-
-  - name: agent-done
-    match:
-      source: agent-spawn
-      hook: post-state-change
-      where:
-        state: reported
-    notify: [team-chat]
-    level: info
-    title: "Agent done"
-    message: "Agent {{object_id}} reported (state {{state}})."
-
-  # Attention is routed from post-escalate only: it fires once when needs_attention changes,
-  # while post-state-change repeats needs_attention on every later event.
-  - name: agent-failed
-    match:
-      source: agent-spawn
-      hook: post-escalate
-      where:
-        needs_attention: failed
-    notify: [phone, team-chat]
-    level: error
-    title: "Agent failed"
-    message: "Agent {{object_id}} failed."
-
-  # Covers needs-input too: a needs-input outcome sets needs_attention to escalated.
-  - name: agent-escalated
-    match:
-      source: agent-spawn
-      hook: post-escalate
-    notify: [phone, desktop]
-    level: action
-    title: "Agent needs attention"
-    message: "Agent {{object_id}} needs attention ({{needs_attention}})."
-    dedup_window: 30m
-
-  - name: review-draft-ready
-    match:
-      source: review-watch
-      hook: post-draft
-    notify: [team-chat]
-    level: info
-    title: "Review draft ready"
-    message: "Draft {{draft_id}} for {{pr}} is ready (tier {{tier}})."
-    link: "{{pr_url}}"
-
-  - name: review-escalated
-    match:
-      source: review-watch
-      hook: post-attention
-      where:
-        reason: escalated
-    notify: [phone, team-chat]
-    level: action
-    title: "Review escalated"
-    message: "Review attention ({{reason}}) for {{object_id}}."
-    link: "{{pr_url}}"
-
-  - name: review-failed
-    match:
-      source: review-watch
-      hook: post-attention
-      where:
-        reason: failed
-    notify: [phone, team-chat]
-    level: error
-    title: "Review failed"
-    message: "Review attention ({{reason}}) for {{object_id}}."
-    link: "{{pr_url}}"
-
-  - name: ticket-attention
-    match:
-      source: ticket-work
-      hook: post-attention
-    notify: [phone, team-chat]
-    level: action
-    title: "Ticket needs attention"
-    message: "Ticket {{key}} needs attention ({{reason}}, phase {{phase}})."
-    link: "{{ticket_url}}"
-
-  - name: ticket-pending
-    match:
-      source: ticket-work
-      hook: post-pending
-    notify: [phone, team-chat]
-    level: action
-    title: "Confirmation pending"
-    message: "Ticket {{key}} has a pending {{action}} confirmation."
-    link: "{{ticket_url}}"
-
-  - name: ticket-start-failed
-    match:
-      source: ticket-work
-      hook: post-start-failed
-    notify: [phone, team-chat]
-    level: error
-    title: "Ticket start failed"
-    message: "Starting ticket {{key}} failed."
-    link: "{{ticket_url}}"
-
-  - name: job-held
-    match:
-      source: jobsctl
-      hook: post-held
-    notify: [phone, team-chat]
-    level: action
-    title: "Job held"
-    message: "Job {{object_id}} (attempt {{attempt.attempt}}) is held."
-
-  # job.status queued is also a failure, with a retry scheduled: only a final failure is routed.
-  - name: job-failed
-    match:
-      source: jobsctl
-      hook: post-fail
-      where:
-        job.status: failed
-    notify: [phone, team-chat]
-    level: error
-    title: "Job failed"
-    message: "Job {{object_id}} failed (attempt {{attempt.attempt}})."
-
-  - name: pr-approved
-    match:
-      source: pr-watch
-      hook: on-approved
-    notify: [team-chat]
-    level: info
-    title: "PR approved"
-    message: "{{pr}} was approved by {{reviewer.login}}."
-    link: "{{pr_url}}"
-
-  - name: pr-changes-requested
-    match:
-      source: pr-watch
-      hook: on-changes_requested
-    notify: [team-chat]
-    level: warn
-    title: "Changes requested"
-    message: "{{reviewer.login}} requested changes on {{pr}}."
-    link: "{{pr_url}}"
-
   # The router's own failure alerts (source notice-route). Delivered by the next flush.
   - name: router-failures
     match:
       source: notice-route
       hook: post-fail
-    notify: [team-chat]
+    notify: [team-chat, phone]
     level: warn
     title: "Notification channel failed"
-    message: "Destination {{object_id}} ({{kind}}): {{code}}, {{outcome}} after {{attempts}} attempts."
+    message: "Destination {{object_id}} ({{kind}}): {{code}}, {{outcome}} after {{attempts}} attempts, for a {{notification_level}} from {{notification_source}}."
 
   # A pass-through rule: a notice of level error from any source goes to the phone with its own
   # title and message.

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "notice-route/notification.json",
   "title": "send --stdin-json input",
-  "description": "One JSON object of one of two shapes, told apart by keys alone: a hook payload (the keys tool and hook are both strings) or a channel notice (only title, message, level and link, with message present). Anything else is exit 20 payload_unrecognized. The reader is strict beyond what a schema expresses: complete within 5 seconds, at most 1048576 bytes, valid UTF-8, no BOM, no duplicate keys at any depth (compared after unescaping), no NaN or Infinity, no integer outside the signed 64-bit range, nesting depth at most 16; a lone surrogate in a string becomes U+FFFD.",
+  "description": "One JSON object of one of two shapes, told apart by keys alone: a hook payload (the keys tool and hook are both strings) or a channel notice (only title, message, level and link, with message present). Anything else is exit 20 payload_unrecognized. The reader is strict beyond what a schema expresses: complete within 5 seconds of the first read when read from stdin, at most 1048576 bytes, valid UTF-8, no BOM, no duplicate keys at any depth (compared after unescaping), no NaN or Infinity, no integer outside the signed 64-bit range, nesting depth at most 16 (the top-level object is depth 1); a lone surrogate in a string becomes U+FFFD.",
   "oneOf": [
     {
       "$ref": "defs.json#/$defs/hook_payload"

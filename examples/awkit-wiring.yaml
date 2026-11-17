@@ -1,7 +1,7 @@
 # A config.d drop-in: copy to ~/.config/notice-route/config.d/ after defining destinations phone,
-# team-chat and desktop in config.yaml. It holds rules only (a drop-in appends rules and refuses
-# any other key defined twice), and its rule names must not be used in your own config.
-# It is the rules block of config.example.yaml; CI keeps the two equal and renders every rule.
+# team-chat and desktop in config.yaml. It holds the producer rules; config.example.yaml holds the
+# destinations phone, team-chat and desktop and the router's own rules. It holds rules only; rule
+# names must not be used in your own config.
 
 rules:
   # A launch is not worth a notification. drop allows only name and match.
@@ -34,6 +34,28 @@ rules:
     level: error
     title: "Agent failed"
     message: "Agent {{object_id}} failed."
+
+  - name: agent-lost
+    match:
+      source: agent-spawn
+      hook: post-escalate
+      where:
+        needs_attention: lost
+    notify: [phone, team-chat]
+    level: error
+    title: "Agent lost"
+    message: "Agent {{object_id}} was lost."
+
+  - name: agent-launch-failed
+    match:
+      source: agent-spawn
+      hook: post-escalate
+      where:
+        needs_attention: launch_failed
+    notify: [phone, team-chat]
+    level: error
+    title: "Agent launch failed"
+    message: "Agent {{object_id}} failed to launch."
 
   # Covers needs-input too: a needs-input outcome sets needs_attention to escalated.
   - name: agent-escalated
@@ -80,6 +102,16 @@ rules:
     message: "Review attention ({{reason}}) for {{object_id}}."
     link: "{{pr_url}}"
 
+  - name: review-attention
+    match:
+      source: review-watch
+      hook: post-attention
+    notify: [team-chat]
+    level: warn
+    title: "Review needs attention"
+    message: "Review attention ({{reason}}) for {{object_id}}."
+    link: "{{pr_url}}"
+
   - name: ticket-attention
     match:
       source: ticket-work
@@ -117,7 +149,7 @@ rules:
     notify: [phone, team-chat]
     level: action
     title: "Job held"
-    message: "Job {{object_id}} (attempt {{attempt.attempt}}) is held."
+    message: "Job {{object_id}} is held."
 
   # job.status queued is also a failure, with a retry scheduled: only a final failure is routed.
   - name: job-failed
@@ -129,7 +161,7 @@ rules:
     notify: [phone, team-chat]
     level: error
     title: "Job failed"
-    message: "Job {{object_id}} failed (attempt {{attempt.attempt}})."
+    message: "Job {{object_id}} failed."
 
   - name: pr-approved
     match:
@@ -138,7 +170,7 @@ rules:
     notify: [team-chat]
     level: info
     title: "PR approved"
-    message: "{{pr}} was approved by {{reviewer.login}}."
+    message: "{{pr}} was approved."
     link: "{{pr_url}}"
 
   - name: pr-changes-requested
@@ -148,22 +180,5 @@ rules:
     notify: [team-chat]
     level: warn
     title: "Changes requested"
-    message: "{{reviewer.login}} requested changes on {{pr}}."
+    message: "Changes were requested on {{pr}}."
     link: "{{pr_url}}"
-
-  # The router's own failure alerts (source notice-route). Delivered by the next flush.
-  - name: router-failures
-    match:
-      source: notice-route
-      hook: post-fail
-    notify: [team-chat]
-    level: warn
-    title: "Notification channel failed"
-    message: "Destination {{object_id}} ({{kind}}): {{code}}, {{outcome}} after {{attempts}} attempts."
-
-  # A pass-through rule: a notice of level error from any source goes to the phone with its own
-  # title and message.
-  - name: direct-errors
-    match:
-      level_min: error
-    notify: [phone]

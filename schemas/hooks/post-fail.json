@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "notice-route/hooks/post-fail.json",
   "title": "post-fail hook payload (stdin)",
-  "description": "Fired after a destination's failure was surfaced (at most once per code and destination per UTC day, rate_capped once per destination per UTC hour). Carries no title, message, link or payload text. The router also routes this payload through its own rules as source notice-route.",
+  "description": "Run by the next flush after a destination's failure was surfaced: at most once per code and destination per UTC day, except rate_capped, env_missing, overflow and expired, at most once per destination per UTC hour; at most 8 distinct codes per destination per UTC day, after which further codes are surfaced once that day as other. Carries no title, message, link or payload text. The router also routes this payload through its own rules as source notice-route and hook post-fail (the bare names source and level are the derived fields of templates; the failed notification's are notification_source and notification_level).",
   "type": "object",
   "properties": {
     "tool": {
@@ -20,7 +20,7 @@
     "event_id": {
       "type": "integer",
       "minimum": 1,
-      "description": "The id of the failing deliveries row."
+      "description": "The id of the failing deliveries row (never reused)."
     },
     "labels": {
       "type": "array",
@@ -28,7 +28,8 @@
         "$ref": "../defs.json#/$defs/label"
       },
       "x-untrusted": true,
-      "maxItems": 96
+      "maxItems": 16,
+      "description": "At most 16 labels, the lexically first, within 1024 characters (matching uses every label)."
     },
     "code": {
       "$ref": "../defs.json#/$defs/notifier_code"
@@ -46,11 +47,11 @@
       "type": "integer",
       "minimum": 0
     },
-    "source": {
+    "notification_source": {
       "$ref": "../defs.json#/$defs/source_name",
       "x-untrusted": true
     },
-    "level": {
+    "notification_level": {
       "$ref": "../defs.json#/$defs/level"
     },
     "kind": {
@@ -68,8 +69,8 @@
     "code",
     "outcome",
     "attempts",
-    "source",
-    "level",
+    "notification_source",
+    "notification_level",
     "kind"
   ],
   "allOf": [
@@ -87,7 +88,10 @@
       "then": {
         "properties": {
           "code": {
-            "const": "rate_capped"
+            "enum": [
+              "rate_capped",
+              "env_missing"
+            ]
           }
         }
       }

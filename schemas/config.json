@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "notice-route/config.json",
   "title": "notice-route config",
-  "description": ".config/notice-route/config.yaml under the home directory from the password database (HOME and XDG_CONFIG_HOME are not read; an unusable home directory is exit 2 with key home) plus config.d/*.yaml beside it in lexical order (rules and hooks.post-fail lists append; a rule name used twice or any other key defined in two files is config_invalid). A drop-in that holds only rules is valid against this schema. Invalid config exits 2 (config_invalid), naming the key. Files are parsed with a strict YAML loader (no anchors, aliases or explicit tags, no duplicate keys; yes, on and dates are strings). Constraints between keys (a rule's destinations exist, unique rule names, a quiet name exists, ranges of durations, retention of at least 1d, time zones, end different from start) are checked by the loader and by validate, not by this schema. Self-contained: no external references.",
+  "description": ".config/notice-route/config.yaml under the home directory from the password database (HOME and XDG_CONFIG_HOME are not read; an unusable home directory is exit 2 with key home) plus config.d/*.yaml beside it in lexical order (rules and hooks.post-fail lists append; entries of destinations, quiet_hours, links.hosts and links.tickets merge by name; a rule name or entry name defined twice, or any other key defined in two files, is config_invalid). A drop-in that holds only rules is valid against this schema. Invalid config exits 2 (config_invalid), naming the key. Files are parsed with a strict YAML loader (no anchors, aliases or explicit tags, no duplicate keys; yes, on and dates are strings). Constraints between keys (a rule's destinations exist, unique rule names, a quiet name exists, ranges of durations, retention of at least 1d, time zones, end different from start) are checked by the loader and by validate, not by this schema. Self-contained: no external references.",
   "$defs": {
     "destination_kind": {
       "enum": [
@@ -130,6 +130,11 @@
                 },
                 {
                   "required": [
+                    "repo"
+                  ]
+                },
+                {
+                  "required": [
                     "where"
                   ]
                 }
@@ -138,7 +143,7 @@
           }
         }
       ],
-      "description": "All present conditions must hold. An empty match matches everything. source and labels apply to both shapes; hook, repo and where to hook payloads only; level_min to channel notices only (a notice without level counts as info) and may not be combined with hook or where."
+      "description": "All present conditions must hold. An empty match matches everything. source and labels apply to both shapes; hook, repo and where to hook payloads only; level_min to channel notices only (a notice without level counts as info) and may not be combined with hook, repo or where. In where, an integer is a number written without a fraction or exponent, so 1.0 never equals 1."
     },
     "rule_name": {
       "type": "string",
@@ -158,7 +163,7 @@
     "enabled": {
       "type": "boolean",
       "default": true,
-      "description": "false makes send exit 22 (disabled) before reading state and flush do nothing."
+      "description": "false makes send exit 22 (disabled) before reading state and flush exit 22 doing nothing."
     },
     "destinations": {
       "type": "object",
@@ -178,7 +183,7 @@
               {
                 "type": "string",
                 "pattern": "^/[^\\x00]+(?![\\s\\S])",
-                "description": "An absolute path (load error otherwise). At each call the file and every parent directory must be owned by the user or root and not group- or world-writable, and the file must have no setuid or setgid bit (else exec_failed)."
+                "description": "An absolute path (load error otherwise). At each call the router resolves it with realpath (following symlinks); the resolved file and every directory of the resolved path must be owned by the user or root and not group- or world-writable, and the file must have no setuid or setgid bit (else exec_failed). The resolved path is executed."
               }
             ],
             "items": {
@@ -192,7 +197,7 @@
               }
             },
             "maxItems": 32,
-            "description": "An argv list of at most 32 elements of at most 4096 characters; no shell. cmd[0] is absolute; the ownership and mode check runs at each call. The notifier's --config <path> belongs here. An element equal to send, --stdin-json, --json, --actor or --dedupe-key, or starting with one of those flags and =, is config_invalid."
+            "description": "An argv list of at most 32 elements of at most 4096 characters; no shell. cmd[0] is absolute; the ownership and mode check runs at each call on the resolved path. The notifier's --config <path> belongs here. An element equal to send, --stdin-json, --json, --actor or --dedupe-key, or starting with one of those flags and =, is config_invalid."
           },
           "timeout": {
             "$ref": "#/$defs/duration",
@@ -213,7 +218,7 @@
             "minimum": 0,
             "maximum": 3600,
             "default": 30,
-            "description": "Notifier calls started per UTC clock hour, counted separately for error and for the other levels; 0 means no cap."
+            "description": "Notifier calls claimed per UTC clock hour, counted separately for error and for the other levels (a digest counts in its highest class and is never held); 0 means no cap."
           },
           "env": {
             "type": "array",
@@ -232,7 +237,7 @@
             },
             "uniqueItems": true,
             "default": [],
-            "description": "The only variables passed to the notifier besides the fixed set (PATH, LANG, LC_ALL, WSL_INTEROP, WSL_DISTRO_NAME), which may not be named. The names are trusted configuration. A send that finds one unset defers the notification to flush."
+            "description": "The only variables passed to the notifier besides the fixed set (PATH, LANG, LC_ALL, WSL_INTEROP, WSL_DISTRO_NAME), which may not be named. The names are trusted configuration. An unset or empty variable counts as unset: send queues the notification for flush, and flush does not call the destination."
           },
           "enabled": {
             "type": "boolean",
@@ -326,7 +331,7 @@
               "gitlab"
             ]
           },
-          "description": "<host>[:<port>] (lowercase, the pr grammar) to forge type; builds pr_url."
+          "description": "<host>[:<port>] (lowercase, the pr grammar; a port is 1 to 65535, checked by the loader) to forge type; builds pr_url."
         },
         "tickets": {
           "type": "object",
@@ -336,8 +341,8 @@
           "additionalProperties": {
             "type": "string",
             "maxLength": 1024,
-            "pattern": "^https://[!-~]+/(?![\\s\\S])",
-            "description": "An https base URL ending in /; the ticket key is appended."
+            "pattern": "^https://[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?/(?:[A-Za-z0-9._~/%?=&+-]*/)?(?![\\s\\S])",
+            "description": "An https base URL ending in /, in the literal URL grammar of a rule's link (port 1 to 65535, checked by the loader); the ticket key is appended."
           },
           "description": "Ticket site name to base URL; builds ticket_url."
         }
@@ -374,21 +379,21 @@
           },
           "level": {
             "$ref": "#/$defs/level",
-            "description": "The final level when set; else the channel notice's own level, else info. A rule without level and without level_min draws a validate warning."
+            "description": "The final level when set; else the channel notice's own level, else info. Required unless drop or match.level_min (a rule that can match a hook payload must set a level)."
           },
           "title": {
             "type": "string",
             "minLength": 1,
             "maxLength": 2000,
             "pattern": "^(?:(?!\\{\\{)[\\s\\S]|\\{\\{(?:labels\\.[a-z0-9][a-z0-9_.-]{0,63}|(?!labels\\.)[A-Za-z_][A-Za-z0-9_]{0,63}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,3})\\}\\})*(?![\\s\\S])",
-            "description": "Template for the title, optional; needs message. A token renders a payload value only when it is plain (an integer, a boolean or a string matching [A-Za-z0-9][A-Za-z0-9._/#@+=-]{0,63}); other text renders empty in a title. The rendered title is cut to 256 characters."
+            "description": "Template for the title, optional; needs message. A token renders a payload value only when it is plain (a number, a boolean or a string matching [A-Za-z0-9][A-Za-z0-9._/#-]{0,255}); other text renders empty in a title. The rendered title is sanitized and cut to 256 characters."
           },
           "message": {
             "type": "string",
             "minLength": 1,
             "maxLength": 2000,
             "pattern": "^(?:(?!\\{\\{)[\\s\\S]|\\{\\{(?:labels\\.[a-z0-9][a-z0-9_.-]{0,63}|(?!labels\\.)[A-Za-z_][A-Za-z0-9_]{0,63}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,3})\\}\\})*(?![\\s\\S])",
-            "description": "Template for the message; a rule without message is a pass-through rule and must have match.level_min. Text values render only through include_text. The rendered message is cut to 4000 characters."
+            "description": "Template for the message; a rule without message is a pass-through rule and must have match.level_min. Text values render only through include_text. The rendered message is sanitized and cut to 4000 characters."
           },
           "link": {
             "anyOf": [
@@ -402,10 +407,10 @@
                 "type": "string",
                 "minLength": 9,
                 "maxLength": 1024,
-                "pattern": "^https://(?:(?!\\{\\{)[!-~])+(?![\\s\\S])"
+                "pattern": "^https://[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~/%?=&+-]*)?(?![\\s\\S])"
               }
             ],
-            "description": "Exactly {{pr_url}}, exactly {{ticket_url}}, or a literal https URL of 1 to 1024 printable ASCII characters with no token. A link that renders empty means no link."
+            "description": "Exactly {{pr_url}}, exactly {{ticket_url}}, or a literal URL https://<host>[:<port>][/<path>] of at most 1024 characters (path characters [A-Za-z0-9._~/%?=&+-]; a port is 1 to 65535, checked by the loader). A link that renders empty means no link."
           },
           "dedup_window": {
             "$ref": "#/$defs/duration_long",
@@ -473,6 +478,26 @@
                     }
                   }
                 }
+              ],
+              "allOf": [
+                {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "level"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "match": {
+                          "required": [
+                            "level_min"
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                }
               ]
             }
           }
@@ -535,7 +560,7 @@
               "async": {
                 "type": "boolean",
                 "default": false,
-                "description": "Do not wait for the hook."
+                "description": "Do not wait for the hook before flush exits (the router runs post-fail hooks from flush only)."
               }
             },
             "required": [
@@ -556,7 +581,7 @@
           "type": "string",
           "maxLength": 4096,
           "pattern": "^/[^\\x00]+(?![\\s\\S])",
-          "description": "Absolute path of a mode-0600 file the cron lines source."
+          "description": "Absolute path of a mode-0600 file the cron lines source and export (set -a)."
         }
       },
       "additionalProperties": false

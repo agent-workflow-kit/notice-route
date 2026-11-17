@@ -45,7 +45,7 @@
         "rate",
         "queue"
       ],
-      "description": "Rows deleted per table: history is the deliveries table, rate the counters of past hours, queue the rows 24 hours old or more."
+      "description": "Rows deleted per table: history is the deliveries table, rate the counters of past hours, queue the unclaimed rows 24 hours old or more."
     }
   },
   "additionalProperties": false,

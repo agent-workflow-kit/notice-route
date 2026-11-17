@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "notice-route/cli/test.json",
   "title": "test --json output (and send --dry-run --json)",
-  "description": "What send would do, with no state change. reason is null when a rule matched and destinations were decided, rule_drop for a drop rule, and unconfigured, no_rule or disabled when nothing was decided (exit 22; all_disabled when every decision is disabled). Then title, message and link are null and destinations is empty, except for all_disabled.",
+  "description": "What send would do, with no state change. reason is null when a rule matched and destinations were decided, rule_drop for a drop rule, and unconfigured, no_rule or disabled when nothing was decided (exit 22; all_disabled when every selected destination has enabled false, also exit 22). Then title, message and link are null and destinations is empty, except for all_disabled.",
   "type": "object",
   "properties": {
     "shape": {
@@ -93,6 +93,10 @@
     },
     "text_excluded": {
       "type": "boolean"
+    },
+    "labels_ignored": {
+      "type": "integer",
+      "minimum": 0
     },
     "level": {
       "oneOf": [
@@ -185,6 +189,51 @@
                 }
               }
             }
+          },
+          {
+            "if": {
+              "properties": {
+                "decision": {
+                  "enum": [
+                    "drop",
+                    "defer",
+                    "suppress"
+                  ]
+                }
+              },
+              "required": [
+                "decision"
+              ]
+            },
+            "then": {
+              "properties": {
+                "reason": {
+                  "$ref": "../defs.json#/$defs/destination_reason"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "decision": {
+                  "enum": [
+                    "send",
+                    "disabled"
+                  ]
+                }
+              },
+              "required": [
+                "decision"
+              ]
+            },
+            "then": {
+              "properties": {
+                "reason": {
+                  "type": "null"
+                }
+              }
+            }
           }
         ]
       },
@@ -204,11 +253,31 @@
     "missing",
     "excluded",
     "text_excluded",
+    "labels_ignored",
     "level",
     "dedupe",
     "destinations"
   ],
   "allOf": [
+    {
+      "if": {
+        "properties": {
+          "excluded": {
+            "minItems": 1
+          }
+        },
+        "required": [
+          "excluded"
+        ]
+      },
+      "then": {
+        "properties": {
+          "text_excluded": {
+            "const": true
+          }
+        }
+      }
+    },
     {
       "if": {
         "properties": {
