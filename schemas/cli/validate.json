@@ -112,7 +112,8 @@
               "flush_stale",
               "env_file_unsafe",
               "alert_unrouted",
-              "orphaned_queue"
+              "orphaned_queue",
+              "flush_env_missing"
             ]
           },
           "rule": {

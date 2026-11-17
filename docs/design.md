@@ -1,6 +1,6 @@
 # notice-route: design
 
-Status: designed 2026-11-17 against architecture v1.24, revised after review passes 1 and 2. The normative rules are in [interface.md](interface.md); this document records why, and how the tool is built. It links to interface headings and does not restate their tables.
+Status: designed 2026-11-17 against architecture v1.24, revised after review. The normative rules are in [interface.md](interface.md); this document records why, and how the tool is built. It links to interface headings and does not restate their tables.
 
 ## Role and layer
 
@@ -46,40 +46,39 @@ Decisions the user did not see as choices, made while writing and open to correc
 - C-1: the whole-call budget of the approved model bounds only the lock wait (a started call runs to its deadline); `lock_wait` defaults to 2s, a `send` makes at most one call per destination, and the worst case is 29 s with defaults, counted from the end of input, under the hooks' 30 s default. `validate` prints the figure; the bound excludes input reading and every hook (hooks run from `flush`).
 - C-2: a destination's `timeout` is at least the notifier's own; the router cannot read the notifier's value.
 - C-3: input limits for the strict reader (1 MiB, depth 16) and label grammar (producer-compatible, up to 64 payload labels read and 32 `--label`).
-- C-4: the retry schedule (1 m, 5 m, 30 m, 2 h counted from the end of the previous call; 5 attempts, 3 for wsl-notice, its caller contract), digest size (10 lines), the 24 hour expiry; `lock_busy` counts no attempt and is due again after 60 s (S-16; pass 1 had made it an attempt); after a retryable result `flush` stops calling that destination for the run; one 100-row cap covers the unclaimed `held` and `single` rows; immediate retries go through the queue and count as attempts.
+- C-4: the retry schedule (1 m, 5 m, 30 m, 2 h counted from the end of the previous call; 5 attempts, 3 for wsl-notice, its caller contract), digest size (10 lines), the 24 hour expiry; `lock_busy` counts no attempt and is due again after 60 s; after a retryable, `failed` or `unknown` result `flush` stops calling that destination for the run (its other due rows wait for the next run); one 100-row cap covers the unclaimed `held` and `single` rows; immediate retries go through the queue and count as attempts.
 - C-5: the cap counts calls claimed (failures too) in the current UTC hour; a digest counts in its highest class and is never held.
-- C-6: removed in review pass 1 (the deny-list is gone).
 - C-7: `post-fail` is best-effort, at most once, run by `flush`, with no outbox in 0.x; expiry, overflow, the cap and a missing credential are surfaced too.
 - C-8: a label on a payload that does not fit the grammar is ignored and counted, not refused.
 - C-9: exit 20 for payload faults only; `config_unsafe` and bad config are exit 2.
 - C-10: pass-through rules require `level_min`, and messages are cut at 4000 characters.
-- C-11: a `send` or `flush` that lacks a destination's credential never calls it: `send` queues the notification as a single row due now, `flush` leaves the rows and surfaces `env_missing`; an empty value counts as unset (pass 2 overturns pass 1's `flush` always calling).
-- C-12: the forbidden `env` names list is removed; the name grammar and a fixed set remain.
+- C-11: a `send` or `flush` that lacks a destination's credential never calls it: `send` queues the notification as a single row due now, `flush` leaves the rows and surfaces `env_missing`; an empty value counts as unset.
 - C-13: every call claims its rows and a crash resends (at least once).
 - C-14: drop-ins append `rules` and `hooks.post-fail`, merge destination, window and link entries by name, and refuse anything defined twice.
 - C-15: the digest title is `N held notifications`.
 - C-16: the row caps are 100000 per table, enforced on insert; retention settings are at least 1 day.
-- C-17: input from stdin must be complete within 5 seconds of the first read, and a lone surrogate is replaced, not refused.
+- C-17: input from stdin must be complete within 5 seconds of the start of the command, and a lone surrogate is replaced, not refused.
 - C-18: a top-level `enabled` key disables the router.
-- C-19: a rule that can match a hook payload must set `level`, as S-3 approved (pass 1 had only warned).
-- C-20: `test` takes `send`'s input flags instead of S-15's `--input`.
-- C-21: every call claims its rows and `lock_busy` counts no attempt, restoring S-16 (pass 1 had removed `flush` leases and counted `lock_busy`).
-- C-22: S-10's `flagged unhealthy` is `validate`'s `surfaced_today`.
-- C-23: the row kinds `held` and `single` and the cap on unclaimed rows (pass 2).
-- C-24: the lifetime of the dedup and event-id records: pending, sent or unknown (pass 2).
-- C-25: alerts skip the redelivery check, and row ids are never reused (pass 2).
-- C-26: the outcome table in precedence order, with a code for every row (pass 2).
-- C-27: refusal retries (link, keyword) count as attempts (pass 2).
-- C-28: a digest is never held by the cap (pass 2).
-- C-29: hooks and alerts run from `flush`; `send` runs none (pass 2).
-- C-30: surfacing periods (queue events hourly, other codes daily) and the limit of 8 codes (pass 2).
-- C-31: the alert payload fields `notification_source` and `notification_level` (pass 2).
-- C-32: `send`'s 0.5 s busy timeouts, two transactions (pass 2).
-- C-33: global row caps on insert and at most 16 stored labels (pass 2).
-- C-34: the plain grammar `[A-Za-z0-9][A-Za-z0-9._/#-]{0,255}`, narrowing S-21's regex and lifting its length (pass 2).
-- C-35: one sanitizing routine for every rendered title and message (pass 2).
-- C-36: drop-ins merge map entries by name (pass 2).
-- C-37: the `flush` heartbeat read by `validate` and `send` (pass 2).
+- C-19: a rule that can match a hook payload must set `level`; a rule that does not is a load error, not a warning.
+- C-20: `test` takes `send`'s input flags instead of a separate `--input` flag.
+- C-21: every call claims its rows and `lock_busy` counts no attempt.
+- C-22: the per-destination health that `validate` shows is `surfaced_today`.
+- C-23: the row kinds `held` and `single` and the cap on unclaimed rows.
+- C-24: the lifetime of the dedup and event-id records: pending, sent or unknown.
+- C-25: alerts skip the redelivery check, and row ids are never reused.
+- C-26: the outcome table in precedence order, with a code for every row.
+- C-27: refusal retries (link, keyword) count as attempts.
+- C-28: a digest is never held by the cap.
+- C-29: hooks and alerts run from `flush`; `send` runs none.
+- C-30: surfacing periods (queue events hourly, other codes daily) and the limit of 8 codes.
+- C-31: the alert payload fields `notification_source` and `notification_level`.
+- C-32: `send`'s 0.5 s busy timeouts, two transactions.
+- C-33: global row caps on insert and at most 16 stored labels.
+- C-34: the plain grammar `[A-Za-z0-9][A-Za-z0-9._/#-]{0,255}`.
+- C-35: one sanitizing routine for every rendered title and message.
+- C-36: drop-ins merge map entries by name.
+- C-37: the `flush` heartbeat read by `validate` and `send`, written only by a full run (no `--dry-run`, no `--destination`), with a record of whether the run skipped a destination for a missing credential.
+- C-38: the last fixes narrow rules and add none: the cron block starts at a line that begins `# notice-route managed v`, `send`'s advisory needs a queued row, a wrapper must `exec` the notifier and exit 128+N with output is `unknown`, the hook environment is an allowlist like every child's, and `flush` stops calling a destination after `failed` or `unknown`.
 
 ## Resolved open topics
 
@@ -87,7 +86,7 @@ The seeded open topics were rule syntax, dedup window and quiet-hours config. Ru
 
 ## Live verification
 
-Two free local spikes ran before the questions (private records in the umbrella; no network and no notification).
+Two free local spikes ran before the questions (no network and no notification).
 
 | Spike | Finding | Where it lands |
 |---|---|---|
@@ -136,7 +135,7 @@ Every notification a destination will receive later is one queue row of kind `he
 
 ## Concurrency
 
-Any number of `send` and `flush` processes may run at once. The decision step is one `BEGIN IMMEDIATE` transaction with a 0.5 second busy timeout in `send` (two transactions, the 1 s of the time bound) and 5 seconds elsewhere; `prune` deletes in batches of 1000. It also writes the queue rows of the destinations to be sent now. The send step is serialized per destination by `flock`, and all `wsl-notice` destinations share `locks/_wsl.lock`. Every call claims its rows (a lease of twice `send_worst_case_s`), and a result is recorded only on rows the recorder still holds; `flush` resends a row whose claim expired. A `flush` holds a per-destination flush lock for its whole run, and per call the send lock and a claim. Every `flush` records its start in `meta.flush_last`; `validate` and `send` read it to report a stopped cron. Deviation from design guide section 4.3: per-destination locks are kernel `flock`s, not leases in `state.db`; the kernel releases them when the holder dies, which is the property a lease provides. Queue rows carry leases (claims). Exact PIDs the router started are the only processes it signals, as process groups it created.
+Any number of `send` and `flush` processes may run at once. The decision step is one `BEGIN IMMEDIATE` transaction with a 0.5 second busy timeout in `send` (two transactions, the 1 s of the time bound) and 5 seconds elsewhere; `prune` deletes in batches of 1000. It also writes the queue rows of the destinations to be sent now. The send step is serialized per destination by `flock`, and all `wsl-notice` destinations share `locks/_wsl.lock`. Every call claims its rows (a lease of twice `send_worst_case_s`), and a result is recorded only on rows the recorder still holds; `flush` resends a row whose claim expired. A `flush` holds a per-destination flush lock for its whole run, and per call the send lock and a claim. Every full `flush` records its start in `meta.flush_last`; `validate` and `send` read it to report a stopped cron. Deviation from design guide section 4.3: per-destination locks are kernel `flock`s, not leases in `state.db`; the kernel releases them when the holder dies, which is the property a lease provides. Queue rows carry leases (claims). Exact PIDs the router started are the only processes it signals, as process groups it created.
 
 ## Error handling
 
@@ -160,4 +159,4 @@ Failures are values: every call ends in one of the outcomes of [Retries and outc
 
 ## Architecture changes (v1.24)
 
-Section 5.2 entry (binding B, commands, state, hook), section 15 and the section 20 entry (decided constraints replace the seed text; the dedup key, keyed on the notification as it would be sent), section 10.4 (`--source`), section 7.7 (the cron block, `flush` every minute, the env-file form), design guide sections 4.3, 5, 6 and 12 (deviation notes, the kernel `flock` locks and the stale "channel tools escape markup" sentence), the interface registry row and the roadmap hook candidate `post-fail`. Pass 2 revises the same entries (status line, sections 5.2, 7.7, 15 and 20, the design guide status and deviation lines, the registry row and the roadmap row) to match the final queue model. Recorded in the private cross-cutting log.
+Section 5.2 entry (binding B, commands, state, hook), section 15 and the section 20 entry (decided constraints replace the seed text; the dedup key, keyed on the notification as it would be sent), section 10.4 (`--source`), section 7.7 (the cron block, `flush` every minute, the env-file form), design guide sections 4.3, 5, 6 and 12 (deviation notes, the kernel `flock` locks and the stale "channel tools escape markup" sentence), the interface registry row and the roadmap hook candidate `post-fail`. The same entries (status line, sections 5.2, 7.7, 15 and 20, the design guide status and deviation lines, the registry row and the roadmap row) describe the final queue model.

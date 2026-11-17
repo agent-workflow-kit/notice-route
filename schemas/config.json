@@ -197,7 +197,7 @@
               }
             },
             "maxItems": 32,
-            "description": "An argv list of at most 32 elements of at most 4096 characters; no shell. cmd[0] is absolute; the ownership and mode check runs at each call on the resolved path. The notifier's --config <path> belongs here. An element equal to send, --stdin-json, --json, --actor or --dedupe-key, or starting with one of those flags and =, is config_invalid."
+            "description": "An argv list of at most 32 elements of at most 4096 characters; no shell. cmd[0] is absolute; the ownership and mode check runs at each call on the resolved path. The notifier's --config <path> belongs here. A script that wraps the notifier must exec it. An element equal to send, --stdin-json, --json, --actor or --dedupe-key, or starting with one of those flags and =, is config_invalid."
           },
           "timeout": {
             "$ref": "#/$defs/duration",

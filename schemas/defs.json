@@ -259,8 +259,8 @@
         },
         "pointer": {
           "type": "string",
-          "pattern": "^(?:|/[A-Za-z0-9_-]{1,64}|/\\?|--source|--label)(?![\\s\\S])",
-          "description": "payload_invalid: empty for the whole input, /<field> (/? when the name does not match [A-Za-z0-9_-]{1,64}), --source or --label. Never an input value."
+          "pattern": "^(?:|/[A-Za-z0-9_-]{1,64}|--source|--label)(?![\\s\\S])",
+          "description": "payload_invalid: empty for the whole input, /<field>, --source or --label. Never an input value."
         }
       },
       "additionalProperties": false,
