@@ -1,2 +1,161 @@
-# Example config for notice-route. Location: ~/.config/notice-route/config.yaml (drop-ins: config.d/*.yaml). Keys are defined in docs/interface.md once designed.
-hooks: {}
+# Example config for notice-route: every key, documented (the rules for the awkit producers are in the drop-in).
+# Location: ~/.config/notice-route/config.yaml (drop-ins: config.d/*.yaml, lexical order; rules and
+# hooks.post-fail lists append, destinations, quiet_hours and link entries merge by name, and
+# anything defined twice is an error). The directory, this file and every drop-in must be owned by
+# you and not group- or world-writable. Keys and defaults are defined in docs/interface.md and
+# checked by schemas/config.json.
+
+# enabled (default true): false makes send exit 22 (disabled) and flush exit 22 doing nothing.
+enabled: true
+
+# --- destinations -------------------------------------------------------------
+# Named channels and the command that reaches each. At most 32. A name is
+# [a-z0-9][a-z0-9_-]{0,31}.
+destinations:
+  phone:
+    # kind (required): slack-notice, ha-notice, wsl-notice or generic. It selects the retry rules.
+    kind: ha-notice
+    # cmd (required): an argv list, no shell. cmd[0] is an absolute path to an executable owned by
+    # you or root and not group- or world-writable (uv tool install puts a symlink in ~/.local/bin;
+    # the resolved file is checked and run). The
+    # notifier's own --config belongs here, one config file per destination. It may not contain
+    # send, --stdin-json, --json, --actor or --dedupe-key.
+    cmd:
+      - /home/example/.local/bin/ha-notice
+      - --config
+      - /home/example/.config/ha-notice/config.yaml
+    # timeout (default 10s, range 1s to 120s): the notifier's own timeout or more. The router
+    # kills the call at this value plus 10 seconds. Keep it at 10s so that a send ends within 30s.
+    timeout: 10s
+    # floor (default info): the lowest level delivered here (info < warn < action < error).
+    floor: warn
+    # quiet (default none): the name of a quiet_hours window for this destination.
+    quiet: night
+    # max_per_hour (default 30, 0 to 3600, 0 means no cap): notifier calls per UTC clock hour,
+    # counted separately for error and for the other levels.
+    max_per_hour: 20
+    # env (default []): the only variables passed to the notifier besides PATH, LANG, LC_ALL (and
+    # WSL_INTEROP, WSL_DISTRO_NAME for wsl-notice). Credentials go here by name, never by value.
+    # A send that runs without them queues the notification for flush from cron (sent as itself
+    # within a minute); an empty value counts as unset.
+    env:
+      - HA_TOKEN
+    # enabled (default true): false skips the destination with outcome disabled.
+    enabled: true
+
+  team-chat:
+    kind: slack-notice
+    cmd:
+      - /home/example/.local/bin/slack-notice
+      - --config
+      - /home/example/.config/slack-notice/config.yaml
+    timeout: 10s
+    floor: info
+    # No quiet window: delivered at any hour. Keep the default cap.
+    max_per_hour: 30
+    env:
+      - SLACK_WEBHOOK
+
+  desktop:
+    kind: wsl-notice
+    cmd:
+      - /home/example/.local/bin/wsl-notice
+    floor: action
+    quiet: night
+    enabled: true
+
+# --- quiet hours ----------------------------------------------------------------
+# Named windows. Inside a destination's window: info is dropped, warn and action are deferred
+# to the end of the window, error is delivered at once. start and end must be quoted: an unquoted
+# 22:00 is not a string and is an error.
+quiet_hours:
+  night:
+    # timezone (required): an IANA name from the system database; no default.
+    timezone: America/New_York
+    # days (default every day): the days on which the window starts.
+    days: [mon, tue, wed, thu, fri, sat, sun]
+    # start and end (required): HH:MM, 24-hour local time. An end earlier than start means the
+    # window ends the next day; an end equal to start is an error.
+    start: "22:00"
+    end: "07:00"
+
+# --- links ----------------------------------------------------------------------
+# The router's own link tables, the only source of links. Hosts are <host>[:<port>] in lowercase;
+# ticket base URLs are https URLs that end in a slash. A port is 1 to 65535.
+links:
+  # hosts: host name -> github or gitlab; builds pr_url from a payload's pr (host/path#n).
+  hosts:
+    github.example.com: github
+    gitlab.example.com: gitlab
+  # tickets: site name -> base URL; builds ticket_url from a payload's site and key.
+  tickets:
+    example-site: https://tickets.example.com/browse/
+
+# --- defaults and limits ----------------------------------------------------------
+defaults:
+  # dedup_window (default 10m, range 1s to 24h): the default repeat-check window of a rule.
+  dedup_window: 10m
+
+# lock_wait (default 2s, range 1s to 60s): how long a send polls for a destination's lock.
+lock_wait: 2s
+
+retention:
+  # history (default 30d, at least 1d): age at which prune deletes history rows.
+  history: 30d
+  # event_ids (default 14d, at least 1d): age at which prune forgets event ids.
+  event_ids: 14d
+
+# log (default true): write log.jsonl under the state directory.
+log: true
+
+# --- cron ---------------------------------------------------------------------------
+cron:
+  # env_file (default none): an absolute path to a mode-0600 file that the cron lines source.
+  # The cron lines export what it assigns (set -a), so plain NAME=value lines work. The notifiers'
+  # credentials must be in it.
+  env_file: /home/example/.config/notice-route/cron.env
+
+# --- hooks --------------------------------------------------------------------------
+# post-fail runs from the next flush after a destination's failure was surfaced (the failure is
+# also routed through the rules below as source notice-route). It is for scripts; the command runs
+# with sh -c and the router's environment minus the destinations' credential variables. Entries
+# have cmd, timeout (default 30s) and async (default false: flush waits for the hook before it
+# exits). Example, left out:
+#
+# hooks:
+#   post-fail:
+#     - cmd: /home/example/bin/log-channel-failure
+#       timeout: 30s
+#       async: true
+
+# --- rules --------------------------------------------------------------------------
+# The rules for the awkit producers are in examples/awkit-wiring.yaml, a config.d drop-in; CI
+# validates this file and the drop-in as one config and renders every rule against the producers'
+# hook examples.
+#
+# Ordered. The first rule whose match holds decides everything; no later rule is consulted.
+# A rule that can match a hook payload (it has no level_min) must set a level.
+# A token renders a payload value only when it is plain (a number, a boolean, or a string of
+# letters, digits and . _ / # - of at most 256 characters); other text needs include_text and a
+# payload that says it is not third-party or tainted. A token that renders empty still sends the
+# notice, and `test` lists it as missing or excluded. A {{pr}} with a port renders empty: the link
+# carries the PR.
+# name: [a-z0-9][a-z0-9_-]{0,63}, unique. notify: 1 to 8 destinations. dedup_window default: the
+# defaults.dedup_window value.
+rules:
+  # The router's own failure alerts (source notice-route). Delivered by the next flush.
+  - name: router-failures
+    match:
+      source: notice-route
+      hook: post-fail
+    notify: [team-chat, phone]
+    level: warn
+    title: "Notification channel failed"
+    message: "Destination {{object_id}} ({{kind}}): {{code}}, {{outcome}} after {{attempts}} attempts, for a {{notification_level}} from {{notification_source}}."
+
+  # A pass-through rule: a notice of level error from any source goes to the phone with its own
+  # title and message.
+  - name: direct-errors
+    match:
+      level_min: error
+    notify: [phone]

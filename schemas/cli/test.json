@@ -1,0 +1,383 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "notice-route/cli/test.json",
+  "title": "test --json output (and send --dry-run --json)",
+  "description": "What send would do, with no state change. reason is null when a rule matched and destinations were decided, rule_drop for a drop rule, and unconfigured, no_rule or disabled when nothing was decided (exit 22; all_disabled when every selected destination has enabled false, also exit 22). Then title, message and link are null and destinations is empty, except for all_disabled.",
+  "type": "object",
+  "properties": {
+    "shape": {
+      "enum": [
+        "hook",
+        "notice"
+      ]
+    },
+    "source": {
+      "$ref": "../defs.json#/$defs/source_name",
+      "x-untrusted": true
+    },
+    "hook": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/hook_name",
+          "x-untrusted": true
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "rule": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/rule_name"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "reason": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/noop_reason"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "title": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 256,
+      "x-untrusted": true,
+      "description": "Untrusted. The rendered title."
+    },
+    "message": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 4000,
+      "x-untrusted": true,
+      "description": "Untrusted. The rendered message."
+    },
+    "link": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 1024,
+      "x-untrusted": true,
+      "description": "Untrusted. The rendered link; null means no link."
+    },
+    "missing": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^(?:labels\\.[a-z0-9][a-z0-9_.-]{0,63}|(?!labels\\.)[A-Za-z_][A-Za-z0-9_]{0,63}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,3})(?![\\s\\S])"
+      },
+      "uniqueItems": true,
+      "description": "Token paths that rendered empty because the field is absent, null, a list or an object."
+    },
+    "excluded": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^(?:labels\\.[a-z0-9][a-z0-9_.-]{0,63}|(?!labels\\.)[A-Za-z_][A-Za-z0-9_]{0,63}(?:\\.[A-Za-z_][A-Za-z0-9_]{0,63}){0,3})(?![\\s\\S])"
+      },
+      "uniqueItems": true,
+      "description": "Token paths whose text was left out (a title token that is not plain, a message token without include_text or with unknown or true flags)."
+    },
+    "text_excluded": {
+      "type": "boolean"
+    },
+    "labels_ignored": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "level": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/level"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "dedupe": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/sha256_64"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "destinations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "$ref": "../defs.json#/$defs/destination_name"
+          },
+          "decision": {
+            "enum": [
+              "send",
+              "defer",
+              "drop",
+              "suppress",
+              "disabled"
+            ]
+          },
+          "reason": {
+            "oneOf": [
+              {
+                "$ref": "../defs.json#/$defs/destination_reason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "deliver_after": {
+            "oneOf": [
+              {
+                "$ref": "../defs.json#/$defs/epoch_seconds"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "decision",
+          "reason",
+          "deliver_after"
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "decision": {
+                  "const": "defer"
+                }
+              },
+              "required": [
+                "decision"
+              ]
+            },
+            "then": {
+              "properties": {
+                "deliver_after": {
+                  "$ref": "../defs.json#/$defs/epoch_seconds"
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "deliver_after": {
+                  "type": "null"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "decision": {
+                  "enum": [
+                    "drop",
+                    "defer",
+                    "suppress"
+                  ]
+                }
+              },
+              "required": [
+                "decision"
+              ]
+            },
+            "then": {
+              "properties": {
+                "reason": {
+                  "$ref": "../defs.json#/$defs/destination_reason"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "decision": {
+                  "enum": [
+                    "send",
+                    "disabled"
+                  ]
+                }
+              },
+              "required": [
+                "decision"
+              ]
+            },
+            "then": {
+              "properties": {
+                "reason": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "maxItems": 8
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "shape",
+    "source",
+    "hook",
+    "rule",
+    "reason",
+    "title",
+    "message",
+    "link",
+    "missing",
+    "excluded",
+    "text_excluded",
+    "labels_ignored",
+    "level",
+    "dedupe",
+    "destinations"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "excluded": {
+            "minItems": 1
+          }
+        },
+        "required": [
+          "excluded"
+        ]
+      },
+      "then": {
+        "properties": {
+          "text_excluded": {
+            "const": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "reason": {
+            "enum": [
+              "unconfigured",
+              "no_rule",
+              "disabled"
+            ]
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
+      "then": {
+        "properties": {
+          "rule": {
+            "type": "null"
+          },
+          "title": {
+            "type": "null"
+          },
+          "message": {
+            "type": "null"
+          },
+          "link": {
+            "type": "null"
+          },
+          "level": {
+            "type": "null"
+          },
+          "dedupe": {
+            "type": "null"
+          },
+          "destinations": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "reason": {
+            "const": "rule_drop"
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
+      "then": {
+        "properties": {
+          "rule": {
+            "$ref": "../defs.json#/$defs/rule_name"
+          },
+          "title": {
+            "type": "null"
+          },
+          "message": {
+            "type": "null"
+          },
+          "link": {
+            "type": "null"
+          },
+          "dedupe": {
+            "type": "null"
+          },
+          "destinations": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "reason": {
+            "const": "all_disabled"
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
+      "then": {
+        "properties": {
+          "destinations": {
+            "minItems": 1,
+            "items": {
+              "properties": {
+                "decision": {
+                  "const": "disabled"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,273 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "notice-route/cli/validate.json",
+  "title": "validate --json output",
+  "description": "Exit 0 (ok) and exit 12 (failed: a cmd_ok or probe check failed). A config that does not load is exit 2 and prints the error envelope instead; no config is exit 22 with outcome no_op and no destinations.",
+  "type": "object",
+  "properties": {
+    "outcome": {
+      "enum": [
+        "ok",
+        "failed",
+        "no_op"
+      ],
+      "description": "no config is exit 22 with outcome no_op."
+    },
+    "probe": {
+      "type": "boolean",
+      "description": "Whether --probe was given."
+    },
+    "destinations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "$ref": "../defs.json#/$defs/destination_name"
+          },
+          "cmd_ok": {
+            "type": "boolean",
+            "description": "cmd[0] and its parent directories pass the ownership and mode check."
+          },
+          "env_unset": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}(?![\\s\\S])"
+            },
+            "description": "Names in env that are unset or empty in the router's environment (reported, not an error). A destination with a non-empty list is not probed."
+          },
+          "probe": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "ok",
+                      "failed",
+                      "disabled"
+                    ],
+                    "description": "disabled is the notifier's exit 22, information only."
+                  },
+                  "exit": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ],
+                    "minimum": 0,
+                    "maximum": 255,
+                    "description": "The exit code, or null when the call was killed or never started."
+                  },
+                  "enabled": {
+                    "type": [
+                      "boolean",
+                      "null"
+                    ],
+                    "description": "The notifier's own enabled value, or null when unreadable."
+                  }
+                },
+                "additionalProperties": false,
+                "required": [
+                  "status",
+                  "exit",
+                  "enabled"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "surfaced_today": {
+            "type": "array",
+            "items": {
+              "$ref": "../defs.json#/$defs/notifier_code"
+            },
+            "uniqueItems": true,
+            "description": "Codes surfaced for this destination in the current UTC day, read from state.db read-only."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "cmd_ok",
+          "env_unset",
+          "probe",
+          "surfaced_today"
+        ]
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "enum": [
+              "destination_unused",
+              "level_from_notice",
+              "rule_unreachable",
+              "worst_case_over_hook_timeout",
+              "flush_stale",
+              "env_file_unsafe",
+              "alert_unrouted",
+              "orphaned_queue",
+              "flush_env_missing"
+            ]
+          },
+          "rule": {
+            "oneOf": [
+              {
+                "$ref": "../defs.json#/$defs/rule_name"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "destination": {
+            "oneOf": [
+              {
+                "$ref": "../defs.json#/$defs/destination_name"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "message": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "A fixed string naming the key, never a value."
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "rule",
+          "destination",
+          "message"
+        ]
+      }
+    },
+    "send_worst_case_s": {
+      "type": "number",
+      "minimum": 0
+    },
+    "flush_age_s": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0,
+      "description": "Seconds since the last flush started; null when none has run."
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "outcome",
+    "probe",
+    "destinations",
+    "warnings",
+    "send_worst_case_s",
+    "flush_age_s"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "failed"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "destinations": {
+            "contains": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "cmd_ok": {
+                      "const": false
+                    }
+                  },
+                  "required": [
+                    "cmd_ok"
+                  ]
+                },
+                {
+                  "properties": {
+                    "probe": {
+                      "type": "object",
+                      "properties": {
+                        "status": {
+                          "const": "failed"
+                        }
+                      },
+                      "required": [
+                        "status"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "probe"
+                  ]
+                }
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "no_op"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "destinations": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "probe": {
+            "const": false
+          }
+        },
+        "required": [
+          "probe"
+        ]
+      },
+      "then": {
+        "properties": {
+          "destinations": {
+            "items": {
+              "properties": {
+                "probe": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

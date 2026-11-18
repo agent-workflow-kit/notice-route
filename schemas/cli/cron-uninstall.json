@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "notice-route/cli/cron-uninstall.json",
+  "title": "cron uninstall --json output",
+  "type": "object",
+  "properties": {
+    "action": {
+      "enum": [
+        "removed",
+        "unchanged"
+      ]
+    },
+    "block": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[\\s\\S]*(?![\\s\\S])",
+      "description": "removed: the block removed (or that would be); unchanged: null."
+    },
+    "dry_run": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "action",
+    "block",
+    "dry_run"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "removed"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "properties": {
+          "block": {
+            "type": "string",
+            "pattern": "^# notice-route managed v1 flush=1m\\n[\\s\\S]*# notice-route managed end\\n?(?![\\s\\S])"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "block": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "notice-route/hooks/post-fail.json",
+  "title": "post-fail hook payload (stdin)",
+  "description": "Run by the next flush after a destination's failure was surfaced: at most once per code and destination per UTC day, except rate_capped, env_missing, overflow and expired, at most once per destination per UTC hour; at most 8 distinct codes per destination per UTC day, after which further codes are surfaced once that day as other. Carries no title, message, link or payload text. The router also routes this payload through its own rules as source notice-route and hook post-fail (the bare names source and level are the derived fields of templates; the failed notification's are notification_source and notification_level).",
+  "type": "object",
+  "properties": {
+    "tool": {
+      "const": "notice-route"
+    },
+    "hook": {
+      "const": "post-fail"
+    },
+    "object_type": {
+      "const": "destination"
+    },
+    "object_id": {
+      "$ref": "../defs.json#/$defs/destination_name"
+    },
+    "event_id": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The id of the failing deliveries row (never reused)."
+    },
+    "labels": {
+      "type": "array",
+      "items": {
+        "$ref": "../defs.json#/$defs/label"
+      },
+      "x-untrusted": true,
+      "maxItems": 16,
+      "description": "At most 16 labels, the lexically first, within 1024 characters (matching uses every label)."
+    },
+    "code": {
+      "$ref": "../defs.json#/$defs/notifier_code"
+    },
+    "outcome": {
+      "enum": [
+        "failed",
+        "unknown",
+        "deferred",
+        "dropped",
+        "expired"
+      ]
+    },
+    "attempts": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "notification_source": {
+      "$ref": "../defs.json#/$defs/source_name",
+      "x-untrusted": true
+    },
+    "notification_level": {
+      "$ref": "../defs.json#/$defs/level"
+    },
+    "kind": {
+      "$ref": "../defs.json#/$defs/destination_kind"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "tool",
+    "hook",
+    "object_type",
+    "object_id",
+    "event_id",
+    "labels",
+    "code",
+    "outcome",
+    "attempts",
+    "notification_source",
+    "notification_level",
+    "kind"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "deferred"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "code": {
+            "enum": [
+              "rate_capped",
+              "env_missing"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "dropped"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "code": {
+            "const": "overflow"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "expired"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "code": {
+            "const": "expired"
+          }
+        }
+      }
+    }
+  ]
+}

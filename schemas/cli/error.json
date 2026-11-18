@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "notice-route/cli/error.json",
+  "title": "Error envelope (any command with --json)",
+  "description": "Printed on stdout for exit 1, 2 and 20 with --json. reason is a refusal reason on exit 20 and null elsewhere. message is a fixed string and details holds names only, never input values.",
+  "type": "object",
+  "properties": {
+    "error": {
+      "$ref": "../defs.json#/$defs/error"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "error"
+  ]
+}
