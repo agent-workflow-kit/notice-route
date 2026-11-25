@@ -95,6 +95,14 @@ def test_regular_file_where_a_dir_belongs_is_refused(gw: Gateway, tmp_path: Path
     assert info.value.reason == "not_directory"
 
 
+def test_intermediate_component_that_is_a_file_is_missing_not_unsafe(
+    gw: Gateway, tmp_path: Path
+) -> None:
+    _file(tmp_path / "file")
+    assert gw.open_config_dir(str(tmp_path / "file" / "cfg")) is None
+    assert gw.open_config_dir(str(tmp_path / "file" / "a" / "cfg")) is None
+
+
 def test_subdirectory_is_opened_relative_to_its_parent(gw: Gateway, tmp_path: Path) -> None:
     _dir(tmp_path / "cfg")
     _dir(tmp_path / "cfg" / "config.d")

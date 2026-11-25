@@ -11,8 +11,10 @@ Rules kept here (docs/interface.md, Config and Files):
 
 - The config directory, ``config.d`` and every file must be owned by the user and not group- or
   world-writable; files are opened with ``O_NOFOLLOW``, so a symlink (also a symlinked
-  directory) is refused (``config_unsafe``). The 256 KiB limit applies to the bytes read, at most
-  256 drop-ins. A missing config directory or ``config.yaml`` is "unconfigured" (``None``);
+  directory) is refused (``config_unsafe``). The 256 KiB limit applies to the bytes read and
+  1 MiB to all files together (the file whose read crosses it is ``config_invalid``); at most 256
+  drop-ins and 4096 directory entries of any name. A missing config directory or ``config.yaml``
+  is "unconfigured" (``None``);
   nothing is ever created.
 - The YAML loader is ``SafeLoader``'s machinery with its own resolvers: the only booleans are
   ``true`` and ``false``, the only numbers are decimal integers and decimal floats, so ``yes``,
@@ -41,14 +43,17 @@ __all__ = [
     "MAX_DEPTH",
     "MAX_DROPINS",
     "MAX_FILE_BYTES",
+    "MAX_TOTAL_BYTES",
     "ConfigError",
     "LoadedConfig",
     "load_config",
 ]
 
 MAX_FILE_BYTES = 256 * 1024
+MAX_TOTAL_BYTES = 1024 * 1024  # config.yaml and every drop-in together (the 1 MiB reader limit)
 MAX_DROPINS = 256
 MAX_DEPTH = 16
+_NUMBER_CHARS = 20  # longest integer or float text (sign excluded), whatever the interpreter says
 _LIST_LIMIT = 4096  # entries of config.d (of any name) read before refusing the directory
 _CONFIG_SUBPATH = "/.config/notice-route"
 _KEY_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
@@ -115,13 +120,17 @@ def _construct_int(loader: yaml.SafeLoader, node: yaml.Node) -> int:
     text = _scalar(loader, node)
     if not _INT.fullmatch(text):
         raise ValueError("not an integer")
-    return int(text)  # a huge value raises ValueError (the interpreter's digit limit)
+    if len(text.lstrip("-")) > _NUMBER_CHARS:
+        raise ValueError("an integer with too many digits")
+    return int(text)
 
 
 def _construct_float(loader: yaml.SafeLoader, node: yaml.Node) -> float:
     text = _scalar(loader, node)
     if not _FLOAT.fullmatch(text):
         raise ValueError("not a decimal float")
+    if len(text.lstrip("-")) > _NUMBER_CHARS:
+        raise ValueError("a float with too many characters")
     value = float(text)
     if not math.isfinite(value):
         raise ValueError("not finite")
@@ -168,13 +177,16 @@ class _StrictLoader(yaml.SafeLoader):
             raise ValueError("anchors are not allowed")
         if getattr(event, "tag", None) is not None:
             raise ValueError("explicit tags are not allowed")
-        self._depth += 1
+        container = isinstance(event, (yaml.MappingStartEvent, yaml.SequenceStartEvent))
+        if container:  # only mappings and sequences count toward the depth
+            self._depth += 1
         try:
             if self._depth > MAX_DEPTH:
                 raise ValueError("document too deep")
             return super().compose_node(parent, index)
         finally:
-            self._depth -= 1
+            if container:
+                self._depth -= 1
 
 
 _StrictLoader.add_implicit_resolver("tag:yaml.org,2002:bool", _BOOL, list("tf"))
@@ -302,14 +314,10 @@ def _config_location(gateway: Gateway, config_path: str | None) -> tuple[str, st
         if failed:
             raise ConfigError("config_invalid", "home")
         return home.rstrip("/") + _CONFIG_SUBPATH, "config.yaml"
-    path = PurePosixPath(config_path)
-    if (
-        config_path == ""
-        or "\x00" in config_path
-        or config_path.endswith("/")
-        or path.name in ("", ".", "..")
-    ):
+    # The raw last segment decides: PurePosixPath would fold ``x/.`` into ``x``.
+    if "\x00" in config_path or config_path.rsplit("/", 1)[-1] in ("", ".", ".."):
         raise ConfigError("config_invalid", "--config")
+    path = PurePosixPath(config_path)
     return str(path.parent), path.name
 
 
@@ -340,12 +348,14 @@ def load_config(gateway: Gateway, config_path: str | None = None) -> LoadedConfi
         if explicit:
             raise ConfigError("config_invalid", "--config")
         return None
+    budget = MAX_TOTAL_BYTES
     with dirh:
-        raw = _read(gateway, dirh, name, main_key)
+        raw = _read(gateway, dirh, name, main_key, budget)
         if raw is None:
             if explicit:
                 raise ConfigError("config_invalid", "--config")
             return None
+        budget -= len(raw)
         _merge(data, _document(raw, main_key), ())
         files.append(main_key)
         sub = _open_dropin_dir(gateway, dirh)
@@ -353,21 +363,24 @@ def load_config(gateway: Gateway, config_path: str | None = None) -> LoadedConfi
             with sub:
                 for dropin in _dropins(gateway, sub):
                     key = _file_key(f"config.d/{dropin}")
-                    raw = _read(gateway, sub, dropin, key)
+                    raw = _read(gateway, sub, dropin, key, budget)
                     if raw is None:  # removed since the listing
                         raise ConfigError("config_invalid", key)
+                    budget -= len(raw)
                     _merge(data, _document(raw, key), ())
                     files.append(key)
     _check_rule_names(data.get("rules", []))
     return LoadedConfig(data, tuple(files))
 
 
-def _read(gateway: Gateway, parent: DirHandle, name: str, key: str) -> bytes | None:
-    """One file's bytes, checked on its descriptor; ``None`` when it does not exist."""
+def _read(gateway: Gateway, parent: DirHandle, name: str, key: str, budget: int) -> bytes | None:
+    """One file's bytes, checked on its descriptor; ``None`` when it does not exist. The read
+    stops at the file limit or the bytes left of the total budget, whichever is smaller; the
+    file whose read crosses either is ``config_invalid``."""
     failure: ConfigError | None = None
     raw: bytes | None = None
     try:
-        raw = gateway.read_config_file(parent, name, MAX_FILE_BYTES)
+        raw = gateway.read_config_file(parent, name, min(MAX_FILE_BYTES, budget))
     except UnsafePathError:
         failure = ConfigError("config_unsafe", key)
     except (LimitExceededError, OSError, ValueError):

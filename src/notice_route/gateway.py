@@ -540,8 +540,9 @@ class Gateway:
         not a directory (``not_directory``), is not owned by the effective user (``owner``) or
         is group- or world-writable (``mode``). Unlike :meth:`open_private_dir`, read access for
         group and world is accepted, and setgid and sticky bits are tolerated. A missing
-        directory, or a missing parent on the way, is ``None``. Other ``OSError`` values
-        (``PermissionError``, ``ENAMETOOLONG``) propagate. The caller closes the handle.
+        directory, or a missing parent on the way (also one that is not a directory), is ``None``.
+        Other ``OSError`` values (``PermissionError``, ``ENAMETOOLONG``) propagate.
+        The caller closes the handle.
         """
         if not isinstance(path, str) or "\x00" in path:
             raise ValueError("path must be a string without NUL")
@@ -561,6 +562,8 @@ class Gateway:
             return None
         except OSError as exc:
             if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
+                if exc.errno == errno.ENOTDIR and not _last_component_exists(path, dir_fd):
+                    return None  # a non-directory earlier on the way: nothing is there
                 raise UnsafePathError("not_directory", shown) from exc
             raise
         try:
@@ -622,6 +625,16 @@ class Gateway:
     def _live(handle: DirHandle) -> None:
         if handle.closed:
             raise ValueError("directory handle is closed")
+
+
+def _last_component_exists(path: str, dir_fd: int | None) -> bool:
+    """Whether ``path`` itself exists (a symlink or file), so that ENOTDIR came from it and not
+    from a component on the way."""
+    try:
+        os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return True
 
 
 @dataclass(frozen=True)

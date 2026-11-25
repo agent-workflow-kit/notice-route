@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -54,6 +55,24 @@ class Env:
 @pytest.fixture
 def env(home: Path) -> Env:
     return Env(home)
+
+
+def foreign_owner(monkeypatch: pytest.MonkeyPatch, target: Path) -> None:
+    """Make ``target`` (and only it) look owned by another user to the gateway's ``fstat``,
+    whatever the order of the checks: the object is recognized by device and inode."""
+    info = target.stat()
+    identity = (info.st_dev, info.st_ino)
+    real_fstat = os.fstat
+
+    def fstat(fd: int) -> os.stat_result:
+        st = real_fstat(fd)
+        if (st.st_dev, st.st_ino) != identity:
+            return st
+        fields = [int(st[i]) for i in range(10)]
+        fields[4] = st.st_uid + 1
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(gateway.os, "fstat", fstat)
 
 
 def invalid(env: Env, key: str, config_path: str | None = None) -> ConfigError:
@@ -277,17 +296,7 @@ def test_main_file_readable_by_others_is_fine(env: Env, mode: int) -> None:
 def test_main_file_not_owned_by_the_user_is_unsafe(
     env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    env.main()
-    real = os.geteuid()
-    # Directory ownership is checked first, so make only the file look foreign by checking the
-    # directory as the real user and the file as another.
-    calls = {"n": 0}
-
-    def euid() -> int:
-        calls["n"] += 1
-        return real if calls["n"] == 1 else real + 1  # 1st: the directory; then: the file
-
-    monkeypatch.setattr(gateway.os, "geteuid", euid)
+    foreign_owner(monkeypatch, env.main())
     unsafe(env, "config.yaml")
 
 
@@ -326,14 +335,7 @@ def test_config_d_not_owned_by_the_user_is_unsafe(
 ) -> None:
     env.main()
     (env.cfg / "config.d").mkdir(mode=0o700)
-    real = os.geteuid()
-    calls = {"n": 0}
-
-    def euid() -> int:
-        calls["n"] += 1
-        return real if calls["n"] <= 2 else real + 1  # config dir, config.yaml; then config.d
-
-    monkeypatch.setattr(gateway.os, "geteuid", euid)
+    foreign_owner(monkeypatch, env.cfg / "config.d")
     unsafe(env, "config.d")
 
 
@@ -367,15 +369,7 @@ def test_dropin_writable_by_others_is_unsafe(env: Env, mode: int) -> None:
 
 def test_dropin_not_owned_by_the_user_is_unsafe(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
     env.main()
-    env.write("config.d/10-a.yaml", "rules: []\n")
-    real = os.geteuid()
-    calls = {"n": 0}
-
-    def euid() -> int:
-        calls["n"] += 1
-        return real if calls["n"] <= 3 else real + 1  # dir, config.yaml, config.d; then drop-in
-
-    monkeypatch.setattr(gateway.os, "geteuid", euid)
+    foreign_owner(monkeypatch, env.write("config.d/10-a.yaml", "rules: []\n"))
     unsafe(env, "config.d/10-a.yaml")
 
 
@@ -719,6 +713,31 @@ def test_huge_integer_is_invalid_not_a_crash(env: Env) -> None:
     invalid(env, "config.yaml")
 
 
+@pytest.mark.parametrize("digits", [5000, 21])
+def test_over_long_integer_is_invalid_whatever_the_interpreter_limit(env: Env, digits: int) -> None:
+    previous = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(0)  # PYTHONINTMAXSTRDIGITS=0: the interpreter would accept it
+    try:
+        env.main("a: " + "9" * digits + "\n")
+        invalid(env, "config.yaml")
+        env.main("a: -" + "9" * digits + "\n")
+        invalid(env, "config.yaml")
+    finally:
+        sys.set_int_max_str_digits(previous)
+
+
+def test_twenty_digit_integer_still_loads(env: Env) -> None:
+    env.main("a: " + "9" * 20 + "\n")
+    assert env.data() == {"a": int("9" * 20)}
+
+
+def test_over_long_float_is_invalid(env: Env) -> None:
+    env.main("a: 1." + "0" * 30 + "\n")
+    invalid(env, "config.yaml")
+    env.main("a: 3.141592653589793\n")
+    assert env.data() == {"a": 3.141592653589793}
+
+
 def test_alias_bomb_is_refused_at_the_first_alias_quickly(env: Env) -> None:
     lines = ["a0: &a0 [x, x, x, x, x, x, x, x, x]"]
     for index in range(1, 10):
@@ -736,6 +755,27 @@ def test_flow_nesting_at_the_depth_limit_loads_and_beyond_it_is_invalid(env: Env
     assert "a" in env.data()
     bad = "a: " + "[" * MAX_DEPTH + "]" * MAX_DEPTH + "\n"
     env.main(bad)
+    invalid(env, "config.yaml")
+
+
+def _block_maps(count: int, leaf: str) -> str:
+    """``count`` nested block maps (the top level is the first) around a scalar leaf."""
+    lines = ["  " * i + "k:" for i in range(count - 1)]
+    return "\n".join([*lines, "  " * (count - 1) + f"k: {leaf}"]) + "\n"
+
+
+def test_block_maps_with_a_scalar_leaf_count_only_containers(env: Env) -> None:
+    env.main(_block_maps(MAX_DEPTH, "v"))  # 16 containers and a scalar: allowed
+    assert "k" in env.data()
+    env.main(_block_maps(MAX_DEPTH + 1, "v"))
+    invalid(env, "config.yaml")
+
+
+def test_flow_sequence_with_a_scalar_counts_only_containers(env: Env) -> None:
+    ok = "a: " + "[" * (MAX_DEPTH - 1) + "x" + "]" * (MAX_DEPTH - 1) + "\n"
+    env.main(ok)  # the top-level map and 15 sequences: 16 containers
+    assert "a" in env.data()
+    env.main("a: " + "[" * MAX_DEPTH + "x" + "]" * MAX_DEPTH + "\n")
     invalid(env, "config.yaml")
 
 
@@ -943,3 +983,81 @@ def test_yaml_error_in_a_dropin_names_the_dropin(env: Env) -> None:
     env.main()
     env.write("config.d/10-a.yaml", "a: &x 1\n")
     invalid(env, "config.d/10-a.yaml")
+
+
+# --- merging maps -----------------------------------------------------------------------------
+
+
+def test_maps_merge_key_by_key_and_a_leaf_in_two_files_is_refused(env: Env) -> None:
+    env.main("defaults: {x: 1}\n")
+    env.write("config.d/10-a.yaml", "defaults: {y: 2}\n")
+    assert env.data() == {"defaults": {"x": 1, "y": 2}}
+    env.write("config.d/10-a.yaml", "defaults: {x: 1}\n")
+    invalid(env, "defaults.?")
+
+
+# --- ENOTDIR on the way, the last segment of --config ---------------------------------------
+
+
+def test_default_location_below_a_regular_file_is_unconfigured(env: Env) -> None:
+    (env.home / ".config").write_text("a file where the directory belongs\n")
+    assert env.load() is None
+
+
+def test_explicit_config_with_a_file_on_the_way_is_config_invalid(env: Env, tmp_path: Path) -> None:
+    (tmp_path / "f").write_text("x")
+    invalid(env, "--config", str(tmp_path / "f" / "config.yaml" / "x"))
+    invalid(env, "--config", str(tmp_path / "f" / "a" / "config.yaml"))
+
+
+def test_explicit_config_whose_directory_is_a_regular_file_is_unsafe(
+    env: Env, tmp_path: Path
+) -> None:
+    (tmp_path / "f").write_text("x")  # the config directory itself is the non-directory
+    unsafe(env, ".", str(tmp_path / "f" / "config.yaml"))
+
+
+@pytest.mark.parametrize("tail", ["/.", "/./.", "/", "/..", "//", "/./"])
+def test_config_option_whose_last_segment_is_empty_or_a_dot_is_invalid(
+    env: Env, tmp_path: Path, tail: str
+) -> None:
+    d = tmp_path / "d"
+    d.mkdir(mode=0o700)
+    (d / "x").write_text("enabled: true\n")
+    (d / "x").chmod(0o600)
+    assert env.load(str(d / "x")) is not None
+    invalid(env, "--config", str(d / "x") + tail)
+
+
+# --- total size and entry caps -----------------------------------------------------------------
+
+
+def _pad(size: int) -> str:
+    return "#" * (size - 1) + "\n"
+
+
+def test_total_bytes_budget_of_one_mebibyte_across_all_files(env: Env) -> None:
+    env.write("config.yaml", _pad(MAX_FILE_BYTES))
+    for index in range(3):
+        env.write(f"config.d/{index}.yaml", _pad(MAX_FILE_BYTES))
+    assert env.data() == {}  # exactly 1 MiB in four files
+    env.write("config.d/9.yaml", "\n")  # one byte over
+    invalid(env, "config.d/9.yaml")
+
+
+def test_total_bytes_budget_is_crossed_by_many_small_files(env: Env) -> None:
+    env.main()
+    for index in range(5):
+        env.write(f"config.d/{index}.yaml", _pad(MAX_FILE_BYTES))
+    invalid(env, "config.d/3.yaml")
+
+
+def test_config_d_entries_of_any_name_are_capped_at_4096(env: Env) -> None:
+    env.main()
+    directory = env.cfg / "config.d"
+    directory.mkdir(mode=0o700)
+    for index in range(4096):
+        (directory / f"{index}.txt").touch()
+    assert env.data() == {"enabled": True}
+    (directory / "one-more.txt").touch()
+    invalid(env, "config.d")
