@@ -16,7 +16,7 @@ Safety properties:
   quantifiers, so the work is linear. Building never raises and never refuses: anything outside
   the grammar or the tables gives the empty string (no link; the notice is still sent).
 
-Choices where the interface is silent (the narrower reading): ``pr`` is at most 512 characters;
+Choices where the interface is silent (the narrower reading): ``pr`` is at most 1024 characters;
 a built URL is at most 1024 characters (else empty); a port must also be 1 to 65535.
 
 TODO(#22): the send pipeline calls :func:`build_links` and passes ``pr_url`` and ``ticket_url``
@@ -33,7 +33,6 @@ from .validate import Links, Rule, is_literal_url
 
 __all__ = ["BuiltLinks", "build_links", "build_pr_url", "build_ticket_url"]
 
-PR_MAX = 512
 URL_MAX = 1024
 
 _LABEL = re.compile(r"[a-z0-9-]+")
@@ -57,7 +56,7 @@ def _host_ok(hostport: str) -> bool:
     host, sep, port = hostport.partition(":")
     if sep and (not _PORT.fullmatch(port) or not 1 <= int(port) <= 65535):
         return False
-    if not 1 <= len(host) <= 253:
+    if not host:
         return False
     for label in host.split("."):
         if not _LABEL.fullmatch(label) or label[0] == "-" or label[-1] == "-":
@@ -68,7 +67,7 @@ def _host_ok(hostport: str) -> bool:
 def build_pr_url(pr: object, links: Links) -> str:
     """The pull or merge request URL for a payload's ``pr`` (``<host>[:<port>]/<path>#<n>``),
     when its host is a key of ``links.hosts``; else ``""``."""
-    if type(pr) is not str or not links.hosts or len(pr) > PR_MAX:
+    if type(pr) is not str or not links.hosts or len(pr) > URL_MAX:
         return ""
     head, sep, number = pr.partition("#")
     if not sep or not _NUMBER.fullmatch(number):
@@ -80,7 +79,8 @@ def build_pr_url(pr: object, links: Links) -> str:
     for segment in path.split("/"):
         if not _SEGMENT.fullmatch(segment) or segment in (".", ".."):
             return ""
-    return f"https://{hostport}/{path}{_FORGES[forge]}{number}"
+    url = f"https://{hostport}/{path}{_FORGES[forge]}{number}"
+    return url if len(url) <= URL_MAX else ""
 
 
 def build_ticket_url(site: object, key: object, links: Links) -> str:

@@ -214,13 +214,49 @@ def test_pr_url_with_no_hosts_is_empty() -> None:
 
 
 def test_pr_url_length_is_bounded() -> None:
-    big = "a" * 600
-    assert build_pr_url(f"github.example.com/{big}#1", LINKS) == ""
     assert build_pr_url("github.example.com/" + "a/" * 5000 + "a#1", LINKS) == ""
-    ok = "a" * 200
+    big = "a" * 600
+    assert build_pr_url(f"github.example.com/{big}#1", LINKS) == (
+        f"https://github.example.com/{big}/pull/1"
+    )
+    ok = "a" * 979  # pr is exactly 1000 characters
     got = build_pr_url(f"github.example.com/{ok}#1", LINKS)
     assert got == f"https://github.example.com/{ok}/pull/1"
     assert len(got) <= 1024
+
+
+def test_pr_url_over_the_built_cap_is_empty() -> None:
+    pr = "github.example.com/" + "a" * 1001 + "#1"  # pr is 1022 characters, the URL is longer
+    assert len(pr) <= 1024
+    assert build_pr_url(pr, LINKS) == ""
+
+
+def test_pr_over_1024_is_empty() -> None:
+    assert build_pr_url("github.example.com/" + "a" * 1010 + "#1", LINKS) == ""
+
+
+def test_host_ok_rejects_keys_that_cannot_load() -> None:
+    bad = ["bad host", "h.example.com:99999", "-a.example.com", "A.example"]
+    hand = Links(hosts=dict.fromkeys(bad, "github"), tickets={})
+    for key in bad:
+        assert build_pr_url(f"{key}/o/r#1", hand) == ""
+
+
+def test_pr_url_builds_for_a_long_valid_host_key() -> None:
+    host = ".".join(["a" * 63] * 4)  # 255 characters
+    assert len(host) == 255
+    hand = Links(hosts={host: "github"}, tickets={})
+    assert build_pr_url(f"{host}/o/r#1", hand) == f"https://{host}/o/r/pull/1"
+
+
+def test_str_subclass_literal_is_refused() -> None:
+    class Sub(str):
+        pass
+
+    assert is_literal_url("https://x.example.com/p")
+    assert not is_literal_url(Sub("https://x.example.com/p"))
+    got = build_links(rule(link=Sub("https://x.example.com/p")), hook({}), LINKS)  # type: ignore[arg-type]
+    assert got.link == ""
 
 
 # --- ticket_url -------------------------------------------------------------------------------

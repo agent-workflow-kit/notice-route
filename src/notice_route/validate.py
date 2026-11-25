@@ -320,7 +320,7 @@ def _template(value: Any, path: Path) -> str:
 
 def is_literal_url(value: object, high: int = MAX_LINK) -> bool:
     """Whether ``value`` is a literal link of the config grammar (Links)."""
-    if not isinstance(value, str) or not 9 <= len(value) <= high:
+    if type(value) is not str or not 9 <= len(value) <= high:
         return False
     found = _URL.fullmatch(value)
     return found is not None and _port_ok(found.group(2))
