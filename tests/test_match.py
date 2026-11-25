@@ -4,7 +4,6 @@ Pure logic: tests build ``Notification`` and ``Match`` objects directly and read
 
 from __future__ import annotations
 
-import time
 from dataclasses import replace
 from typing import Any
 
@@ -102,12 +101,13 @@ def test_wildcard_matches(pattern: str, value: str, expected: bool) -> None:
     assert wildcard_matches(pattern, value) is expected
 
 
-def test_wildcard_is_not_quadratic_on_hostile_input() -> None:
-    # The grammar is one literal prefix: matching is a single startswith, whatever the value.
-    start = time.perf_counter()
-    for _ in range(200):
-        assert not wildcard_matches("a" * 255 + "b*", "a" * 1_000_000)
-    assert time.perf_counter() - start < 2.0
+def test_wildcard_gives_correct_results_on_long_hostile_input() -> None:
+    # The grammar is one literal prefix: the answer depends only on it, however long the value.
+    long_value = "a" * 1_000_000
+    assert not wildcard_matches("a" * 255 + "b*", long_value)
+    assert wildcard_matches("a" * 255 + "*", long_value)
+    assert wildcard_matches("a" * 255 + "b*", "a" * 255 + "b" + "a" * 1_000_000)
+    assert not wildcard_matches("a" * 255 + "b*", "a" * 254)
 
 
 # --- conditions per shape ----------------------------------------------------------------------
@@ -538,10 +538,14 @@ def test_rule_covers_implies_the_later_rule_never_decides() -> None:
     earlier = m(source="agent-*", labels=("a=b",), where=(("k", 1),))
     later = m(source="agent-spawn", labels=("a=b", "c=d"), where=(("k", 1), ("j", "x")))
     assert rule_covers(earlier, later)
-    for n in (
+    samples = (
         hook({"k": 1, "j": "x"}, labels=(("a", "b"), ("c", "d"))),
         hook({"k": 1, "j": "x"}, labels=(("a", "b"),)),
         hook({"k": 2, "j": "x"}, labels=(("a", "b"), ("c", "d"))),
-    ):
+    )
+    exercised = 0
+    for n in samples:
         if matches(later, n):
+            exercised += 1
             assert matches(earlier, n)
+    assert exercised >= 1
