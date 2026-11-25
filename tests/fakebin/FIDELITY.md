@@ -22,9 +22,17 @@ The sources are the notifiers' interfaces (`Calling from automation`, `Exit code
   session, cwd, argv, full environment, open descriptors), `stdin`, `signal`, `grandchild`,
   `hang_started`, `exit`. A process killed by a signal writes no `exit`.
 - Safety: a hang, sleep or linger never outlives `max_seconds` (default 60, exit 124); a hang
-  also ends when its parent changes (not when the parent was already PID 1); a grandchild ends
-  after `lifetime` (default 20 s, at most 120). Tests signal only recorded PIDs whose start
-  time still matches (`Notifier.kill_tracked`).
+  also ends when its parent changes (not when the parent was already PID 1); reading stdin and
+  writing stdout or stderr are bounded the same way (a writer that keeps stdin open, or a reader
+  that never reads, ends the fake with 124 at `max_seconds` or when its parent changes). A
+  grandchild is meant to outlive the fake and hold the pipe, so it does not follow its parent;
+  its `lifetime` (default 20 s, at most 120) is its only bound. It records itself
+  (`grandchild_started`) before it reports, and the fake logs `grandchild_spawn` right after the
+  spawn, so a fake killed in between still leaves the PID for the helper.
+- Tests kill only recorded PIDs verified by start time (`Notifier.kill_tracked`: the fake, its
+  grandchildren, and the process `start()`/`run()` launched). Process-group kills
+  (`os.killpg`) are used only for groups the test created itself with `start_new_session`,
+  while the leader is still unreaped, so the group id cannot belong to anyone else.
 - A broken setup (unknown key, bad type, a relative `log`) is one `fakebin: ...` line on stderr
   and exit 70, never a traceback.
 
@@ -33,15 +41,15 @@ The sources are the notifiers' interfaces (`Calling from automation`, `Exit code
 | Key | Effect |
 |---|---|
 | `exit` | the exit code, any 0 to 255 |
-| `error` | `{code, ...}`: the error envelope with the per-code flag and details defaults of the interfaces; the exit code follows the code (usage and config_invalid 2, internal 1, refused 20, the rest 12) unless `exit` is set |
+| `error` | `{code, ...}` (not with `stdout`, `stdout_b64`, `stdout_bytes` or `no_output`: setup error): the error envelope with the per-tool, per-code flag and details defaults of the interfaces (ha-notice: `hint` on `host_rejected`; `retryable` true for `outcome_unknown` and `upstream_error` exactly when `--dedupe-key` was passed); the exit code follows the code (usage and config_invalid 2, internal 1, refused 20, the rest 12) unless `exit` is set |
 | `result` | fields merged into the default success object |
 | `stdout`, `stdout_b64`, `no_output`, `stderr` | any output, byte for byte, or none |
 | `stdout_bytes`, `stderr_bytes` | that many bytes of padding (oversized output) |
 | `sleep`, `linger`, `hang`, `hang_before_read` | time before the answer, after it, until killed, and before stdin is read |
 | `signals` | per TERM, HUP or INT: `ignore`, `default` or `exit:N` |
-| `die_by_signal` | the fake kills itself with that signal after its output |
+| `die_by_signal` | the fake kills itself with that signal after its output (SEGV and ABRT first set `RLIMIT_CORE` to 0, so no core file is written; the `die` log record shows the limit) |
 | `grandchild` | a descendant: `setsid`, `hold_stdout`, `hold_stderr`, `double_fork`, `lifetime` |
-| `close_stdin` | closes stdin without reading it (a writer then sees EPIPE) |
+| `close_stdin` | closes stdin without reading it. A writer sees EPIPE only for a payload larger than the pipe buffer (64 KiB by default) or when it writes after the close; a small payload is simply buffered and no EPIPE is guaranteed |
 | `disabled` | exit 22 and `{"outcome":"disabled"}` before any input is read |
 | `validate_input` | `false` skips the payload checks below |
 | `tool` | `slack-notice` (default) or `ha-notice`: the shape of the success object and a few input rules |
@@ -50,9 +58,13 @@ The sources are the notifiers' interfaces (`Calling from automation`, `Exit code
 ## Modeled from the interfaces
 
 - Argument grammar: exact flags (no abbreviations), `--flag=value`, a separate value may not
-  start with `-`, a value flag at most once (`--decision-id` repeats), no bare `--`, no short
+  start with `-` (a lone `-` is a value, as in `--file -`), `--help`/`-h`/`--version` exit 0 as
+  soon as they are reached, even after an unknown flag or stray word (the argparse behavior;
+  a missing value, a repeated value flag or `--` before them still fail), a value flag at most once (`--decision-id` repeats), no bare `--`, no short
   option but `-h`, boolean flags refuse `=value`, `--verbose` with `--quiet`, the actor
-  pattern, a dedupe key of 1 to 1024 characters, the source-combination rules of `send`. Any
+  pattern, a dedupe key of 1 to 1024 characters, the source-combination rules of `send`, an empty
+  `--config=`, `clear` without `--dedupe-key` or with `--stdin-json`, and `validate` with
+  `--dedupe-key` (all exit 2 usage). Any
   `--json` or `--json=...` token selects the envelope, found before parsing.
 - Exit codes 0, 1, 2, 12, 20, 22 and the envelope; stdout is written before the stderr line.
 - Input: strict reader (duplicate keys, NaN, a BOM, invalid UTF-8, more than 1 MiB, nesting
@@ -68,6 +80,8 @@ The sources are the notifiers' interfaces (`Calling from automation`, `Exit code
 - The sanitizer is reduced to the emptiness test (removed characters, whitespace and marks).
   Text is never cut, so `truncated` is always false, and `bytes` is an approximation of the
   request body.
+- Known divergences: nesting over 100 is refused with pointer `""`; ha-notice `actions` answer
+  `fake_unsupported` before any field check; a surrogate in scripted text is written as `?`.
 - No config, no credential check, no network, no send lock, no spacing, no log file of its own.
 - `duration_ms` is 0 and `http_status` 200. The messages of envelopes are fixed fake strings.
 - A signal before the send starts exits 128+N only when scripted (`signals`); by default the
@@ -84,8 +98,13 @@ The sources are the notifiers' interfaces (`Calling from automation`, `Exit code
   codes and envelope are assumed to be the same as the other two. Its `WSL_INTEROP` and
   `WSL_DISTRO_NAME` handling and its lock behavior are not modeled.
 - slack-notice is pinned at its design version (0.1.0-design, no implementation released):
-  everything about it comes from its interface and schemas. ha-notice is pinned at 0.28.0 but
-  the fake was not compared with a real run.
+  everything about it comes from its interface and schemas. ha-notice is pinned at 0.28.0 and was
+  compared with a real `ha-notice send --dry-run --config <scratch>` differential on payloads
+  and argv (2026-11-24, 0.28.0); slack-notice was not compared with anything real.
+- That the real tool loads and checks its config before reading input (so `config_invalid`,
+  exit 2, would precede payload refusals; the fake has no config), and what a real tool prints
+  when SIGTERM or SIGINT arrives after the send started (an envelope that `signals` cannot
+  script).
 - That a real notifier prints exactly one line (trailing newline) on stdout, and the exact
   usage message text and stderr lines.
 - The real exit code and output when a signal arrives (exit 128+N before the send starts, the

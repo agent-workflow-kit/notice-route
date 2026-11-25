@@ -15,6 +15,7 @@ import ipaddress
 import json
 import os
 import re
+import resource
 import select
 import signal
 import subprocess
@@ -140,6 +141,8 @@ def check_behavior(b: dict[str, Any], *, top: bool) -> None:
             raise Setup(f"{key} must be an object")
     if "error" in b and b["error"].get("code") not in ERROR_CODES:
         raise Setup("error.code must be one of the notifiers' codes")
+    if "error" in b and ({"stdout", "stdout_b64", "stdout_bytes", "no_output"} & set(b)):
+        raise Setup("error cannot be combined with stdout, stdout_b64, stdout_bytes or no_output")
     if "signals" in b:
         if not isinstance(b["signals"], dict):
             raise Setup("signals must be an object")
@@ -207,7 +210,7 @@ class Log:
         line = json.dumps({"event": event, "n": self.n, **fields}, ensure_ascii=False) + "\n"
         fd = os.open(self.path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
-            os.write(fd, line.encode("utf-8"))
+            os.write(fd, line.encode("utf-8", errors="replace"))
         finally:
             os.close(fd)
 
@@ -254,22 +257,28 @@ SUBCOMMANDS = {"send", "clear", "validate"}
 
 class Args:
     def __init__(self) -> None:
+        self.early: str | None = None  # --help or --version, whichever came first
         self.flags: set[str] = set()
         self.values: dict[str, str] = {}
         self.command: str | None = None
 
 
 def parse_argv(argv: list[str]) -> Args:
+    """Parse like argparse: ``--help``/``--version`` act when reached, so they win over unknown
+    flags and stray words (deferred errors); a missing value, a doubled flag or ``--`` fail at once.
+    """
     a = Args()
+    deferred = False
     i = 0
     while i < len(argv):
         tok = argv[i]
         i += 1
         if tok == "--":
             raise Usage
-        if tok == "-h":
-            a.flags.add("--help")
-            continue
+        if tok in ("-h", "--help", "--version"):
+            a.early = "--help" if tok == "-h" else tok
+            a.flags.add(a.early)
+            return a
         if tok.startswith("--"):
             name, eq, value = tok.partition("=")
             if name in BOOL_FLAGS:
@@ -279,7 +288,7 @@ def parse_argv(argv: list[str]) -> Args:
                 continue
             if name in VALUE_FLAGS:
                 if not eq:
-                    if i >= len(argv) or argv[i].startswith("-"):
+                    if i >= len(argv) or (argv[i].startswith("-") and argv[i] != "-"):
                         raise Usage
                     value = argv[i]
                     i += 1
@@ -287,17 +296,20 @@ def parse_argv(argv: list[str]) -> Args:
                     raise Usage
                 a.values[name] = value
                 continue
-            raise Usage  # unknown, or an abbreviation: flags are exact
-        if tok.startswith("-"):
-            raise Usage  # no short option but -h
+            deferred = True  # unknown, or an abbreviation: flags are exact
+            continue
+        if tok.startswith("-") and tok != "-":
+            deferred = True  # no short option but -h
+            continue
         if a.command is not None or tok not in SUBCOMMANDS:
-            raise Usage
+            deferred = True
+            continue
         a.command = tok
-    if "--help" in a.flags or "--version" in a.flags:
-        return a
-    if a.command is None:
+    if deferred or a.command is None:
         raise Usage
     if "--verbose" in a.flags and "--quiet" in a.flags:
+        raise Usage
+    if a.values.get("--config") == "":
         raise Usage
     actor = a.values.get("--actor")
     if actor is not None and ACTOR.fullmatch(actor) is None:
@@ -311,6 +323,10 @@ def parse_argv(argv: list[str]) -> Args:
         if not 1 <= len(key) <= 1024:
             raise Usage
     if a.command != "validate" and ({"--probe", "--test-message"} & a.flags):
+        raise Usage
+    if a.command == "clear" and (key is None or "--stdin-json" in a.flags):
+        raise Usage
+    if a.command == "validate" and key is not None:
         raise Usage
     if a.command == "send":
         text = {"--title", "--message", "--level", "--link"} & set(a.values)
@@ -390,13 +406,18 @@ def _has_surrogate(text: str) -> bool:
     return any(0xD800 <= ord(c) <= 0xDFFF for c in text)
 
 
-def _empty(text: str) -> bool:
-    kept = [
+def _sanitized(text: str) -> list[str]:
+    """The characters that survive the sanitizer's removals."""
+    return [
         c
         for c in text
         if not REMOVED.fullmatch(c)
         and not (unicodedata.category(c) in ("Cc", "Co", "Cn") and c != "\n")
     ]
+
+
+def _empty(text: str) -> bool:
+    kept = _sanitized(text)
     return all(c.isspace() or unicodedata.category(c) in ("Mn", "Mc", "Me") for c in kept)
 
 
@@ -444,7 +465,7 @@ def check_payload(raw: bytes, *, tool: str) -> dict[str, Any]:
     if message is None or _empty(message):
         raise Refuse("empty_message")
     if tool == "ha-notice":
-        folded = unicodedata.normalize("NFKC", message).casefold().strip()
+        folded = unicodedata.normalize("NFKC", "".join(_sanitized(message))).casefold().strip()
         if folded == "tts" or COMMAND_FAMILY.fullmatch(folded):
             raise Refuse("command_keyword")
     return value
@@ -454,15 +475,47 @@ def check_payload(raw: bytes, *, tool: str) -> dict[str, Any]:
 
 
 def dumps(obj: Any) -> bytes:
-    return (json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    return text_bytes(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+class Guard:
+    """The fake's own lifetime: a deadline and the parent it may not outlive."""
+
+    end = float("inf")
+    ppid = 1
+
+    @classmethod
+    def check(cls) -> None:
+        if time.monotonic() >= cls.end or (cls.ppid != 1 and os.getppid() != cls.ppid):
+            raise Ended(124)
+
+
+def wait_fd(fd: int, *, writing: bool) -> None:
+    """Block until ``fd`` is ready, in short slices that check the lifetime guard."""
+    while True:
+        Guard.check()
+        try:
+            r, w, _ = select.select([] if writing else [fd], [fd] if writing else [], [], 0.05)
+        except (OSError, ValueError):
+            return  # a closed or invalid descriptor: let the caller's next call fail
+        if r or w:
+            return
 
 
 def write_fd(fd: int, data: bytes) -> None:
-    """Write everything; a reader that went away is ignored, as the real tools ignore it."""
+    """Write everything; a reader that went away is ignored, as the real tools ignore it.
+
+    A reader that never reads cannot hold the fake past its lifetime (``Ended(124)``).
+    """
     view = memoryview(data)
     try:
+        os.set_blocking(fd, False)
         while view:
-            view = view[os.write(fd, view) :]
+            wait_fd(fd, writing=True)
+            try:
+                view = view[os.write(fd, view) :]
+            except BlockingIOError:
+                continue
     except OSError:
         pass
 
@@ -471,15 +524,23 @@ def write_padding(fd: int, size: int) -> None:
     chunk = b"a" * 65536
     left = size
     try:
+        os.set_blocking(fd, False)
         while left > 0:
-            n = os.write(fd, chunk[: min(left, len(chunk))])
-            left -= n
+            wait_fd(fd, writing=True)
+            try:
+                left -= os.write(fd, chunk[: min(left, len(chunk))])
+            except BlockingIOError:
+                continue
     except OSError:
         pass
 
 
-# Per-code defaults of the flags and details, as the notifiers' interfaces fix them (the pinned
-# error schema enforces the same table). A scripted error may override any key.
+def text_bytes(text: str) -> bytes:
+    return text.encode("utf-8", errors="replace")
+
+
+# Per-code defaults of the flags and details, as the notifiers' interfaces fix them (each tool's
+# pinned error schema enforces the same table). A scripted error may override any key.
 CODE_DEFAULTS: dict[str, dict[str, Any]] = {
     "config_invalid": {"details": {"key": "?"}},
     "internal": {"retryable": False, "unknown_outcome": False},
@@ -511,9 +572,19 @@ CODE_DEFAULTS: dict[str, dict[str, Any]] = {
         "retryable": True, "unknown_outcome": False, "details": {"phase": "input"},
     },
 }  # fmt: skip
+# ha-notice differs: a 400 carries a hint, and a request tagged with --dedupe-key makes an unknown
+# outcome (outcome_unknown, upstream_error) retryable.
+HA_DEFAULTS: dict[str, dict[str, Any]] = {
+    "host_rejected": {
+        "retryable": False, "unknown_outcome": False,
+        "details": {"http_status": 400, "hint": "the host refused the request"},
+    },
+}  # fmt: skip
 
 
-def envelope(error: dict[str, Any], message: str) -> dict[str, Any]:
+def envelope(
+    error: dict[str, Any], message: str, *, tool: str = "slack-notice", key: str | None = None
+) -> dict[str, Any]:
     base = {
         "code": None,
         "message": message,
@@ -523,23 +594,36 @@ def envelope(error: dict[str, Any], message: str) -> dict[str, Any]:
         "retry_after_s": None,
         "unknown_outcome": None,
     }
-    base.update(CODE_DEFAULTS.get(error["code"], {}))
+    code = error["code"]
+    base.update(CODE_DEFAULTS.get(code, {}))
+    if tool == "ha-notice":
+        base.update(HA_DEFAULTS.get(code, {}))
+        if code in ("outcome_unknown", "upstream_error"):
+            base["retryable"] = key is not None
     base.update(error)
     return {"error": base}
 
 
+def _text(value: Any) -> str:
+    """A payload field as text; with validation off a field may be any JSON value."""
+    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+
+
 def success(tool: str, payload: dict[str, Any], key: str | None) -> dict[str, Any]:
     level = payload.get("level", "info")
+    if not isinstance(level, str):
+        level = "info"
+    title, message = payload.get("title"), payload.get("message")
     if tool == "slack-notice":
-        body = {"body": "\n".join(x for x in (payload.get("title"), payload.get("message")) if x)}
+        body = {"body": "\n".join(_text(x) for x in (title, message) if x)}
     else:
-        body = {k: payload[k] for k in ("title", "message") if k in payload}
+        body = {k: _text(payload[k]) for k in ("title", "message") if k in payload}
     out: dict[str, Any] = {
         "outcome": "sent",
         "tool": tool,
         "level": level,
         "truncated": False,
-        "bytes": len(json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")),
+        "bytes": len(text_bytes(json.dumps(body, ensure_ascii=False, separators=(",", ":")))),
         "duration_ms": 0,
         "http_status": 200,
     }
@@ -554,14 +638,21 @@ def success(tool: str, payload: dict[str, Any], key: str | None) -> dict[str, An
 # the run --------------------------------------------------------------------------------------
 
 GRANDCHILD = r"""
-import os, sys, time
+import json, os, sys, time
 lifetime = float(sys.argv[1])
 double, setsid = sys.argv[2] == "1", sys.argv[3] == "1"
 report = int(sys.argv[4])
+log, n = sys.argv[5], int(sys.argv[6])
 if double and os.fork():
     os._exit(0)
 if setsid:
     os.setsid()
+with open("/proc/self/stat", encoding="utf-8") as f:
+    start = f.read().rsplit(")", 1)[1].split()[19]
+line = json.dumps({"event": "grandchild_started", "n": n, "pid": os.getpid(), "start": start})
+fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+os.write(fd, (line + "\n").encode())
+os.close(fd)
 os.write(report, str(os.getpid()).encode())
 os.close(report)
 end = time.monotonic() + lifetime
@@ -579,6 +670,9 @@ class Run:
         self.started = time.monotonic()
         self.ppid = os.getppid()  # a parent that is already PID 1 cannot be watched
         self.json_mode = False
+        self.key: str | None = None
+        Guard.end = self.started + self.max_seconds
+        Guard.ppid = self.ppid
 
     # time that can never outlive its test
     def pause(self, seconds: float, *, hang: bool = False) -> None:
@@ -614,6 +708,7 @@ class Run:
         chunks: list[bytes] = []
         size = 0
         while size <= MAX_STDIN:
+            wait_fd(0, writing=False)  # never past max_seconds, never after the parent is gone
             try:
                 data = os.read(0, 65536)
             except OSError:
@@ -637,13 +732,16 @@ class Run:
         r, w = os.pipe()
         proc = subprocess.Popen(
             [sys.executable, "-I", "-c", GRANDCHILD, str(lifetime), "1" if double else "0",
-             "1" if g.get("setsid", False) else "0", str(w)],
+             "1" if g.get("setsid", False) else "0", str(w), self.log.path, str(self.log.n)],
             stdin=subprocess.DEVNULL,
             stdout=1 if hold_out else subprocess.DEVNULL,
             stderr=2 if hold_err else subprocess.DEVNULL,
             pass_fds=(w,),
         )  # fmt: skip
         os.close(w)
+        # Logged before the wait: if the fake is killed now the helper still knows this PID (for a
+        # double fork it is the intermediate; the grandchild itself logs ``grandchild_started``).
+        self.log.write("grandchild_spawn", pid=proc.pid, start=proc_start(proc.pid))
         ready, _, _ = select.select([r], [], [], 10)
         raw = os.read(r, 32) if ready else b""
         os.close(r)
@@ -661,10 +759,10 @@ class Run:
         code = error["code"]
         message = "invalid arguments" if code == "usage" else f"fake notifier: {code}"
         if self.json_mode:
-            write_fd(1, dumps(envelope(error, message)))
+            write_fd(1, dumps(envelope(error, message, tool=self.tool, key=self.key)))
         reason = error.get("reason")
         line = f"refused ({reason}): {message}" if code == "refused" else f"{code}: {message}"
-        write_fd(2, (line + "\n").encode("utf-8"))
+        write_fd(2, text_bytes(line + "\n"))
         if exit_code is not None:
             return exit_code
         return CODES_EXIT.get(code, 12)
@@ -676,10 +774,11 @@ class Run:
             args = parse_argv(argv)
         except Usage:
             return self.emit_error({"code": "usage"}, None)
-        if "--version" in args.flags:
+        self.key = args.values.get("--dedupe-key")
+        if args.early == "--version":
             write_fd(1, f"{self.tool} {VERSION}\n".encode())
             return 0
-        if "--help" in args.flags:
+        if args.early == "--help":
             write_fd(1, f"usage: {self.tool} [flags] send|clear|validate\n".encode())
             return 0
         if args.command != "send" or "--dry-run" in args.flags:
@@ -718,7 +817,7 @@ class Run:
             try:
                 value = json.loads(raw)
                 payload = value if isinstance(value, dict) else {}
-            except ValueError:
+            except (ValueError, RecursionError):
                 payload = {}
         if "grandchild" in b:
             self.spawn_grandchild()
@@ -734,6 +833,13 @@ class Run:
             num = SIGNALS[b["die_by_signal"]]
             if num != signal.SIGKILL:
                 signal.signal(num, signal.SIG_DFL)
+            if num in (signal.SIGSEGV, signal.SIGABRT):
+                resource.setrlimit(resource.RLIMIT_CORE, (0, 0))  # no core file from a test
+            self.log.write(
+                "die",
+                signal=b["die_by_signal"],
+                core_limit=list(resource.getrlimit(resource.RLIMIT_CORE)),
+            )
             os.kill(os.getpid(), num)
             time.sleep(5)
             raise Setup("the process survived its own signal")
@@ -747,7 +853,7 @@ class Run:
         elif "stdout_b64" in b:
             write_fd(1, base64.b64decode(b["stdout_b64"]))
         elif "stdout" in b:
-            write_fd(1, b["stdout"].encode("utf-8"))
+            write_fd(1, text_bytes(b["stdout"]))
         elif b.get("no_output"):
             pass
         elif "error" in b:
@@ -759,12 +865,12 @@ class Run:
             if self.json_mode:
                 write_fd(1, dumps(body))
             else:
-                write_fd(2, f"sent ({body['level']}, {body['duration_ms']} ms)\n".encode())
+                write_fd(2, text_bytes(f"sent ({body['level']}, {body['duration_ms']} ms)\n"))
         return self.finish_stderr(0 if exit_code is None else exit_code)
 
     def finish_stderr(self, code: int) -> int:
         if "stderr" in self.b:
-            write_fd(2, self.b["stderr"].encode("utf-8"))
+            write_fd(2, text_bytes(self.b["stderr"]))
         if "stderr_bytes" in self.b:
             write_padding(2, self.b["stderr_bytes"])
         return code

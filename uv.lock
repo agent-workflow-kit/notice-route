@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 
 [[package]]
@@ -117,6 +117,7 @@ dev = [
     { name = "pymarkdownlnt" },
     { name = "pyright" },
     { name = "pytest" },
+    { name = "referencing" },
     { name = "ruff" },
 ]
 
@@ -128,6 +129,7 @@ dev = [
     { name = "pymarkdownlnt", specifier = ">=0.9.41" },
     { name = "pyright", specifier = ">=1.1.380" },
     { name = "pytest", specifier = ">=8" },
+    { name = "referencing", specifier = ">=0.35" },
     { name = "ruff", specifier = ">=0.6" },
 ]
 

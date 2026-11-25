@@ -263,3 +263,107 @@ def test_a_number_is_a_parse_failure_for_slack_and_a_type_error_for_ha(
     assert refused(ha, home, '{"message": 1' + "0" * 5000 + "}")[1]["error"]["details"] == {  # type: ignore[index]
         "pointer": ""
     }
+
+
+# review round 1 -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("tool", TOOLS)
+@pytest.mark.parametrize("code", ["outcome_unknown", "upstream_error"])
+def test_ha_retryable_follows_the_dedupe_key_for_unknown_outcomes(
+    make_notifier: Make, home: Path, tool: str, code: str
+) -> None:
+    n = make_notifier(tool, tool=tool, error={"code": code})
+    keyed = last_json(run(n, home, args=[*CANONICAL, "--dedupe-key", "k"]))
+    plain = last_json(run(n, home))
+    ss.validate(keyed, tool, "cli/error.json")
+    ss.validate(plain, tool, "cli/error.json")
+    assert keyed["error"]["retryable"] is (tool == "ha-notice")
+    assert plain["error"]["retryable"] is False
+
+
+def test_a_command_keyword_is_folded_after_the_sanitizer_removed_invisible_characters(
+    make_notifier: Make, home: Path
+) -> None:
+    ha = make_notifier("ha-notice", tool="ha-notice")
+    for text in ("clear\u200b_notification", "t\u200bts", "\u00adclear_notification"):
+        _, body = refused(ha, home, json.dumps({"message": text}))
+        error = body["error"]
+        assert isinstance(error, dict)
+        assert error["reason"] == "command_keyword", text
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["send", "--file", "-", "--json"],
+        ["send", "--stdin-json", "--file", "-", "--json"],
+        ["send", "--json", "--file=-"],
+    ],
+)
+def test_a_separated_value_of_a_single_dash_is_a_value(
+    make_notifier: Make, home: Path, args: list[str]
+) -> None:
+    n = make_notifier("ha-notice", tool="ha-notice")
+    assert run(n, home, args=args).returncode == 0
+
+
+def test_a_dedupe_key_of_a_single_dash_is_echoed(make_notifier: Make, home: Path) -> None:
+    n = make_notifier()
+    result = run(n, home, args=["send", "--stdin-json", "--json", "--dedupe-key", "-"])
+    assert last_json(result)["dedupe_key"] == "-"
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["send", "--stdin-json", "--json", "--version", "--bogus"],
+        ["send", "--bogus", "--help"],
+        ["frobnicate", "--version"],
+        ["send", "-h", "--actor=root"],
+    ],
+)
+def test_help_and_version_win_over_a_later_or_unknown_flag(
+    make_notifier: Make, home: Path, args: list[str]
+) -> None:
+    n = make_notifier()
+    result = run(n, home, args=args)
+    assert result.returncode == 0
+    assert n.events("stdin") == []
+
+
+def test_a_missing_value_before_help_is_still_a_usage_error(
+    make_notifier: Make, home: Path
+) -> None:
+    n = make_notifier()
+    assert run(n, home, args=["send", "--actor", "--help"]).returncode == 2
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["clear", "--json"],
+        ["clear", "--json", "--dedupe-key=k", "--stdin-json"],
+        ["validate", "--json", "--dedupe-key=k"],
+        ["send", "--stdin-json", "--json", "--config="],
+        ["validate", "--json", "--config="],
+    ],
+)
+@pytest.mark.parametrize("tool", TOOLS)
+def test_malformed_non_send_invocations_and_an_empty_config_are_usage_errors(
+    make_notifier: Make, home: Path, tool: str, args: list[str]
+) -> None:
+    n = make_notifier(tool, tool=tool)
+    result = run(n, home, args=args)
+    assert result.returncode == 2
+    assert last_json(result)["error"]["code"] == "usage"
+
+
+@pytest.mark.parametrize("tool", TOOLS)
+def test_disabled_without_json_prints_the_message_on_stderr_only(
+    make_notifier: Make, home: Path, tool: str
+) -> None:
+    n = make_notifier(tool, tool=tool, disabled=True)
+    result = run(n, home, args=["send", "--stdin-json"])
+    assert (result.returncode, result.stdout) == (22, b"")
+    assert result.stderr == b"disabled in config\n"

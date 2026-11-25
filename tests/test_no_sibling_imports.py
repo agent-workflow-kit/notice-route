@@ -20,6 +20,15 @@ SIBLINGS = frozenset(
         "pr_watch",
         "pr_comment",
         "memoctl",
+        "ticketctl",
+        "ticket_queue",
+        "ticket_create",
+        "review_run",
+        "review_watch",
+        "review_respond",
+        "ticket_work",
+        "session_audit",
+        "self_improve",
         "jobsctl",
         "gatectl",
         "awkit",
@@ -43,15 +52,32 @@ def test_the_checker_sees_each_import_form() -> None:
     assert imported_roots("from . import x\nimport os") == {"os"}
 
 
-def test_no_python_file_under_tests_imports_a_sibling() -> None:
-    offenders = {
-        path.relative_to(TESTS).as_posix(): sorted(
+def offenders_under(root: Path) -> dict[str, list[str]]:
+    return {
+        path.relative_to(root).as_posix(): sorted(
             imported_roots(path.read_text("utf-8")) & SIBLINGS
         )
-        for path in TESTS.rglob("*.py")
+        for path in root.rglob("*.py")
         if imported_roots(path.read_text("utf-8")) & SIBLINGS
     }
-    assert offenders == {}
+
+
+def test_no_python_file_under_tests_imports_a_sibling() -> None:
+    assert offenders_under(TESTS) == {}
+
+
+def test_the_check_can_fail_for_every_listed_sibling(tmp_path: Path) -> None:
+    for name in sorted(SIBLINGS):
+        (tmp_path / f"{name}_user.py").write_text(f"import {name}\n", "utf-8")
+    found = offenders_under(tmp_path)
+    assert sorted(found) == sorted(f"{name}_user.py" for name in SIBLINGS)
+
+
+def test_the_listed_siblings_include_the_tools_of_the_architecture_catalog() -> None:
+    assert {
+        "ticketctl", "ticket_queue", "ticket_create", "review_run", "review_watch",
+        "review_respond", "ticket_work", "session_audit", "self_improve",
+    } <= SIBLINGS  # fmt: skip
 
 
 def test_the_fake_imports_only_the_standard_library() -> None:

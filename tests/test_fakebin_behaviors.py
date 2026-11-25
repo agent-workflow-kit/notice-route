@@ -26,6 +26,7 @@ from tests.fakes import (
     last_json,
     proc_start,
     run,
+    scrubbed_env,
     start,
 )
 
@@ -44,6 +45,7 @@ def wait_gone(pid: int, start_time: str | None, timeout: float = 5.0) -> bool:
 # exit codes and envelopes -------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("tool", ["slack-notice", "ha-notice"])
 @pytest.mark.parametrize(
     ("code", "exit_code"),
     [
@@ -63,15 +65,15 @@ def wait_gone(pid: int, start_time: str | None, timeout: float = 5.0) -> bool:
     ],
 )
 def test_an_error_code_exits_with_the_documented_code_and_a_schema_valid_envelope(
-    make_notifier: Make, home: Path, code: str, exit_code: int
+    make_notifier: Make, home: Path, tool: str, code: str, exit_code: int
 ) -> None:
     error = {"code": code}
     if code == "refused":
         error["reason"] = "empty_message"
-    n = make_notifier(error=error, validate_input=False)
+    n = make_notifier(tool, tool=tool, error=error, validate_input=False)
     result = run(n, home)
     assert result.returncode == exit_code
-    ss.validate(last_json(result), "slack-notice", "cli/error.json")
+    ss.validate(last_json(result), tool, "cli/error.json")
     assert last_json(result)["error"]["code"] == code
 
 
@@ -471,7 +473,7 @@ def test_a_broken_setup_is_exit_70_never_a_traceback(
 
 def test_the_fake_needs_no_home_config_or_network(make_notifier: Make, tmp_path: Path) -> None:
     n = make_notifier()
-    result = run(n, tmp_path, env={})
+    result = run(n, tmp_path, env=scrubbed_env(tmp_path / "private"))
     assert result.returncode == 0
 
 
@@ -480,3 +482,161 @@ def test_proc_start_tells_two_processes_with_one_pid_apart() -> None:
     assert mine is not None
     assert alive(os.getpid(), mine)
     assert not alive(os.getpid(), "1")
+
+
+# review round 1 -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("key", ["stdout", "stdout_b64", "stdout_bytes", "no_output"])
+def test_an_error_together_with_scripted_stdout_is_a_setup_error(
+    make_notifier: Make, home: Path, key: str
+) -> None:
+    value: object = {"stdout": "x", "stdout_b64": "eA==", "stdout_bytes": 3, "no_output": True}[key]
+    n = make_notifier()
+    n.behavior_path.write_text(
+        json.dumps({"log": str(n.log_path), "error": {"code": "internal"}, key: value}), "utf-8"
+    )
+    result = run(n, home)
+    assert result.returncode == 70
+    assert result.stderr.startswith(b"fakebin: ")
+
+
+@pytest.mark.parametrize(("name", "signum"), [("SEGV", 11), ("ABRT", 6)])
+def test_dying_by_a_core_signal_first_forbids_core_dumps(
+    make_notifier: Make, home: Path, name: str, signum: int
+) -> None:
+    n = make_notifier(die_by_signal=name)
+    assert run(n, home).returncode == -signum
+    assert n.events("die")[0]["core_limit"] == [0, 0]
+
+
+def test_a_grandchild_can_hold_stderr_open(make_notifier: Make, home: Path) -> None:
+    n = make_notifier(grandchild={"setsid": True, "hold_stderr": True, "lifetime": 30})
+    proc = start(n, home)
+    feed(proc, b'{"message": "m"}')
+    assert proc.wait(timeout=5) == 0
+    assert n.wait_for("grandchild")["hold_stderr"] is True
+    with pytest.raises(subprocess.TimeoutExpired):
+        proc.communicate(timeout=0.5)
+    n.kill_tracked()
+    proc.communicate(timeout=5)
+
+
+@pytest.mark.parametrize(("name", "signum", "code"), [("INT", 2, 130), ("HUP", 1, 129)])
+def test_int_and_hup_can_end_the_fake_with_a_scripted_exit_code(
+    make_notifier: Make, home: Path, name: str, signum: int, code: int
+) -> None:
+    n = make_notifier(hang=True, signals={name: f"exit:{code}"})
+    proc = start(n, home)
+    feed(proc, b'{"message": "m"}')
+    n.wait_for("hang_started")
+    os.killpg(proc.pid, signum)
+    proc.communicate(timeout=5)
+    assert proc.returncode == code
+    assert n.events("exit")[-1]["code"] == code
+
+
+def test_a_writer_that_keeps_stdin_open_does_not_hold_the_fake_past_max_seconds(
+    make_notifier: Make, home: Path
+) -> None:
+    n = make_notifier(max_seconds=0.5)
+    proc = start(n, home)
+    began = time.monotonic()
+    assert proc.wait(timeout=5) == 124  # stdin is never closed
+    assert time.monotonic() - began < 4
+    assert proc.stdin is not None
+    proc.stdin.close()
+
+
+def test_a_reader_that_never_reads_does_not_hold_the_fake_past_max_seconds(
+    make_notifier: Make, home: Path
+) -> None:
+    n = make_notifier(stdout_bytes=5_000_000, max_seconds=0.5)
+    proc = start(n, home)
+    feed(proc, b'{"message": "m"}')
+    assert proc.wait(timeout=5) == 124  # stdout is never read
+    assert proc.stdout is not None
+    proc.stdout.close()
+
+
+def test_close_stdin_gives_epipe_to_a_writer_with_a_large_payload(
+    make_notifier: Make, home: Path
+) -> None:
+    n = make_notifier(close_stdin=True, linger=0.5)
+    proc = start(n, home)
+    assert proc.stdin is not None
+    n.wait_for("stdin_closed")
+    with pytest.raises(BrokenPipeError):
+        proc.stdin.write(b"x" * 300_000)  # more than the pipe holds: the write cannot be buffered
+        proc.stdin.flush()
+    proc.wait(timeout=5)
+
+
+def test_a_surrogate_in_argv_is_a_usage_error_not_a_traceback(
+    make_notifier: Make, home: Path
+) -> None:
+    n = make_notifier()
+    result = run(n, home, args=["send", "--stdin-json", "--json", "--bogus\udcff"])
+    assert result.returncode == 2
+    assert b"Traceback" not in result.stderr
+    assert n.events("invoke")
+
+
+def test_a_surrogate_in_scripted_text_does_not_traceback(make_notifier: Make, home: Path) -> None:
+    n = make_notifier(stderr="a\ud800b")
+    result = run(n, home)
+    assert result.returncode == 0
+    assert b"Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"message": 5, "title": [1], "level": {"a": 1}}',
+        '{"message": "m\\ud800", "title": "t\\ud800"}',
+        "[" * 100_000,
+        '{"message": "' + "x" * 10 + '", "title": null}',
+    ],
+)
+def test_odd_payloads_with_validation_off_never_traceback(
+    make_notifier: Make, home: Path, payload: str
+) -> None:
+    for tool in ("slack-notice", "ha-notice"):
+        n = make_notifier(tool, tool=tool, validate_input=False)
+        result = run(n, home, payload)
+        assert b"Traceback" not in result.stderr, result.stderr
+        assert result.returncode == 0
+
+
+def test_a_grandchild_records_itself_before_it_reports(make_notifier: Make, home: Path) -> None:
+    n = make_notifier(grandchild={"setsid": True, "lifetime": 30})
+    run(n, home, timeout=5)
+    events = [r["event"] for r in n.records()]
+    assert events.index("grandchild_spawn") < events.index("grandchild_started")
+    assert events.index("grandchild_started") < events.index("grandchild")
+    full = n.events("grandchild")[0]
+    assert n.events("grandchild_started")[0]["pid"] == full["pid"]
+    n.kill_tracked()
+
+
+def test_run_returns_promptly_on_timeout_even_when_a_setsid_grandchild_holds_stdout(
+    make_notifier: Make, home: Path
+) -> None:
+    n = make_notifier(hang=True, grandchild={"setsid": True, "hold_stdout": True, "lifetime": 30})
+    began = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        run(n, home, timeout=1.5)
+    assert time.monotonic() - began < 10
+    g = n.events("grandchild")[0]
+    assert wait_gone(g["pid"], g["start"])
+
+
+def test_kill_tracked_also_reaches_a_process_start_recorded_without_a_log(
+    make_notifier: Make, home: Path
+) -> None:
+    n = make_notifier(hang_before_read=True, hang=True)
+    proc = start(n, home)
+    assert any(t.pid == proc.pid and t.role == "popen" for t in n.tracked())
+    n.wait_for("hang_started")
+    n.kill_tracked()
+    assert proc.wait(timeout=5) == -signal.SIGKILL

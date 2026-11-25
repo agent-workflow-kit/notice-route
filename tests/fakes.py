@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +68,8 @@ class Notifier:
     stub: Path
     behavior_path: Path
     log_path: Path
+    # processes the helpers started themselves (``start``/``run``), known even before any log line
+    spawned: list[Tracked] = field(default_factory=list)
 
     @property
     def cmd(self) -> list[str]:
@@ -99,16 +101,19 @@ class Notifier:
         raise AssertionError(f"no {event!r} record x{count} within {timeout}s: {self.records()}")
 
     def tracked(self) -> list[Tracked]:
-        out: list[Tracked] = []
+        out: list[Tracked] = list(self.spawned)
         for r in self.records():
             if r["event"] == "invoke":
                 out.append(Tracked(r["pid"], r["start"], "fake"))
-            elif r["event"] == "grandchild":
+            elif r["event"] in ("grandchild", "grandchild_started", "grandchild_spawn"):
                 out.append(Tracked(r["pid"], r["start"], "grandchild"))
         return out
 
     def kill_tracked(self) -> None:
-        """SIGKILL each process this notifier recorded, only if PID and start time still match."""
+        """SIGKILL each process this notifier recorded or started, only if PID and start time match.
+
+        A process that was never reaped keeps its PID, so a start-time match proves identity.
+        """
         for t in self.tracked():
             if t.start is not None and alive(t.pid, t.start):
                 try:
@@ -159,7 +164,7 @@ def start(
     env: Mapping[str, str] | None = None,
 ) -> subprocess.Popen[bytes]:
     """Start the fake like the router starts a notifier: own session, piped stdio, cwd ``/``."""
-    return subprocess.Popen(
+    proc = subprocess.Popen(
         [*notifier.cmd, *(CANONICAL if args is None else args)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -168,6 +173,8 @@ def start(
         env=dict(env) if env is not None else scrubbed_env(home),
         start_new_session=True,
     )
+    notifier.spawned.append(Tracked(proc.pid, proc_start(proc.pid), "popen"))
+    return proc
 
 
 def feed(proc: subprocess.Popen[bytes], data: bytes) -> None:
@@ -192,8 +199,21 @@ def run(
     try:
         out, err = proc.communicate(data, timeout=timeout)
     except BaseException:
-        os.killpg(proc.pid, signal.SIGKILL)
-        proc.communicate()
+        # Recorded processes first (a setsid grandchild is outside the group and may hold the
+        # pipes), then the group this helper created (the leader is not reaped yet), then close
+        # the pipes ourselves: nothing here may wait for a process that is still alive.
+        notifier.kill_tracked()
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None:
+                pipe.close()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
         raise
     return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
