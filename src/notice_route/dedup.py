@@ -260,11 +260,13 @@ def is_redelivered(
 
 
 # A conflict with a live record changes nothing (its lifetime is never extended) and returns no
-# row; an expired or untrusted one is replaced.
+# row; an expired or untrusted one is replaced and takes a fresh row id, so the cap (which evicts
+# the lowest id) never evicts a replaced record before older ones.
 _RECORD = (
     "INSERT INTO event_ids (destination, source, hook, event_id, repeat_digest, seen_at,"
     " delivery_id) VALUES (?, ?, ?, ?, ?, ?, ?)"
     " ON CONFLICT (destination, source, hook, event_id, repeat_digest) DO UPDATE SET"
+    " id = (SELECT MAX(id) + 1 FROM event_ids),"
     " seen_at = excluded.seen_at, delivery_id = excluded.delivery_id"
     " WHERE NOT (event_ids.seen_at >= excluded.seen_at - ?"
     " AND event_ids.seen_at <= excluded.seen_at)"

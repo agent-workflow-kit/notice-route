@@ -40,6 +40,7 @@ __all__ = [
     "open_readonly",
     "open_store",
     "trim_deliveries",
+    "TRIM_EVENT_IDS_SQL",
     "trim_event_ids",
 ]
 
@@ -242,7 +243,7 @@ def _open(
     readonly: bool,
     migrations: tuple[Migration, ...],
 ) -> Store | None:
-    if sqlite3.sqlite_version_info < MIN_SQLITE:
+    if not readonly and sqlite3.sqlite_version_info < MIN_SQLITE:  # RETURNING is a write need
         raise StoreError("sqlite_old")
     if not (
         isinstance(busy_timeout, (int, float))
@@ -512,6 +513,14 @@ def trim_deliveries(
     return len(ids)
 
 
+# Oldest first by row id (indexed: no sort). dedup.record_event_id gives a replaced record a
+# fresh id, so the id order is the order of the last write.
+TRIM_EVENT_IDS_SQL = (
+    "DELETE FROM event_ids WHERE id IN"
+    " (SELECT id FROM event_ids WHERE id IS NOT ? ORDER BY id LIMIT ?)"
+)
+
+
 def trim_event_ids(
     conn: sqlite3.Connection,
     *,
@@ -524,9 +533,5 @@ def trim_event_ids(
     want = _excess(conn, "event_ids", cap, batch)
     if want == 0:
         return 0
-    cur = conn.execute(
-        "DELETE FROM event_ids WHERE id IN"
-        " (SELECT id FROM event_ids WHERE id IS NOT ? ORDER BY seen_at, id LIMIT ?)",
-        (keep_id, want),
-    )
+    cur = conn.execute(TRIM_EVENT_IDS_SQL, (keep_id, want))
     return cur.rowcount

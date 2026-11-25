@@ -18,7 +18,13 @@ from notice_route import dedup, payload
 from notice_route import queue as q
 from notice_route.dryrun import dedupe_digest
 from notice_route.gateway import FakeClock, Gateway
-from notice_route.store import Store, StoreError, open_readonly, open_store
+from notice_route.store import (
+    TRIM_EVENT_IDS_SQL,
+    Store,
+    StoreError,
+    open_readonly,
+    open_store,
+)
 
 NOW = 1_700_000_000
 W = 60  # window length used by most tests
@@ -631,11 +637,20 @@ def test_record_event_id_requires_a_delivery_id(store: Store, bad: object) -> No
 def test_sqlite_older_than_3_35_is_refused_with_a_fixed_sentence(
     gw: Gateway, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    open_store(gw).close()  # a database made by a current library
     monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 34, 1))
     with pytest.raises(StoreError, match="SQLite 3.35 or newer is required"):
         open_store(gw)
-    with pytest.raises(StoreError, match="SQLite 3.35 or newer is required"):
-        open_readonly(gw)
+
+
+def test_read_only_open_works_on_an_old_sqlite_that_never_uses_returning(
+    gw: Gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    open_store(gw).close()
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 34, 1))
+    ro = open_readonly(gw)
+    assert ro is not None
+    ro.close()
 
 
 @pytest.mark.parametrize("bad", [1.0, 60.0, 0.5])
@@ -1024,3 +1039,8 @@ def test_eight_concurrent_event_id_writers_record_once_and_none_raises(
     assert results.count(True) == 1 and results.count(False) == 7
     with open_store(gw) as store:
         assert count(store, "event_ids") == 1
+
+
+def test_trim_event_ids_plan_uses_no_temp_b_tree(store: Store) -> None:
+    plan = store.conn.execute("EXPLAIN QUERY PLAN " + TRIM_EVENT_IDS_SQL, (None, 1)).fetchall()
+    assert "TEMP B-TREE" not in " ".join(str(r[-1]) for r in plan).upper()
