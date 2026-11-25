@@ -17,6 +17,7 @@ from referencing import Registry, Resource
 
 from notice_route.cli import main
 from notice_route.gateway import SYSTEM_TZ_DIRS, FakeClock, Gateway
+from notice_route.store import open_store
 
 ROOT = Path(__file__).resolve().parent.parent
 SCHEMAS = ROOT / "schemas"
@@ -528,23 +529,24 @@ def _make_state(
     directory.mkdir(parents=True, exist_ok=True)
     directory.chmod(0o700)
     directory.joinpath("state.db").unlink(missing_ok=True)
+    store = open_store(Gateway(passwd_home=lambda: str(home)))
+    assert store is not None
+    store.close()
     conn = sqlite3.connect(directory / "state.db")
-    conn.executescript(
-        """
-        CREATE TABLE meta (key TEXT PRIMARY KEY, value REAL);
-        CREATE TABLE deliveries (id INTEGER PRIMARY KEY AUTOINCREMENT, destination TEXT);
-        CREATE TABLE queue (id INTEGER PRIMARY KEY AUTOINCREMENT, delivery_id INTEGER);
-        CREATE TABLE surfaced (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, destination TEXT, code TEXT, period TEXT
-        );
-        """
-    )
-    conn.execute("INSERT INTO meta VALUES ('flush_last', ?)", (flush_last,))
-    conn.execute("INSERT INTO meta VALUES ('flush_env_missing', ?)", (env_missing,))
+    conn.execute("UPDATE meta SET value = ? WHERE key = 'flush_last'", (flush_last,))
+    conn.execute("UPDATE meta SET value = ? WHERE key = 'flush_env_missing'", (env_missing,))
     conn.executemany("INSERT INTO surfaced (destination, code, period) VALUES (?, ?, ?)", surfaced)
     for destination in queued:
-        cur = conn.execute("INSERT INTO deliveries (destination) VALUES (?)", (destination,))
-        conn.execute("INSERT INTO queue (delivery_id) VALUES (?)", (cur.lastrowid,))
+        cur = conn.execute(
+            "INSERT INTO deliveries (ts, source, level, outcome, destination)"
+            " VALUES (1, 's', 'info', 'sent', ?)",
+            (destination,),
+        )
+        conn.execute(
+            "INSERT INTO queue (delivery_id, kind, message, level, source, deliver_after,"
+            " created_at) VALUES (?, 'single', 'm', 'info', 's', 1, 1)",
+            (cur.lastrowid,),
+        )
     conn.commit()
     conn.close()
     directory.joinpath("state.db").chmod(0o600)

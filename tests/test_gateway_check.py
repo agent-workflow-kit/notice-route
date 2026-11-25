@@ -12,6 +12,7 @@ import pytest
 
 from notice_route import gateway as gateway_module
 from notice_route.gateway import FakeClock, Gateway, StateError
+from notice_route.store import open_store
 
 # 2023-11-14 22:13:20 UTC
 NOW = 1_700_000_000.0
@@ -189,21 +190,28 @@ def _state_dir(home: Path) -> Path:
 
 
 def _db(home: Path) -> sqlite3.Connection:
-    path = _state_dir(home) / "state.db"
-    conn = sqlite3.connect(path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.executescript(
-        """
-        CREATE TABLE meta (key TEXT PRIMARY KEY, value);
-        CREATE TABLE deliveries (id INTEGER PRIMARY KEY AUTOINCREMENT, destination TEXT);
-        CREATE TABLE queue (id INTEGER PRIMARY KEY AUTOINCREMENT, delivery_id INTEGER);
-        CREATE TABLE surfaced (
-            destination TEXT, code TEXT, period TEXT, delivery_id INTEGER,
-            processed INTEGER DEFAULT 0
-        );
-        """
+    """The real schema (``schema.py``), created by the store, as a plain connection."""
+    gateway = Gateway(passwd_home=lambda: str(home))
+    store = open_store(gateway)
+    assert store is not None
+    store.close()
+    return sqlite3.connect(_state_dir(home) / "state.db")
+
+
+def _delivery(conn: sqlite3.Connection, destination: str) -> None:
+    conn.execute(
+        "INSERT INTO deliveries (ts, source, level, outcome, destination)"
+        " VALUES (1, 's', 'info', 'sent', ?)",
+        (destination,),
     )
-    return conn
+
+
+def _queued(conn: sqlite3.Connection, delivery_id: int) -> None:
+    conn.execute(
+        "INSERT INTO queue (delivery_id, kind, message, level, source, deliver_after, created_at)"
+        " VALUES (?, 'single', 'm', 'info', 's', 1, 1)",
+        (delivery_id,),
+    )
 
 
 def _state_gateway(home: Path) -> Gateway:
@@ -229,8 +237,8 @@ def test_state_directory_without_a_database_is_empty(home: Path) -> None:
 
 def test_reads_meta_surfaced_today_and_queue_counts(home: Path) -> None:
     conn = _db(home)
-    conn.execute("INSERT INTO meta VALUES ('flush_last', ?)", (NOW - 120,))
-    conn.execute("INSERT INTO meta VALUES ('flush_env_missing', ?)", (NOW - 120,))
+    conn.execute("INSERT OR REPLACE INTO meta VALUES ('flush_last', ?)", (NOW - 120,))
+    conn.execute("INSERT OR REPLACE INTO meta VALUES ('flush_env_missing', ?)", (NOW - 120,))
     conn.executemany(
         "INSERT INTO surfaced (destination, code, period) VALUES (?, ?, ?)",
         [
@@ -241,10 +249,10 @@ def test_reads_meta_surfaced_today_and_queue_counts(home: Path) -> None:
             ("phone", "BAD CODE", "2023-11-14"),  # not a notifier code shape
         ],
     )
-    conn.executemany(
-        "INSERT INTO deliveries (destination) VALUES (?)", [("gone",), ("gone",), ("phone",)]
-    )
-    conn.executemany("INSERT INTO queue (delivery_id) VALUES (?)", [(1,), (2,), (3,)])
+    for destination in ("gone", "gone", "phone"):
+        _delivery(conn, destination)
+    for delivery_id in (1, 2, 3):
+        _queued(conn, delivery_id)
     conn.commit()
     conn.close()
     view = _state_gateway(home).read_state()
@@ -257,7 +265,7 @@ def test_reads_meta_surfaced_today_and_queue_counts(home: Path) -> None:
 
 def test_null_meta_values_are_none(home: Path) -> None:
     conn = _db(home)
-    conn.execute("INSERT INTO meta VALUES ('flush_last', NULL)")
+    conn.execute("INSERT OR REPLACE INTO meta VALUES ('flush_last', NULL)")
     conn.commit()
     conn.close()
     view = _state_gateway(home).read_state()
@@ -288,7 +296,7 @@ def test_reading_a_wal_database_creates_no_files(home: Path) -> None:
 def test_a_live_wal_is_read_including_uncheckpointed_rows(home: Path) -> None:
     conn = _db(home)
     conn.execute("PRAGMA wal_autocheckpoint=0")
-    conn.execute("INSERT INTO meta VALUES ('flush_last', ?)", (NOW - 5,))
+    conn.execute("INSERT OR REPLACE INTO meta VALUES ('flush_last', ?)", (NOW - 5,))
     conn.commit()
     try:
         assert (home / ".local/state/notice-route/state.db-wal").exists()
@@ -307,7 +315,7 @@ def test_a_database_path_with_uri_characters_is_read(tmp_path: Path) -> None:
 @pytest.mark.parametrize(("stored", "expected"), [("1699999900", NOW - 100), ("1e3", 1000.0)])
 def test_numeric_text_meta_values_are_numbers(home: Path, stored: str, expected: float) -> None:
     conn = _db(home)
-    conn.execute("INSERT INTO meta VALUES ('flush_last', ?)", (stored,))
+    conn.execute("INSERT OR REPLACE INTO meta VALUES ('flush_last', ?)", (stored,))
     conn.commit()
     conn.close()
     assert _state_gateway(home).read_state().flush_last == expected
@@ -316,13 +324,13 @@ def test_numeric_text_meta_values_are_numbers(home: Path, stored: str, expected:
 @pytest.mark.parametrize("stored", ["abc", "nan", "inf", "-inf", ""])
 def test_non_numeric_text_meta_values_are_none(home: Path, stored: str) -> None:
     conn = _db(home)
-    conn.execute("INSERT INTO meta VALUES ('flush_last', ?)", (stored,))
+    conn.execute("INSERT OR REPLACE INTO meta VALUES ('flush_last', ?)", (stored,))
     conn.commit()
     conn.close()
     assert _state_gateway(home).read_state().flush_last is None
 
 
-def test_surfaced_needs_no_id_column_and_keeps_insertion_order(home: Path) -> None:
+def test_surfaced_keeps_insertion_order(home: Path) -> None:
     conn = _db(home)
     conn.executemany(
         "INSERT INTO surfaced (destination, code, period) VALUES ('d', ?, '2023-11-14')",
@@ -384,3 +392,34 @@ def test_a_wide_state_directory_is_a_state_error(home: Path) -> None:
             _state_gateway(home).read_state()
     finally:
         _state_dir(home).chmod(0o700)
+
+
+def test_a_newer_schema_is_a_state_error(home: Path) -> None:
+    conn = _db(home)
+    conn.execute("PRAGMA user_version=99")
+    conn.close()
+    with pytest.raises(StateError):
+        _state_gateway(home).read_state()
+
+
+def test_a_database_of_another_application_is_a_state_error(home: Path) -> None:
+    conn = _db(home)
+    conn.execute("PRAGMA application_id=12345")
+    conn.close()
+    with pytest.raises(StateError):
+        _state_gateway(home).read_state()
+
+
+def test_a_hard_linked_database_is_a_state_error(home: Path, tmp_path: Path) -> None:
+    _db(home).close()
+    os.link(_state_dir(home) / "state.db", tmp_path / "other-name")
+    with pytest.raises(StateError):
+        _state_gateway(home).read_state()
+
+
+def test_a_symlinked_side_file_is_a_state_error(home: Path, tmp_path: Path) -> None:
+    _db(home).close()
+    (_state_dir(home) / "state.db-wal").symlink_to(tmp_path / "victim")
+    with pytest.raises(StateError):
+        _state_gateway(home).read_state()
+    assert not (tmp_path / "victim").exists()

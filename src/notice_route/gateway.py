@@ -35,6 +35,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Protocol
 
+from .schema import APPLICATION_ID, SCHEMA_VERSION
+
 __all__ = [
     "Clock",
     "DirHandle",
@@ -49,6 +51,7 @@ __all__ = [
     "RunResult",
     "SYSTEM_TZ_DIRS",
     "StateError",
+    "StateFiles",
     "StateView",
     "SystemClock",
     "STDERR_LIMIT",
@@ -223,6 +226,14 @@ class UnsafePathError(Exception):
 
 class StateError(Exception):
     """``state.db`` cannot be read (unsafe path, corrupt, not the expected schema): exit 1."""
+
+
+@dataclass(frozen=True)
+class StateFiles:
+    """A checked ``state.db``: where SQLite may open it and whether a ``-wal`` file exists."""
+
+    path: str
+    wal_present: bool
 
 
 @dataclass(frozen=True)
@@ -795,47 +806,90 @@ class Gateway:
         except (OSError, ValueError):
             return False
 
+    def prepare_state_db(self, *, create: bool) -> StateFiles | None:
+        """Check the state directory and ``state.db`` and its side files, then return where
+        SQLite may open the database; ``None`` when ``create`` is false and there is no database.
+
+        SQLite opens a file by path and cannot use ``O_NOFOLLOW``, so every refusal happens
+        here first, on descriptors: the directory is the last component checked as for the other
+        state files (owned by the user, no group or world access; created 0700 under umask 077
+        when ``create``), ``state.db`` is opened relative to it with ``O_NOFOLLOW`` and must be a
+        regular file owned by the user, with one link, mode without group or world access
+        (created 0600 when ``create``), and ``-wal``, ``-shm`` and ``-journal``, when present,
+        must meet the same rules. Raises :class:`HomeError`, :class:`UnsafePathError` and
+        ``OSError`` (``PermissionError`` for a file the user cannot write when ``create``).
+
+        Accepted race: a swap of ``state.db`` between this check and SQLite's open needs write
+        access to the 0700 directory, which only the user has.
+        """
+        directory = str(self.home_dir()).rstrip("/") + "/.local/state/notice-route"
+        if create:
+            handle = self.open_private_dir(directory)
+        else:
+            opened = self.open_config_dir(directory)
+            if opened is None:
+                return None
+            handle = opened
+        with handle:
+            if os.fstat(handle.fd).st_mode & 0o077:  # open_config_dir refuses writes only
+                raise UnsafePathError("mode", handle.path)
+            sides = {}
+            for suffix in ("-wal", "-shm", "-journal"):
+                sides[suffix] = self._check_side_file(handle, "state.db" + suffix)
+            try:
+                file = self.open_file(
+                    handle, "state.db", mode="rw" if create else "r", create=create
+                )
+            except FileNotFoundError:
+                return None
+            with file:
+                info = os.fstat(file.fileno())
+            shown = handle.path.rstrip("/") + "/state.db"
+            if info.st_uid != os.geteuid():
+                raise UnsafePathError("owner", shown)
+            if info.st_mode & 0o077:
+                raise UnsafePathError("mode", shown)
+            if info.st_nlink != 1:
+                raise UnsafePathError("not_regular", shown)
+            return StateFiles(shown, wal_present=sides["-wal"])
+
+    @staticmethod
+    def _check_side_file(handle: DirHandle, name: str) -> bool:
+        """Whether the SQLite side file ``name`` exists; refuse one that is not a plain private
+        file of the user (checked with ``lstat``, never followed)."""
+        try:
+            info = os.stat(name, dir_fd=handle.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        shown = handle.path.rstrip("/") + "/" + name
+        if stat.S_ISLNK(info.st_mode):
+            raise UnsafePathError("symlink", shown)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise UnsafePathError("not_regular", shown)
+        if info.st_uid != os.geteuid():
+            raise UnsafePathError("owner", shown)
+        if info.st_mode & 0o077:
+            raise UnsafePathError("mode", shown)
+        return True
+
     def read_state(self) -> StateView:
         """Read ``<home>/.local/state/notice-route/state.db`` read-only; an empty view when the
         directory or the file is missing. Raises :class:`HomeError` and :class:`StateError`.
 
-        TODO(#14): align the queries with ``store.py``'s schema once it exists.
+        The queries are those of the schema in ``schema.py`` (#14); a database whose
+        ``user_version`` is newer than this build, or that is not ours, is a ``StateError``.
         """
-        directory = str(self.home_dir()).rstrip("/") + "/.local/state/notice-route"
         try:
-            handle = self.open_config_dir(directory)
+            files = self.prepare_state_db(create=False)
+        except HomeError:
+            raise
         except (UnsafePathError, OSError, ValueError):
-            raise StateError("unsafe state directory") from None
-        if handle is None:
+            raise StateError("unsafe state.db") from None
+        if files is None:
             return StateView()
-        with handle:
-            try:
-                # the spec: no group or world access (open_config_dir only refuses writes)
-                if os.fstat(handle.fd).st_mode & 0o077:
-                    raise StateError("unsafe state directory")
-            except OSError:
-                raise StateError("unsafe state directory") from None
-            try:
-                self.open_file(handle, "state.db").close()
-            except FileNotFoundError:
-                return StateView()
-            except (UnsafePathError, OSError):
-                raise StateError("unsafe state.db") from None
-            db_path = handle.path.rstrip("/") + "/state.db"
-            # a read-only open of a WAL database without a -wal file would create -wal and -shm;
-            # such a database holds no uncheckpointed data, so it is opened immutable instead
-            wal_exists = self._exists_in(handle, "state.db-wal")
-            return self._query_state(db_path, immutable=not wal_exists)
-
-    @staticmethod
-    def _exists_in(handle: DirHandle, name: str) -> bool:
-        try:
-            os.stat(name, dir_fd=handle.fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return False
-        except OSError:
-            return True  # unknown: take the plain read-only path
-        return True
+        # a read-only open of a WAL database without a -wal file would create -wal and -shm;
+        # such a database holds no uncheckpointed data, so it is opened immutable instead
+        return self._query_state(files.path, immutable=not files.wal_present)
 
     def _query_state(self, db_path: str, *, immutable: bool = False) -> StateView:
         day = time.strftime("%Y-%m-%d", time.gmtime(self.wall()))
@@ -847,6 +901,16 @@ class Gateway:
             options = "?mode=ro&immutable=1" if immutable else "?mode=ro"
             conn = sqlite3.connect(uri + options, uri=True, timeout=5.0)
             try:
+                app = conn.execute("PRAGMA application_id").fetchone()[0]
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+                if version == 0 and app in (0, APPLICATION_ID):
+                    objects = conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0]
+                    if objects == 0:  # created, never migrated: no database yet
+                        return StateView()
+                if app != APPLICATION_ID:
+                    raise StateError("state.db is not ours")
+                if version > SCHEMA_VERSION:
+                    raise StateError("state.db is newer")
                 meta = {
                     str(k): v
                     for k, v in conn.execute(
@@ -855,8 +919,9 @@ class Gateway:
                     )
                 }
                 for dest, code in conn.execute(
-                    "SELECT destination, code FROM surfaced WHERE period LIKE ? ORDER BY rowid",
-                    (day + "%",),
+                    "SELECT destination, code FROM surfaced "
+                    "WHERE substr(period, 1, 10) = ? ORDER BY id",
+                    (day,),
                 ):
                     if (
                         isinstance(dest, str)
