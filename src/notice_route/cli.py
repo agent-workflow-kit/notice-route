@@ -15,6 +15,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROG,
         description=DESCRIPTION,
+        allow_abbrev=False,
     )
     parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")
     parser.add_argument("--json", action="store_true", help="machine-readable JSON output")
