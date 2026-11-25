@@ -554,16 +554,6 @@ def test_send_refuses_config_with_its_own_fixed_message(
     assert "/x/y.yaml" not in out + err
 
 
-def test_send_without_dry_run_is_internal_until_it_exists(
-    inv: Invoker, configured: dict[str, Any]
-) -> None:
-    code, out, err = inv.run("send", "--message", "m", "--json")
-    doc = json.loads(out)
-    assert code == 1 and doc["error"]["code"] == "internal"
-    assert schema_errors(doc, "error.json") == []
-    assert err.startswith("notice-route: internal: ")
-
-
 # --- usage errors of the command line ------------------------------------------------------------
 
 USAGE_LINE = "notice-route: usage: the command line cannot be used\n"

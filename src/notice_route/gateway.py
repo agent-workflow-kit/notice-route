@@ -696,10 +696,10 @@ class Gateway:
             pass
 
     @contextmanager
-    def trapped_signals(self, signums: Sequence[int]) -> Iterator[SignalTrap]:
-        """Trap ``signums`` for the body of the ``with`` block (main thread only; from another
-        thread nothing is trapped and ``received`` stays ``None``). The old handlers come back
-        on exit. See :class:`SignalTrap`."""
+    def trapped_signals(self) -> Iterator[SignalTrap]:
+        """Trap SIGTERM, SIGINT and SIGHUP for the body of the ``with`` block (main thread
+        only; from another thread nothing is trapped and ``received`` stays ``None``). The old
+        handlers come back on exit. See :class:`SignalTrap`."""
         trap = SignalTrap()
         previous: dict[int, object] = {}
 
@@ -711,7 +711,7 @@ class Gateway:
                 raise Interrupted(signum)
 
         try:
-            for signum in signums:
+            for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                 previous[signum] = signal.signal(signum, handler)
         except ValueError:  # not the main thread
             pass

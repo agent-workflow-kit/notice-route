@@ -184,6 +184,8 @@ USAGE_MESSAGES = {
     "argv": "the command line cannot be used",
     "config": "--config is not accepted by this command",
     "verbose_quiet": "--verbose and --quiet cannot be combined",
+    "actor": "--actor must be human:<name> or auto:<name>",
+    "decision_id": "--decision-id takes one value of letters, digits and ._:-",
 }
 # The pointers a refusal may carry: fixed strings, never built from the input.
 POINTERS = frozenset(
@@ -224,7 +226,15 @@ class PayloadError(Exception):
 
 
 UsageReason = Literal[
-    "flags", "labels", "terminal", "input_file", "argv", "config", "verbose_quiet"
+    "flags",
+    "labels",
+    "terminal",
+    "input_file",
+    "argv",
+    "config",
+    "verbose_quiet",
+    "actor",
+    "decision_id",
 ]
 
 

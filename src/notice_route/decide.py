@@ -136,7 +136,8 @@ class DestinationDecision:
     ``deliveries`` one. ``deliver_after`` is set for ``defer`` only. The ids and the claim are
     set only for a recorded decision: ``delivery_id`` for everything but ``suppress``,
     ``queue_id`` for a queued row, and for ``send`` the ``claim_token`` and ``claim_expires`` of
-    its row."""
+    its row. ``count`` is the repeat count of the row that opened the window, for a ``suppress``
+    with reason ``repeat`` (this repeat included), else ``None``."""
 
     name: str
     decision: Decision
@@ -147,6 +148,7 @@ class DestinationDecision:
     queue_id: int | None = None
     claim_token: str | None = None
     claim_expires: int | None = None
+    count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -429,7 +431,17 @@ def decide_and_record(
                 retention=retention,
             )
             if plan.decision == "suppress":
-                out.append(DestinationDecision(name, "suppress", "suppressed", plan.reason))
+                repeats = None
+                if plan.reason == "repeat":
+                    found = conn.execute(
+                        "SELECT d.count FROM dedup x JOIN deliveries d ON d.id = x.delivery_id"
+                        " WHERE x.destination = ? AND x.key_digest = ?",
+                        (name, notice.dedupe),
+                    ).fetchone()
+                    repeats = None if found is None else int(found[0])
+                out.append(
+                    DestinationDecision(name, "suppress", "suppressed", plan.reason, count=repeats)
+                )
                 continue
             out.append(_record(conn, gateway, plan, dest, notice, lease, retention))
         return out
