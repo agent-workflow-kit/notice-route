@@ -28,7 +28,7 @@ from .dryrun import dry_run_document
 from .gateway import Gateway, HomeError, StateError
 from .payload import InputFlags, PayloadError, UsageError, load_notification
 from .report import rules_document, validate_document
-from .store import Store, StoreError, open_readonly
+from .store import StoreError, open_readonly
 from .validate import load_valid_config
 
 PROG = "notice-route"
@@ -276,8 +276,8 @@ def _dry_run_text(doc: dict[str, Any]) -> None:
 
 def _run_dry_run(args: argparse.Namespace, gateway: Gateway) -> int:
     """``test`` and ``send --dry-run``: send steps 1 to 6 for the config alone. Nothing is
-    written, locked, spawned or sent; ``state.db`` is opened read-only, and only when a destination
-    reaches a state-dependent decision (nothing is created, migrated or locked)."""
+    written, locked, spawned or sent; ``state.db`` is opened read-only once the router is enabled
+    and configured (nothing is created, migrated or locked); one that cannot be used is exit 1."""
     started = gateway.monotonic()
     flags = InputFlags(
         stdin_json=args.stdin_json,
@@ -290,21 +290,13 @@ def _run_dry_run(args: argparse.Namespace, gateway: Gateway) -> int:
     is_test = args.command == "test"
     notification = load_notification(gateway, flags, started, default_stdin=is_test)
     config = load_valid_config(gateway, args.config if is_test else None)
-    opened: list[Store | None] = []
-
-    def open_state() -> Store | None:
-        store = open_readonly(gateway)
-        opened.append(store)
-        return store
-
-    try:
-        doc, code = dry_run_document(
-            config, notification, open_state, instant(gateway.wall()), dict(gateway.environ())
-        )
-    finally:
-        for store in opened:
-            if store is not None:
-                store.close()
+    doc, code = dry_run_document(
+        config,
+        notification,
+        lambda: open_readonly(gateway),
+        instant(gateway.wall()),
+        dict(gateway.environ()),
+    )
     if args.json:
         _json(doc)
     else:

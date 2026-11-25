@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import signal
-import sqlite3
 import subprocess
 import sys
 import time
@@ -440,6 +439,26 @@ def test_the_first_rate_capped_deferral_per_hour_is_surfaced(store: Store, gw: G
     assert rows == [("2023-11-14T12", first.delivery_id), ("2023-11-14T13", third.delivery_id)]
 
 
+def test_a_rate_capped_row_evicted_at_once_is_not_surfaced(store: Store, gw: Gateway) -> None:
+    at(gw, NIGHT)
+    d = dest(quiet="night", max_per_hour=1)
+    for i in range(100):  # a full queue of action rows, held through the night
+        assert one(store, gw, d, notice("action", f"m{i}")).decision == "defer"
+    at(gw, NOON)
+    assert one(store, gw, d, notice("warn", "a")).decision == "send"
+    evicted = one(store, gw, d, notice("warn", "b"))  # capped, and the lowest row: dropped
+    assert (evicted.decision, evicted.reason) == ("drop", "overflow")
+    assert count(store, "surfaced") == 0
+    assert q(store, "SELECT surfaced FROM deliveries WHERE id = ?", (evicted.delivery_id,)) == [
+        (0,)
+    ]
+    assert one(store, gw, d, notice("error", "c")).decision == "send"
+    kept = one(store, gw, d, notice("error", "e"))  # capped, and kept: the hour's first surfaced
+    assert (kept.decision, kept.reason) == ("defer", "rate_capped")
+    assert q(store, "SELECT delivery_id FROM surfaced") == [(kept.delivery_id,)]
+    assert q(store, "SELECT surfaced FROM deliveries WHERE id = ?", (kept.delivery_id,)) == [(1,)]
+
+
 def test_surfacing_is_per_destination(store: Store, gw: Gateway) -> None:
     cfg = make_config(dest("a", max_per_hour=1), dest("b", max_per_hour=1))
     for text in ("x", "y"):
@@ -509,22 +528,28 @@ def test_claim_call_rejects_bad_arguments(store: Store, kwargs: dict[str, object
     assert count(store, "rate") == 0
 
 
-def test_old_and_far_future_counters_are_pruned_when_a_counter_is_created(
-    store: Store, gw: Gateway
-) -> None:
+def test_deciding_never_deletes_a_counter_row(store: Store, gw: Gateway) -> None:
+    """Counter deletion belongs to ``prune`` (#26): a row far in the past or ahead survives."""
     hour = NOON - NOON % HOUR
+    hours = [hour - 25 * HOUR, hour - HOUR, hour + 24 * HOUR, hour + 25 * HOUR]
     with store.write() as conn:
-        for h in (
-            hour - 25 * HOUR,
-            hour - 24 * HOUR,
-            hour - HOUR,
-            hour + 24 * HOUR,
-            hour + 25 * HOUR,
-        ):
+        for h in hours:
             conn.execute("INSERT INTO rate VALUES ('d', ?, 'other', 1)", (h,))
     one(store, gw, dest(), notice("warn"))
-    hours = [r[0] for r in q(store, "SELECT hour FROM rate ORDER BY hour")]
-    assert hours == [hour - 24 * HOUR, hour - HOUR, hour, hour + 24 * HOUR]
+    with store.write() as conn:
+        decide.count_call(conn, destination="d", level="warn", now=NOON)
+    assert [r[0] for r in q(store, "SELECT hour FROM rate ORDER BY hour")] == sorted([*hours, hour])
+
+
+def test_a_counter_ahead_by_a_day_does_not_reset_the_current_hours_cap(
+    store: Store, gw: Gateway
+) -> None:
+    d = dest(max_per_hour=1)
+    assert one(store, gw, d, notice("warn", "a")).decision == "send"
+    at(gw, NOON + 25 * HOUR)  # a clock that stepped forward: that hour has its own counter
+    assert one(store, gw, d, notice("warn", "b")).decision == "send"
+    at(gw, NOON)  # and back: the first hour's counter is still there, at its cap
+    assert one(store, gw, d, notice("warn", "c")).decision == "defer"
 
 
 # --- the clock ------------------------------------------------------------------------------
@@ -1027,15 +1052,15 @@ def test_a_sender_killed_inside_its_transaction_leaves_no_count(
         assert one(store, gw, dest(max_per_hour=1), notice("warn")).decision == "send"
 
 
-def test_a_database_that_cannot_be_opened_stops_before_any_decision(
-    home: Path, gw: Gateway
-) -> None:
+def test_a_database_that_cannot_be_opened_is_left_unchanged(home: Path, gw: Gateway) -> None:
     state = home / ".local" / "state" / "notice-route"
     state.mkdir(parents=True)
     state.chmod(0o700)
     db = state / "state.db"
     db.write_bytes(b"garbage" * 200)
     db.chmod(0o600)
+    before = db.read_bytes()
     with pytest.raises(StoreError):
         open_store(gw)
-    assert sqlite3.connect(f"file:{db}?mode=ro", uri=True) is not None
+    assert db.read_bytes() == before
+    assert sorted(p.name for p in state.iterdir() if p.name.startswith("state.db")) == ["state.db"]

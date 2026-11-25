@@ -13,7 +13,9 @@ by this process, the counter incremented).
 Write order per destination that reaches (6) to (9) (docs/design.md C-47): ``check_repeat`` (step
 5, so a suppressed repeat writes only its ``count``), ``insert_delivery``, ``bind_window`` (must be
 ``True``; the row was inserted a moment ago and nothing ended it), ``record_event_id``, ``enqueue``
-(which may evict, even the new row: that destination then ends ``dropped``, ``overflow``). A
+(which may evict, even the new row: that destination then ends ``dropped``, ``overflow``), and
+last the ``rate_capped`` surfacing (the hour's ``surfaced`` row and ``surfaced = 1``), only when
+the new row was not evicted, so an evicted capped row does not use the hour's one surfacing. A
 destination dropped or disabled gets a ``deliveries`` row and no dedup record; a suppressed one
 gets no row.
 
@@ -23,8 +25,8 @@ increments in one statement, so concurrent senders cannot pass the cap together 
 write lock; :func:`count_call` increments without a cap (a digest is never held by the cap but
 still counts); :func:`give_back` returns a count when a call was never made (``lock_busy``).
 A destination with ``max_per_hour: 0`` has no cap and is still counted (a later cap then sees an
-honest count). Rows older than a day, or more than a day ahead (a clock that stepped), are
-deleted whenever a counter row is created, so the table stays small.
+honest count). Nothing here deletes a counter row: ``prune`` (#26) deletes rows of past hours
+older than 2 days, so a clock that steps forward and back never resets a cap.
 
 Choices where the interface is silent (the narrower reading):
 
@@ -45,9 +47,9 @@ TODO(#19) the notifier call for each ``send`` result; TODO(#20) its recorded out
 ``attempts`` count and ``give_back`` for a call never made; TODO(#21) ``lock_busy``;
 TODO(#22) the pipeline that renders, calls :func:`decide_and_record`, prints and logs;
 TODO(#23) ``flush`` claims a due row with :func:`claim_call` (single rows) or :func:`count_call`
-(a digest); TODO(#26) ``prune`` may drop old ``rate`` rows too; TODO(#27) surfacing ``env_missing``
-and routing the alert (alerts skip the redelivery check, which :func:`dedup.is_redelivered`
-already does for source ``notice-route``).
+(a digest); TODO(#26) ``prune`` deletes ``rate`` rows of past hours older than 2 days;
+TODO(#27) surfacing ``env_missing`` and routing the alert (alerts skip the redelivery check,
+which :func:`dedup.is_redelivered` already does for source ``notice-route``).
 """
 
 from __future__ import annotations
@@ -64,7 +66,7 @@ from typing import Literal
 from . import dedup
 from .gateway import Gateway
 from .queue import Lease, enqueue, insert_delivery, quiet_deliver_after
-from .report import worst_case_s
+from .report import env_unset, worst_case_s
 from .store import Store
 from .validate import LEVELS, Config, Destination
 from .window import in_window
@@ -210,11 +212,6 @@ _COUNT = (
     " ON CONFLICT (destination, hour, class) DO UPDATE SET"
     " count = CASE WHEN rate.count < ? THEN rate.count + 1 ELSE rate.count END"
 )
-_PRUNE = "DELETE FROM rate WHERE hour < ? OR hour > ?"
-
-
-def _prune(conn: _Conn, hour: int) -> None:
-    conn.execute(_PRUNE, (hour - 24 * HOUR, hour + 24 * HOUR))
 
 
 def rate_count(conn: _Conn, destination: str, level: str, now: int) -> int:
@@ -235,18 +232,13 @@ def claim_call(conn: _Conn, *, destination: str, level: str, now: int, cap: int)
         _CLAIM,
         (_name(destination), hour, rate_class(level), _cap(cap), cap, _INT64_MAX),
     ).fetchone()
-    if row is None:
-        return False
-    if row[0] == 1:  # a counter was created (or came back from 0): keep the table small
-        _prune(conn, hour)
-    return True
+    return row is not None
 
 
 def count_call(conn: _Conn, *, destination: str, level: str, now: int) -> None:
     """Count one call without a cap check: a digest is never held by the cap but still counts."""
     hour = hour_start(_now(now))
     conn.execute(_COUNT, (_name(destination), hour, rate_class(level), _INT64_MAX))
-    _prune(conn, hour)
 
 
 def give_back(conn: _Conn, *, destination: str, level: str, hour: int) -> bool:
@@ -261,11 +253,6 @@ def give_back(conn: _Conn, *, destination: str, level: str, hour: int) -> bool:
 
 
 # --- the decision order --------------------------------------------------------------------
-
-
-def env_unset(names: Sequence[str], environ: Mapping[str, str]) -> list[str]:
-    """The variables of ``names`` that are missing or empty in ``environ``."""
-    return [n for n in names if environ.get(n, "") == ""]
 
 
 def _surface_period(hour: int) -> str:
@@ -497,8 +484,6 @@ def _record(
         retention=retention,
         delivery_id=delivery_id,
     )
-    if plan.surface and _surface(conn, dest.name, "rate_capped", hour_start(now), delivery_id):
-        conn.execute("UPDATE deliveries SET surfaced = 1 WHERE id = ?", (delivery_id,))
     token = gateway.new_token() if plan.claim else None
     queued = enqueue(
         conn,
@@ -520,6 +505,8 @@ def _record(
         return DestinationDecision(
             dest.name, "drop", "dropped", "overflow", None, delivery_id, queued.row_id
         )
+    if plan.surface and _surface(conn, dest.name, "rate_capped", hour_start(now), delivery_id):
+        conn.execute("UPDATE deliveries SET surfaced = 1 WHERE id = ?", (delivery_id,))
     return DestinationDecision(
         dest.name,
         plan.decision,

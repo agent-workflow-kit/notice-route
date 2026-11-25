@@ -5,8 +5,11 @@ This module reads a validated config and a notification, and touches no file, lo
 clock or process, so a dry run cannot change anything.
 
 The per-destination decision is ``decide.preview``: the same classification ``send`` runs, over
-a read-only database that is opened only when a destination needs state (``open_state``), at the
-instant ``now`` and with the environment ``environ`` the caller passes. It never writes.
+a read-only database that is opened (``open_state``) once the config is enabled and has
+destinations, before any rule is matched, so a database that cannot be opened is exit 1 whatever
+the notification decides (docs/interface.md); a disabled or unconfigured router exits 22 before any
+state read. It uses the instant ``now`` and the environment ``environ`` the caller passes and never
+writes. This module closes the store it opened.
 """
 
 from __future__ import annotations
@@ -102,6 +105,17 @@ def dry_run_document(
         return _base(n, "unconfigured"), EXIT_NOOP
     if not config.enabled:
         return _base(n, "disabled"), EXIT_NOOP
+    store = open_state()  # StoreError (exit 1) for a database that cannot be used
+    try:
+        return _document(config, n, store, now, environ)
+    finally:
+        if store is not None:
+            store.close()
+
+
+def _document(
+    config: Config, n: Notification, store: Store | None, now: int, environ: Mapping[str, str]
+) -> tuple[dict[str, Any], int]:
     decision = decide(config.rules, n)
     if decision.rule is None:
         return _base(n, "no_rule"), EXIT_NOOP
@@ -118,7 +132,7 @@ def dry_run_document(
     notice = make_notice(
         n, decision.rule, decision.level, rendered, built.link, pass_through=decision.pass_through
     )
-    results = preview(open_state, config, notice, decision.rule.notify, now=now, environ=environ)
+    results = preview(lambda: store, config, notice, decision.rule.notify, now=now, environ=environ)
     doc.update(
         title=rendered.title,
         message=rendered.message,

@@ -929,13 +929,10 @@ def test_nothing_is_written_locked_spawned_or_opened(
         m.setattr(os, "open", guarded_os_open(os.open))
         for extra, stdin, expected in cases:
             argv = [*prefix, *extra]
-            body = stdin if stdin is not None else b""
-            if mode == "file" and extra and extra[0].endswith(".json"):
-                body = Path(extra[0]).read_bytes()
-            # a database that cannot be opened is exit 1, but only for a notification that
-            # reaches a state-dependent decision (not a drop rule, no_rule or a refusal)
-            reads_state = expected == 0 and b"post-launch" not in body
-            want = 1 if reads_state and state_kind in ("garbage", "valid") else expected
+            # a database that cannot be opened is exit 1 for every notification that gets past
+            # the input checks (20 and 2) and the enabled/configured checks, a no_rule, a drop
+            # rule and an all-disabled result included
+            want = 1 if expected in (0, 22) and state_kind in ("garbage", "valid") else expected
             for as_json in (False, True):
                 code, _, _ = inv.run(*argv, *(["--json"] if as_json else []), stdin=stdin)
                 assert code == want, argv
@@ -1023,3 +1020,67 @@ def test_help_and_version_on_a_full_standard_output_exit_one(
         )
     assert result.returncode == 1
     assert result.stderr == b"notice-route: internal: cannot write to standard output\n"
+
+
+# --- a database that cannot be used is exit 1 in every case (R3) -------------------------------
+
+CASES_STATE: dict[str, tuple[Any, ...]] = {
+    "no_rule": (hook(tool="other"),),
+    "drop_rule": (hook(hook="post-launch"),),
+    "all_destinations_disabled": (None, "--title", "T", "--message", "m", "--source", "offsrc"),
+    "all_floor_dropped": (None, "--title", "T", "--message", "m", "--source", "direct"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(CASES_STATE))
+@pytest.mark.parametrize("argv", [("test",), ("send", "--dry-run")])
+def test_a_corrupt_state_db_is_exit_1_whatever_the_notification_decides(
+    inv: Invoker, configured: dict[str, Any], home: Path, case: str, argv: tuple[str, ...]
+) -> None:
+    configured["destinations"]["chat"]["floor"] = "warn"
+    write_config(home, configured)
+    stdin, *extra = CASES_STATE[case]
+    if stdin is not None and argv[0] == "send":
+        argv = (*argv, "--stdin-json")
+    argv = (*argv, *extra)
+    ok_code, out, err = inv.run(*argv, stdin=stdin)
+    assert ok_code in (0, 22), err  # no database: the notification own result
+    db = make_state(home, "garbage")
+    code, _, _ = inv.run(*argv, stdin=stdin)
+    assert code == 1
+    code, doc = inv.run_json(*argv, stdin=stdin)
+    assert code == 1 and doc["error"]["code"] == "internal"
+    assert db.read_bytes() == b"not a database"
+
+
+@pytest.mark.parametrize("argv", [("test",), ("send", "--dry-run", "--stdin-json")])
+def test_a_disabled_or_unconfigured_router_is_22_before_any_state_read(
+    inv: Invoker, configured: dict[str, Any], home: Path, argv: tuple[str, ...]
+) -> None:
+    make_state(home, "garbage")
+    configured["enabled"] = False
+    write_config(home, configured)
+    assert inv.run(*argv, stdin=hook())[0] == 22
+    write_config(home, {})
+    assert inv.run(*argv, stdin=hook())[0] == 22
+
+
+@pytest.mark.parametrize("argv", [("test",), ("send", "--dry-run", "--stdin-json")])
+def test_an_older_schema_is_exit_1_internal_for_a_read_only_open(
+    inv: Invoker,
+    configured: dict[str, Any],
+    home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    argv: tuple[str, ...],
+) -> None:
+    from notice_route.schema import MIGRATIONS
+    from notice_route.store import open_readonly, open_store
+
+    open_store(Gateway(passwd_home=lambda: str(home))).close()  # a database at version 1
+    state = home / ".local" / "state" / "notice-route"
+    before = {p.name: p.read_bytes() for p in state.iterdir()}
+    newer = (*MIGRATIONS, ("ALTER TABLE deliveries ADD COLUMN extra INTEGER",))
+    monkeypatch.setattr(cli, "open_readonly", lambda gw: open_readonly(gw, migrations=newer))
+    code, doc = inv.run_json(*argv, stdin=hook())
+    assert code == 1 and doc["error"]["code"] == "internal"
+    assert {p.name: p.read_bytes() for p in state.iterdir()} == before
