@@ -12,6 +12,7 @@ from notice_route import decide, dedup
 from notice_route import queue as q
 from notice_route.gateway import FakeClock, Gateway
 from notice_route.outcome import (
+    LOCK_BUSY,
     Applied,
     Outcome,
     apply_outcome,
@@ -420,6 +421,92 @@ def test_give_back_never_goes_below_zero(store: Store) -> None:
         conn.execute("UPDATE rate SET count = 0")
     apply(store, row, Outcome("deferred", None, "env_missing", counted=False), count_hour=HOUR)
     assert rate(store) == 0
+
+
+# --- lock_busy (#21) ------------------------------------------------------------------------
+
+
+def test_lock_busy_requeues_a_minute_later_without_an_attempt_and_gives_the_count_back(
+    store: Store,
+) -> None:
+    row = make(store, attempts=2)
+    res = apply(store, row, LOCK_BUSY, count_hour=HOUR)
+    assert (res.applied, res.outcome, res.code, res.reason, res.attempts) == (
+        True,
+        "queued_retry",
+        None,
+        "lock_busy",
+        2,
+    )
+    assert res.deliver_after == NOW + 60
+    assert delivery(store, row.delivery_id)[:5] == ("queued_retry", "lock_busy", None, 2, NOW + 60)
+    assert store.read("SELECT claimed_by, deliver_after, kind FROM queue")[0] == (
+        None,
+        NOW + 60,
+        "single",
+    )
+    assert rate(store) == 0
+    assert n(store, "dedup") == 1
+
+
+def test_lock_busy_without_a_count_hour_gives_nothing_back(store: Store) -> None:
+    apply(store, make(store), LOCK_BUSY)
+    assert rate(store) == 1
+
+
+def test_lock_busy_is_not_cut_off_by_the_attempt_cap(store: Store) -> None:
+    row = make(store, attempts=5)  # the schedule of this file has no step after 3 attempts
+    res = apply(store, row, LOCK_BUSY, count_hour=HOUR)
+    assert (res.outcome, res.attempts, res.released) == ("queued_retry", 5, False)
+
+
+@pytest.mark.parametrize("prior", ["link_refused", "keyword_refused"])
+def test_lock_busy_keeps_a_stored_refusal_reason(store: Store, prior: str) -> None:
+    row = make(store, reason=prior, attempts=1)
+    res = apply(store, row, LOCK_BUSY)
+    assert res.reason == "lock_busy"  # the result says what happened; the column keeps the refusal
+    assert delivery(store, row.delivery_id)[:2] == ("queued_retry", prior)
+    again = reclaim(store, row)
+    res = apply(store, again, Outcome("queued_retry", "link_invalid", refusal="link_refused"))
+    assert (res.outcome, res.code) == ("failed", "link_invalid")
+
+
+def test_lock_busy_at_the_cap_eviction_keeps_the_give_back_and_the_attempts(store: Store) -> None:
+    row = make(store, level="info", attempts=2)
+    with store.write() as conn:
+        for _ in range(100):
+            did = q.insert_delivery(
+                conn, ts=NOW, source="s", level="error", outcome="deferred", destination="d"
+            )
+            q.enqueue(
+                conn,
+                delivery_id=did,
+                kind="single",
+                message="m",
+                level="error",
+                source="s",
+                deliver_after=NOW,
+                created_at=NOW,
+                lease=Lease(NOW, 20),
+            )
+    res = apply(store, row, LOCK_BUSY, count_hour=HOUR)
+    assert (res.outcome, res.code) == ("dropped", "overflow")
+    assert res.attempts == 2
+    assert rate(store) == 0
+    assert delivery(store, row.delivery_id)[3] == 2
+
+
+def test_lock_busy_of_a_held_row_makes_it_a_single_row(store: Store) -> None:
+    row = make(store, kind="held")
+    apply(store, row, LOCK_BUSY)
+    assert kind_of(store) == "single"
+
+
+def test_lock_busy_is_fenced_by_the_claim_token(store: Store) -> None:
+    row = make(store)
+    res = apply(store, row, LOCK_BUSY, token="someone-else", count_hour=HOUR)
+    assert res.applied is False
+    assert rate(store) == 1
 
 
 # --- fencing ----------------------------------------------------------------------------------
