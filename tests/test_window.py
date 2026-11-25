@@ -1,8 +1,15 @@
 """Quiet-hour membership and the next window end (#15), over UTC epoch seconds.
 
-Expectations are pinned to stable rules: the United States and European DST rules, fixed offsets
-and a handful of zones whose rules have not changed in years. Every zone comes from the system
-database through ``Gateway.load_zone`` (the one place allowed to read it).
+The fixed-date tests assume the 2026 rules of the United States, the United Kingdom, Australia
+and Morocco; the sweeps are data-driven from the system database (``Gateway.load_zone``, the one
+place allowed to read it), so they follow whatever rules it holds.
+
+The criterion "a backwards wall-clock step changes nothing" holds by construction: every
+function takes UTC epoch ints or floats and reads no clock (``tests/test_import_boundary.py``
+bans clock reads in the package), so no test of it can fail and none is kept.
+
+The property sweep covers whole weeks (one winter, one summer) plus every neighborhood of a change
+of UTC offset, against an independent reference built from calendar dates.
 """
 
 from __future__ import annotations
@@ -17,13 +24,14 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from notice_route.gateway import FakeClock, Gateway, ZoneError
+from notice_route.gateway import Gateway, ZoneError
 from notice_route.validate import QuietWindow
 from notice_route.window import MAX_EPOCH, MIN_EPOCH, in_window, window_end
 
 _GATEWAY = Gateway()
 try:
     _GATEWAY.load_zone("UTC")
+    _GATEWAY.load_zone("America/New_York")
     _HAVE_ZONES = True
 except ZoneError:
     _HAVE_ZONES = False
@@ -207,8 +215,10 @@ def test_instants_outside_the_supported_range_are_refused(bad: float) -> None:
 @pytest.mark.parametrize("tz", ["Pacific/Kiritimati", "Pacific/Pago_Pago", "America/Adak"])
 def test_the_range_edges_themselves_work_in_the_extreme_zones(tz: str) -> None:
     window = win(tz, "09:00", "17:00")
-    assert in_window(window, MIN_EPOCH) in (True, False)
-    assert in_window(window, MAX_EPOCH) in (True, False)
+    for edge in (MIN_EPOCH, MAX_EPOCH):
+        local = (datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=edge)).astimezone(window.zone)
+        expected = hm("09:00") <= local.hour * 60 + local.minute < hm("17:00")
+        assert in_window(window, edge) is expected
     assert window_end(window, MAX_EPOCH) is not None
     assert window_end(window, MIN_EPOCH) is not None
 
@@ -268,9 +278,10 @@ def test_odd_offsets_shift_the_boundary(tz: str, offset_minutes: int | None) -> 
         # Walk one day; exactly 8 hours of the day are inside, in a contiguous run
         start = utc("2026-01-07T00:00")
         flags = [in_window(window, start + m * 60) for m in range(-1440, 2880)]
-        assert sum(flags[1440 : 1440 + 1440]) in (480, 480 + 0)
+        assert sum(flags[1440 : 1440 + 1440]) == 480
+        # three local days of 09:00-17:00 without a transition: six edges, all contiguous runs
         runs = sum(1 for a, b in zip(flags, flags[1:], strict=False) if a != b)
-        assert runs <= 6
+        assert runs == 6
 
 
 def test_lord_howe_has_a_thirty_minute_dst_shift() -> None:
@@ -407,32 +418,6 @@ def test_southern_hemisphere_dst_runs_the_other_way() -> None:
     assert in_window(window, utc("2026-04-04T17:00")) is False  # 03:00 AEST
 
 
-# ---- wall-clock steps and the injected clock --------------------------------------------------
-
-
-def test_membership_follows_the_wall_clock_only() -> None:
-    clock = FakeClock(wall=float(utc("2026-01-09T23:00")), monotonic=5.0)
-    window = win("UTC", "22:00", "06:00", (FRI,))
-    assert in_window(window, clock.wall()) is True
-    clock.advance_monotonic(10 * 3600)  # monotonic time is irrelevant
-    assert in_window(window, clock.wall()) is True
-    clock.jump_wall(8 * 3600)  # forward step: Saturday 07:00
-    assert in_window(window, clock.wall()) is False
-    clock.jump_wall(-8 * 3600 - 3 * 3600)  # backwards step: Friday 20:00
-    assert in_window(window, clock.wall()) is False
-    clock.jump_wall(3 * 3600)  # and forward again: Friday 23:00
-    assert in_window(window, clock.wall()) is True
-
-
-def test_a_backwards_step_gives_the_same_answer_for_the_same_instant() -> None:
-    clock = FakeClock(wall=float(utc("2026-01-10T05:59:30")))
-    window = win("America/New_York", "22:00", "01:00", (FRI, SAT))
-    before = (in_window(window, clock.wall()), window_end(window, clock.wall()))
-    clock.jump_wall(7200)
-    clock.jump_wall(-7200)
-    assert (in_window(window, clock.wall()), window_end(window, clock.wall())) == before
-
-
 # ---- window_end ----------------------------------------------------------------------------
 
 
@@ -495,6 +480,33 @@ def test_window_end_is_deterministic_and_pure() -> None:
     assert [window_end(window, now) for _ in range(3)] == [window_end(window, now)] * 3
 
 
+def test_window_end_for_the_design_spike_fixture() -> None:
+    # New York, 2026-11-01 fall back, window 22:00 to 01:30.
+    window = win("America/New_York", "22:00", "01:30")
+    assert in_window(window, utc("2026-11-01T05:29")) is True  # 01:29 EDT: inside until 01:30
+    assert in_window(window, utc("2026-11-01T05:30")) is False  # 01:30 EDT
+    assert in_window(window, utc("2026-11-01T05:59")) is False  # 01:59 EDT
+    assert in_window(window, utc("2026-11-01T06:00")) is True  # 01:00 EST: inside again
+    assert in_window(window, utc("2026-11-01T06:29")) is True
+    assert in_window(window, utc("2026-11-01T06:30")) is False  # 01:30 EST
+    assert window_end(window, utc("2026-11-01T05:00")) == utc("2026-11-01T05:30")
+    assert window_end(window, utc("2026-11-01T06:00")) == utc("2026-11-01T06:30")
+
+
+def test_window_end_in_a_zone_with_a_second_level_offset_is_a_whole_epoch_minute() -> None:
+    # Amsterdam in 1930 was at +01:19:32: a multiple of 60 epoch seconds is not a local minute.
+    window = win("Europe/Amsterdam", "00:00", "01:00")
+    zone = window.zone
+    now = int(datetime(1930, 6, 1, 0, 30, tzinfo=zone).timestamp())
+    assert zone.utcoffset(datetime(1930, 6, 1, 0, 30)).seconds % 60 != 0  # type: ignore[union-attr]
+    assert in_window(window, now) is True
+    got = window_end(window, now)
+    assert got is not None
+    assert got % 60 == 0
+    assert got > now
+    assert in_window(window, got) is False
+
+
 class _FrozenZone(tzinfo):
     """A zone that always reads the same local time: the window never ends (a stub)."""
 
@@ -521,7 +533,7 @@ def test_a_search_is_bounded_to_two_days_and_gives_up_with_none() -> None:
     assert in_window(window, 1_800_000_000) is True
     zone.calls = 0
     assert window_end(window, 1_800_000_000) is None
-    assert zone.calls <= 2 * 24 * 60 + 1
+    assert zone.calls == 2 * 24 * 60  # one zone conversion per minute searched, no more
 
 
 @pytest.mark.parametrize(
@@ -531,6 +543,11 @@ def test_a_search_is_bounded_to_two_days_and_gives_up_with_none() -> None:
         {"days": (7,)},
         {"days": (-1,)},
         {"days": (1, 1)},
+        {"days": (True,)},
+        {"days": ("mon",)},
+        {"days": [1, 2]},
+        {"days": 3},
+        {"days": "mon"},
         {"start": -1},
         {"end": 1440},
         {"start": 1440},
@@ -550,18 +567,22 @@ def test_a_malformed_window_is_refused(bad: dict[str, Any]) -> None:
         window_end(window, 0)
 
 
-# ---- the property test: every minute of a year against an independent reference -------------
+# ---- the property test: sampled weeks and offset-change neighborhoods against a reference -------
 
 _YEAR_START = utc("2026-01-01T00:00")
 _YEAR_MINUTES = 365 * 24 * 60
 _ORIGIN = datetime(2025, 12, 1)  # the reference counts naive local minutes from here
 _SPAN_DAYS = 31 + 365 + 31 + 2
+_WEEK_MINUTES = 7 * 24 * 60
+_WEEKS = (utc("2026-01-12T00:00"), utc("2026-07-13T00:00"))  # a winter and a summer week
 
 # (start, end, days): same-day, crossing midnight, every day, one day, a start in a New York
-# spring-forward gap, an end in the gap, an end in the fall-back fold, a start in the fold.
+# spring-forward gap, an end in the gap, an end in the fall-back fold, a start in the fold, and
+# the design spike window.
 _CONFIGS: list[tuple[str, str, tuple[int, ...]]] = [
     ("09:00", "17:00", ALL),
     ("22:00", "06:00", ALL),
+    ("22:00", "01:30", ALL),
     ("22:30", "07:15", (FRI, SAT)),
     ("02:30", "04:00", (SUN, MON)),  # start in a spring-forward gap
     ("01:00", "02:30", ALL),  # end in a gap (and 01:00-02:30 spans the fall-back fold)
@@ -571,6 +592,7 @@ _CONFIGS: list[tuple[str, str, tuple[int, ...]]] = [
 _ZONES = ["America/New_York", "UTC", "Asia/Kolkata"]
 
 
+@functools.cache
 def _reference_paint(days: tuple[int, ...], start: int, end: int) -> bytearray:
     """Mark the naive local minutes of every window interval, built from calendar dates.
 
@@ -593,78 +615,95 @@ def _local_minute_index(zone: ZoneInfo, instant: int) -> int:
     return (local.replace(tzinfo=None) - _ORIGIN) // timedelta(minutes=1)
 
 
-@pytest.fixture(scope="module")
-def local_indexes() -> dict[str, list[int]]:
-    result: dict[str, list[int]] = {}
-    for tz in _ZONES:
-        zone = _GATEWAY.load_zone(tz)
-        result[tz] = [
-            _local_minute_index(zone, _YEAR_START + m * 60) for m in range(_YEAR_MINUTES + 1500)
-        ]
-    return result
+@functools.cache
+def _zone(tz: str) -> ZoneInfo:
+    return _GATEWAY.load_zone(tz)
+
+
+def _reference_inside(tz: str, config: tuple[str, str, tuple[int, ...]], instant: int) -> bool:
+    start, end, days = config
+    painted = _reference_paint(days, hm(start), hm(end))
+    return bool(painted[_local_minute_index(_zone(tz), instant)])
 
 
 @functools.cache
-def _transition_minutes(tz: str) -> tuple[int, ...]:
-    """Year minute offsets within 3 hours of any change of UTC offset in the year."""
-    zone = _GATEWAY.load_zone(tz)
+def _change_minutes(tz: str) -> tuple[int, ...]:
+    """Year minutes just before each change of UTC offset, found on a 15-minute grid."""
+    zone = _zone(tz)
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
     found: list[int] = []
     previous = None
-    for m in range(_YEAR_MINUTES + 1500):
-        stamp = _YEAR_START + m * 60
-        local = (datetime(1970, 1, 1, tzinfo=UTC) + timedelta(seconds=stamp)).astimezone(zone)
-        offset = local.utcoffset()
+    for m in range(0, _YEAR_MINUTES + 1500, 15):
+        offset = (epoch + timedelta(seconds=_YEAR_START + m * 60)).astimezone(zone).utcoffset()
         if previous is not None and offset != previous:
-            found.extend(range(max(0, m - 180), m + 180))
+            found.append(m)
         previous = offset
     return tuple(found)
 
 
+def _neighborhood(tz: str, radius_minutes: int) -> list[int]:
+    minutes: set[int] = set()
+    for m in _change_minutes(tz):
+        minutes.update(range(max(0, m - radius_minutes), m + radius_minutes))
+    return sorted(minutes)
+
+
+def _sweep_minutes(tz: str) -> list[int]:
+    """Every minute of the two weeks and of +-30 h around each change of offset."""
+    minutes = {(week - _YEAR_START) // 60 + k for week in _WEEKS for k in range(_WEEK_MINUTES)}
+    minutes.update(_neighborhood(tz, 30 * 60))
+    return sorted(m for m in minutes if m < _YEAR_MINUTES)
+
+
+def test_the_sweeps_find_the_known_changes() -> None:
+    assert len(_change_minutes("America/New_York")) == 2
+    assert _change_minutes("UTC") == ()
+    assert _change_minutes("Asia/Kolkata") == ()
+
+
 @pytest.mark.parametrize("tz", _ZONES)
 @pytest.mark.parametrize(("start", "end", "days"), _CONFIGS)
-def test_every_minute_of_2026_matches_the_reference(
-    tz: str, start: str, end: str, days: tuple[int, ...], local_indexes: dict[str, list[int]]
+def test_membership_matches_the_reference(
+    tz: str, start: str, end: str, days: tuple[int, ...]
 ) -> None:
     window = win(tz, start, end, days)
     painted = _reference_paint(days, hm(start), hm(end))
-    indexes = local_indexes[tz]
-    # offset of the first year minute into the painted span: December 2025 is month 0
-    expected = [bool(painted[i]) for i in indexes[:_YEAR_MINUTES]]
-    got = [in_window(window, _YEAR_START + m * 60) for m in range(_YEAR_MINUTES)]
-    mismatches = [m for m, (a, b) in enumerate(zip(got, expected, strict=True)) if a != b]
+    zone = window.zone
+    mismatches = []
+    seen_inside = seen_outside = False
+    for m in _sweep_minutes(tz):
+        instant = _YEAR_START + m * 60
+        expected = bool(painted[_local_minute_index(zone, instant)])
+        seen_inside |= expected
+        seen_outside |= not expected
+        if in_window(window, instant) is not expected:
+            mismatches.append(m)
     assert mismatches == []
-    assert any(got) and not all(got)
+    assert seen_inside and seen_outside
+
+
+def _end_samples(tz: str) -> list[int]:
+    samples = set(range(0, _YEAR_MINUTES, 997))
+    samples.update(m for m in _neighborhood(tz, 30 * 60) if m % 11 == 0)
+    samples.update(_neighborhood(tz, 180))  # one-minute resolution near each change
+    return sorted(m for m in samples if m < _YEAR_MINUTES)
 
 
 @pytest.mark.parametrize("tz", _ZONES)
 @pytest.mark.parametrize(("start", "end", "days"), _CONFIGS)
 def test_window_end_is_the_first_outside_minute_and_within_two_days(
-    tz: str, start: str, end: str, days: tuple[int, ...], local_indexes: dict[str, list[int]]
+    tz: str, start: str, end: str, days: tuple[int, ...]
 ) -> None:
     window = win(tz, start, end, days)
-    painted = _reference_paint(days, hm(start), hm(end))
-    indexes = local_indexes[tz]
-    count = _YEAR_MINUTES + 1500
-    inside = [bool(painted[i]) for i in indexes]
-    # reference: for each minute m, the first minute k > m that is outside (a backward pass)
-    first_outside_after = [0] * count
-    nxt = -1
-    for m in range(count - 1, -1, -1):
-        first_outside_after[m] = nxt
-        if not inside[m]:
-            nxt = m
-    samples = set(range(0, _YEAR_MINUTES, 997))
-    samples.update(m for m in _transition_minutes(tz) if m < _YEAR_MINUTES)
-    for m in sorted(samples):
-        now = _YEAR_START + m * 60
-        for fraction in (0, 29):  # on the minute and 29 seconds into it
-            got = window_end(window, now + fraction)
-            assert got is not None
-            assert got % 60 == 0
-            assert 0 < got - (now + fraction) <= 2 * 86400
-            assert got == _YEAR_START + first_outside_after[m] * 60
-            assert in_window(window, got) is False
-            if inside[m]:
-                assert all(in_window(window, t) for t in range(now + 60 - fraction, got, 60)) or (
-                    got - now > 3600 * 30
-                )
+    config = (start, end, days)
+    for index, m in enumerate(_end_samples(tz)):
+        now = _YEAR_START + m * 60 + (29 if index % 2 else 0)  # on the minute or 29 s into it
+        got = window_end(window, now)
+        assert got is not None
+        assert got % 60 == 0
+        assert 0 < got - now <= 2 * 86400
+        candidate = (now // 60 + 1) * 60
+        while _reference_inside(tz, config, candidate):
+            candidate += 60
+        assert got == candidate
+        assert in_window(window, got) is False

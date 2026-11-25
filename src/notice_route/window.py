@@ -50,7 +50,8 @@ _SEARCH_MINUTES = 2 * 24 * 60
 def _check_window(window: QuietWindow) -> None:
     days = window.days
     if (
-        not days
+        not isinstance(days, tuple)
+        or not days
         or len(set(days)) != len(days)
         or any(type(d) is not int or not 0 <= d <= 6 for d in days)
     ):
