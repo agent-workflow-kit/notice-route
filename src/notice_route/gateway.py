@@ -11,23 +11,33 @@ files, never in argv or the environment.
 
 from __future__ import annotations
 
+import errno
+import fcntl
+import io
 import math
 import os
+import pwd
 import secrets
 import selectors
 import signal
+import stat
 import subprocess
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal, Protocol
 
 __all__ = [
     "Clock",
+    "DirHandle",
     "FakeClock",
     "FixedTokens",
     "FINAL_READ",
     "Gateway",
+    "HomeError",
+    "POLL_INTERVAL",
     "RunResult",
     "SystemClock",
     "STDERR_LIMIT",
@@ -35,6 +45,7 @@ __all__ = [
     "SystemTokens",
     "TERM_GRACE",
     "TokenSource",
+    "UnsafePathError",
 ]
 
 
@@ -42,6 +53,7 @@ STDOUT_LIMIT = 65536
 STDERR_LIMIT = 16384
 TERM_GRACE = 5.0
 FINAL_READ = 1.0
+POLL_INTERVAL = 0.05
 _POLL_SLICE = 0.02
 _CHUNK = 65536
 
@@ -69,6 +81,10 @@ class Clock(Protocol):
 
     def monotonic(self) -> float: ...
 
+    def sleep(self, seconds: float) -> None:
+        """Let ``seconds`` pass; the fake moves both clocks instead of waiting."""
+        ...
+
 
 class SystemClock:
     """The real clocks."""
@@ -78,6 +94,9 @@ class SystemClock:
 
     def monotonic(self) -> float:
         return time.monotonic()
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
 
 
 class FakeClock:
@@ -103,6 +122,10 @@ class FakeClock:
         if seconds < 0:
             raise ValueError("monotonic time must advance by a finite, non-negative amount")
         self._monotonic = _finite(self._monotonic + seconds, "monotonic")
+
+    def sleep(self, seconds: float) -> None:
+        """Sleeping is time passing: both clocks move forward, nothing waits."""
+        self.advance(seconds)
 
     def advance(self, seconds: float) -> None:
         """Let real time pass: both clocks move forward together."""
@@ -146,12 +169,120 @@ class FixedTokens:
         return token
 
 
+class HomeError(Exception):
+    """The password-database home directory is unusable.
+
+    ``reason`` is ``empty``, ``relative`` or ``unresolvable`` (no entry, a bad value).
+    """
+
+    def __init__(self, reason: Literal["empty", "relative", "unresolvable"], detail: str) -> None:
+        super().__init__(f"home directory is {reason}: {detail}")
+        self.reason = reason
+
+
+class UnsafePathError(Exception):
+    """A path was refused for safety, never repaired.
+
+    ``reason``: ``symlink``, ``not_regular`` (a FIFO, directory, device or socket where a regular
+    file belongs), ``not_directory`` (a symlink or file where a directory belongs), ``owner``
+    (a directory not owned by the effective user) or ``mode`` (group or world access).
+    """
+
+    def __init__(self, reason: str, path: str) -> None:
+        super().__init__(f"refused {path!r}: {reason}")
+        self.reason = reason
+        self.path = path
+
+
+class DirHandle:
+    """An open directory descriptor; files and subdirectories are opened relative to it."""
+
+    def __init__(self, fd: int, path: str) -> None:
+        self.fd = fd
+        self.path = path
+
+    @property
+    def closed(self) -> bool:
+        return self.fd < 0
+
+    def close(self) -> None:
+        fd, self.fd = self.fd, -1
+        if fd >= 0:
+            os.close(fd)
+
+    def __enter__(self) -> DirHandle:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+FileMode = Literal["r", "a", "rw"]
+_FILE_FLAGS: dict[str, int] = {"r": os.O_RDONLY, "a": os.O_WRONLY | os.O_APPEND, "rw": os.O_RDWR}
+_FILE_FDOPEN: dict[str, str] = {"r": "rb", "a": "ab", "rw": "r+b"}
+
+
+@contextmanager
+def _umask_077() -> Iterator[None]:
+    old = os.umask(0o077)
+    try:
+        yield
+    finally:
+        os.umask(old)
+
+
+def _component(name: str) -> str:
+    if not isinstance(name, str) or name in ("", ".", "..") or "/" in name or "\x00" in name:
+        raise ValueError("name must be one plain path component")
+    return name
+
+
+def _passwd_home() -> str:
+    try:
+        return pwd.getpwuid(os.geteuid()).pw_dir
+    except KeyError as exc:
+        raise HomeError("unresolvable", "no password-database entry") from exc
+
+
+def _open_checked_dir(path: str, dir_fd: int | None, shown: str) -> DirHandle:
+    """Create ``path`` (0700, umask 077) when absent, open it without following a symlink, and
+    refuse it unless it is a directory owned by the effective user with no group/world access."""
+    with _umask_077():
+        try:
+            os.mkdir(path, 0o700, dir_fd=dir_fd)
+        except FileExistsError:
+            pass
+    try:
+        fd = os.open(
+            path,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=dir_fd,
+        )
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
+            raise UnsafePathError("not_directory", shown) from exc
+        raise
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISDIR(info.st_mode):
+            raise UnsafePathError("not_directory", shown)
+        if info.st_uid != os.geteuid():
+            raise UnsafePathError("owner", shown)
+        if info.st_mode & 0o077:
+            raise UnsafePathError("mode", shown)
+    except BaseException:
+        os.close(fd)
+        raise
+    return DirHandle(fd, shown)
+
+
 @dataclass
 class Gateway:
     """The injectable boundary. Build one at startup and pass it down."""
 
     clock: Clock = field(default_factory=SystemClock)
     tokens: TokenSource = field(default_factory=SystemTokens)
+    passwd_home: Callable[[], str] = _passwd_home
 
     def wall(self) -> float:
         return self.clock.wall()
@@ -245,7 +376,121 @@ class Gateway:
             )
         return _Supervisor(self.clock, proc, payload, started + timeout, started).run()
 
-    # TODO(#5): flock helpers and filesystem helpers (directories, files, home lookup).
+    def home_dir(self) -> Path:
+        """The home directory from the password database; ``HOME`` and ``XDG_*`` are never read.
+
+        Raises :class:`HomeError` for an empty, relative or unresolvable home (callers report
+        exit 2 ``config_invalid``, ``details.key`` ``home``). The path is not checked for
+        existence and symlinks are not resolved.
+        """
+        try:
+            value = self.passwd_home()
+        except HomeError:
+            raise
+        except (KeyError, OSError) as exc:
+            raise HomeError("unresolvable", type(exc).__name__) from exc
+        if not isinstance(value, str) or "\x00" in value:
+            raise HomeError("unresolvable", "not a usable string")
+        if value == "":
+            raise HomeError("empty", "the password database gives no home")
+        if not value.startswith("/"):
+            raise HomeError("relative", repr(value))
+        return Path(value)
+
+    def open_private_dir(self, path: str | os.PathLike[str]) -> DirHandle:
+        """Open the absolute directory ``path``, creating it and its parents with mode 0700
+        under ``umask 077`` when absent.
+
+        The last component is opened with ``O_NOFOLLOW``; the directory is refused
+        (:class:`UnsafePathError`, never repaired) when it is a symlink or not a directory, is
+        not owned by the effective user (``owner``) or has any group or world access
+        (``mode``). Parents that already exist are not checked. The caller closes the handle.
+        """
+        text = os.fspath(path)
+        if not isinstance(text, str) or not text.startswith("/") or "\x00" in text:
+            raise ValueError("path must be an absolute path without NUL")
+        parent = os.path.dirname(text.rstrip("/")) or "/"
+        with _umask_077():
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+        if text.rstrip("/") == "":
+            return _open_checked_dir("/", None, "/")
+        return _open_checked_dir(text.rstrip("/"), None, text)
+
+    def open_private_subdir(self, parent: DirHandle, name: str) -> DirHandle:
+        """Open (creating at 0700) the directory ``name`` inside ``parent``, with the same
+        refusals as :meth:`open_private_dir`."""
+        self._live(parent)
+        return _open_checked_dir(_component(name), parent.fd, f"{parent.path.rstrip('/')}/{name}")
+
+    def open_file(
+        self, parent: DirHandle, name: str, *, mode: FileMode = "r", create: bool = False
+    ) -> io.FileIO:
+        """Open the file ``name`` inside ``parent`` as an unbuffered binary file.
+
+        Uses ``O_NOFOLLOW`` and ``O_NONBLOCK`` relative to the directory descriptor and checks
+        ``fstat`` for a regular file: a symlink (``symlink``) or a FIFO, directory, device or
+        socket (``not_regular``) raises :class:`UnsafePathError`. ``mode`` is ``r`` (read), ``a``
+        (append) or ``rw``; ``create`` makes a missing file with mode 0600 (before the umask).
+        A missing file without ``create`` is ``FileNotFoundError``. The descriptor is not
+        inherited by children.
+        """
+        self._live(parent)
+        if mode not in _FILE_FLAGS:
+            raise ValueError(f"unknown mode {mode!r}")
+        shown = f"{parent.path.rstrip('/')}/{_component(name)}"
+        flags = _FILE_FLAGS[mode] | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        if create:
+            flags |= os.O_CREAT
+        try:
+            fd = os.open(name, flags, 0o600, dir_fd=parent.fd)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.EMLINK):
+                raise UnsafePathError("symlink", shown) from exc
+            if exc.errno == errno.EISDIR:
+                raise UnsafePathError("not_regular", shown) from exc
+            raise
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise UnsafePathError("not_regular", shown)
+            return os.fdopen(fd, _FILE_FDOPEN[mode], buffering=0)  # type: ignore[return-value]
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def try_lock(self, file: io.FileIO, wait: float) -> bool:
+        """Take an exclusive ``flock`` on ``file`` without ever blocking.
+
+        Tries at once, then every ``POLL_INTERVAL`` (50 ms) until ``wait`` seconds of the
+        clock's monotonic time have passed (the last sleep is shortened to the deadline, and one
+        last try follows it). Returns False when not acquired. The kernel releases the lock when
+        the holder dies or closes the file; :meth:`unlock` releases it early. ``wait`` must be a
+        finite number of seconds >= 0 (``ValueError`` otherwise, before anything is tried).
+        """
+        if isinstance(wait, bool) or not isinstance(wait, (int, float)):
+            raise ValueError("wait must be a number of seconds")
+        wait = _finite(wait, "wait")
+        if wait < 0:
+            raise ValueError("wait must not be negative")
+        deadline = self.clock.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                pass
+            remaining = deadline - self.clock.monotonic()
+            if remaining <= 0:
+                return False
+            self.clock.sleep(min(POLL_INTERVAL, remaining))
+
+    def unlock(self, file: io.FileIO) -> None:
+        """Release a lock taken with :meth:`try_lock`; harmless when not held."""
+        fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+
+    @staticmethod
+    def _live(handle: DirHandle) -> None:
+        if handle.closed:
+            raise ValueError("directory handle is closed")
 
 
 @dataclass(frozen=True)
