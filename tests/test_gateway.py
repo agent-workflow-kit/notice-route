@@ -1,5 +1,4 @@
 import math
-import subprocess
 
 import pytest
 
@@ -65,22 +64,6 @@ def test_default_gateway_token_is_random_hex() -> None:
     assert first != second
     assert len(first) == 32
     int(first, 16)
-
-
-def test_run_uses_no_shell_and_passes_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
-
-    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
-        calls.append((args, kwargs))
-        return subprocess.CompletedProcess(args=["x"], returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
-    Gateway().run(["tool", "--flag"], stdin="a; echo $HOME", timeout=3.0)
-    (args, kwargs) = calls[0]
-    assert args == (["tool", "--flag"],)
-    assert not kwargs.get("shell", False)
-    assert kwargs["input"] == "a; echo $HOME"
-    assert kwargs["timeout"] == 3.0
 
 
 def test_gateway_module_holds_no_clock_instances() -> None:

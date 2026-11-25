@@ -223,6 +223,9 @@ def proc_start(pid: int) -> str | None:
         return None
 
 
+_INTERPRETER_FDS = ("/sys/kernel/mm/transparent_hugepage/",)
+
+
 def open_fds() -> list[int] | None:
     for base in ("/proc/self/fd", "/dev/fd"):
         try:
@@ -236,6 +239,12 @@ def open_fds() -> list[int] | None:
                 os.fstat(fd)
             except OSError:
                 continue  # the descriptor listdir itself used
+            try:
+                target = os.readlink(f"{base}/{fd}")
+            except OSError:
+                target = ""
+            if target.startswith(_INTERPRETER_FDS):
+                continue  # held by the interpreter itself, never inherited (uv's CPython 3.12)
             fds.append(fd)
         return sorted(fds)
     return None
