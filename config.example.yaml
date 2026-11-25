@@ -66,8 +66,7 @@ destinations:
 
 # --- quiet hours ----------------------------------------------------------------
 # Named windows. Inside a destination's window: info is dropped, warn and action are deferred
-# to the end of the window, error is delivered at once. start and end must be quoted: an unquoted
-# 22:00 is not a string and is an error.
+# to the end of the window, error is delivered at once. start and end are HH:MM text; quote them.
 quiet_hours:
   night:
     # timezone (required): an IANA name from the system database; no default.

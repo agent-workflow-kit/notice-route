@@ -183,7 +183,8 @@
               {
                 "type": "string",
                 "pattern": "^/[^\\x00]+(?![\\s\\S])",
-                "description": "An absolute path (load error otherwise). At each call the router resolves it with realpath (following symlinks); the resolved file and every directory of the resolved path must be owned by the user or root and not group- or world-writable, and the file must have no setuid or setgid bit (else exec_failed). The resolved path is executed."
+                "description": "An absolute path (load error otherwise). At each call the router resolves it with realpath (following symlinks); the resolved file and every directory of the resolved path must be owned by the user or root and not group- or world-writable, and the file must have no setuid or setgid bit (else exec_failed). The resolved path is executed.",
+                "maxLength": 4096
               }
             ],
             "items": {
@@ -551,7 +552,8 @@
               "cmd": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Run via sh -c in its own process group; JSON payload on stdin."
+                "description": "Run via sh -c in its own process group; JSON payload on stdin.",
+                "maxLength": 4096
               },
               "timeout": {
                 "$ref": "#/$defs/duration",

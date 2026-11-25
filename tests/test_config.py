@@ -976,7 +976,7 @@ def test_merge_does_not_alias_values_between_loads(env: Env) -> None:
 
 def test_rule_without_a_string_name_is_left_to_the_validator(env: Env) -> None:
     env.main("rules:\n  - {x: 1}\n  - {x: 1}\n  - not-a-map\n  - [list]\n  - {name: [a]}\n")
-    assert len(env.data()["rules"]) == 5  # TODO(#7): rule shape and names are validated there
+    assert len(env.data()["rules"]) == 5  # rule shape and names are validated by validate.py
 
 
 def test_yaml_error_in_a_dropin_names_the_dropin(env: Env) -> None:
