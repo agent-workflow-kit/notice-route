@@ -17,6 +17,7 @@ import io
 import math
 import os
 import pwd
+import re
 import secrets
 import selectors
 import signal
@@ -24,6 +25,7 @@ import stat
 import subprocess
 import threading
 import time
+import zoneinfo
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -40,6 +42,7 @@ __all__ = [
     "HomeError",
     "POLL_INTERVAL",
     "RunResult",
+    "SYSTEM_TZ_DIRS",
     "SystemClock",
     "STDERR_LIMIT",
     "STDOUT_LIMIT",
@@ -47,6 +50,7 @@ __all__ = [
     "TERM_GRACE",
     "TokenSource",
     "UnsafePathError",
+    "ZoneError",
 ]
 
 
@@ -57,6 +61,17 @@ FINAL_READ = 1.0
 POLL_INTERVAL = 0.05
 _POLL_SLICE = 0.02
 _CHUNK = 65536
+# The system time zone database, in search order. ``PYTHONTZPATH`` and ``zoneinfo.TZPATH`` are
+# never consulted: the config selects a zone by name and must not reach other files.
+SYSTEM_TZ_DIRS = (
+    "/usr/share/zoneinfo",
+    "/usr/lib/zoneinfo",
+    "/usr/share/lib/zoneinfo",
+    "/etc/zoneinfo",
+)
+_ZONE_KEY = re.compile(r"[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+){0,2}")
+_ZONE_REFUSED = frozenset({"localtime", "posixrules", "factory"})
+_ZONE_MAX_BYTES = 256 * 1024
 
 RunStatus = Literal["exited", "signaled", "timeout", "overflow", "spawn_failed"]
 
@@ -198,6 +213,10 @@ class UnsafePathError(Exception):
         self.path = path
 
 
+class ZoneError(Exception):
+    """A time zone cannot be loaded from the system database (the message never names it)."""
+
+
 class LimitExceededError(Exception):
     """A file or a directory listing is larger than the caller's limit (never truncated)."""
 
@@ -296,6 +315,7 @@ class Gateway:
     clock: Clock = field(default_factory=SystemClock)
     tokens: TokenSource = field(default_factory=SystemTokens)
     passwd_home: Callable[[], str] = _passwd_home
+    tz_dirs: tuple[str, ...] = SYSTEM_TZ_DIRS
 
     def wall(self) -> float:
         return self.clock.wall()
@@ -620,6 +640,44 @@ class Gateway:
                     raise LimitExceededError(f"{handle.path!r} has more than {limit} entries")
                 names.append(entry.name)
         return names
+
+    def load_zone(self, key: str) -> zoneinfo.ZoneInfo:
+        """The zone ``key`` from the system database (``tz_dirs``), else :class:`ZoneError`.
+
+        ``key`` must match ``[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+){0,2}`` and be at most 64
+        characters, so it cannot leave the directory; ``localtime``, ``posixrules`` and
+        ``Factory`` (any case) are refused. The file is read here, at most 256 KiB, a regular
+        file (symlinks are followed: the database links its aliases), and parsed from memory,
+        so the environment's search path plays no part. Any failure is one :class:`ZoneError`.
+        """
+        if (
+            not isinstance(key, str)  # pyright: ignore[reportUnnecessaryIsInstance]
+            or len(key) > 64
+            or not _ZONE_KEY.fullmatch(key)
+            or key.lower() in _ZONE_REFUSED
+        ):
+            raise ZoneError("not a usable time zone name")
+        for base in self.tz_dirs:
+            try:
+                fd = os.open(os.path.join(base, key), os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+            except OSError:
+                continue
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise ZoneError("not a regular file")
+                file = os.fdopen(fd, "rb")
+            except BaseException:
+                os.close(fd)
+                raise
+            with file:
+                data = file.read(_ZONE_MAX_BYTES + 1)
+            if len(data) > _ZONE_MAX_BYTES:
+                raise ZoneError("zone file too large")
+            try:
+                return zoneinfo.ZoneInfo.from_file(io.BytesIO(data), key=key)
+            except Exception:  # any parse failure is one outcome; its text is not kept
+                raise ZoneError("not a time zone file") from None
+        raise ZoneError("unknown time zone")
 
     @staticmethod
     def _live(handle: DirHandle) -> None:
