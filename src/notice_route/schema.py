@@ -6,8 +6,7 @@ knows; the router still refuses a ``user_version`` above what it was built for (
 Every statement is a fixed string: no value from outside ever reaches SQL by formatting.
 
 Row ids are ``AUTOINCREMENT`` (never reused). Which tables hold which rows is
-[Files](interface.md#files); their logic is owned by later issues (queue #16, dedup #17,
-counters #18).
+[Files](interface.md#files); their logic is owned by later issues (counters #18).
 """
 
 from __future__ import annotations

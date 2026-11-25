@@ -33,6 +33,7 @@ __all__ = [
     "EVENT_IDS_CAP",
     "EVICT_BATCH",
     "MESSAGES",
+    "MIN_SQLITE",
     "SEND_BUSY_S",
     "Store",
     "StoreError",
@@ -49,7 +50,16 @@ EVENT_IDS_CAP = 100_000
 EVICT_BATCH = 16
 
 Reason = Literal[
-    "unsafe", "corrupt", "foreign", "newer", "older", "readonly", "busy", "migration", "internal"
+    "unsafe",
+    "corrupt",
+    "foreign",
+    "newer",
+    "older",
+    "readonly",
+    "busy",
+    "migration",
+    "internal",
+    "sqlite_old",
 ]
 
 MESSAGES: dict[str, str] = {
@@ -62,7 +72,9 @@ MESSAGES: dict[str, str] = {
     "busy": "state database is busy",
     "migration": "state database migration failed",
     "internal": "state database cannot be used",
+    "sqlite_old": "SQLite 3.35 or newer is required",
 }
+MIN_SQLITE = (3, 35, 0)  # RETURNING (the dedup upserts)
 
 # SQLite primary result codes
 _BUSY, _LOCKED, _READONLY, _PERM, _CANTOPEN = 5, 6, 8, 3, 14
@@ -230,6 +242,8 @@ def _open(
     readonly: bool,
     migrations: tuple[Migration, ...],
 ) -> Store | None:
+    if sqlite3.sqlite_version_info < MIN_SQLITE:
+        raise StoreError("sqlite_old")
     if not (
         isinstance(busy_timeout, (int, float))
         and not isinstance(busy_timeout, bool)
@@ -512,7 +526,7 @@ def trim_event_ids(
         return 0
     cur = conn.execute(
         "DELETE FROM event_ids WHERE id IN"
-        " (SELECT id FROM event_ids WHERE id IS NOT ? ORDER BY id LIMIT ?)",
+        " (SELECT id FROM event_ids WHERE id IS NOT ? ORDER BY seen_at, id LIMIT ?)",
         (keep_id, want),
     )
     return cur.rowcount

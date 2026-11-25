@@ -14,11 +14,11 @@ from pathlib import Path
 
 import pytest
 
-from notice_route import dedup
+from notice_route import dedup, payload
 from notice_route import queue as q
 from notice_route.dryrun import dedupe_digest
 from notice_route.gateway import FakeClock, Gateway
-from notice_route.store import Store, open_store
+from notice_route.store import Store, StoreError, open_readonly, open_store
 
 NOW = 1_700_000_000
 W = 60  # window length used by most tests
@@ -107,6 +107,8 @@ def record(
     delivery_id: int | None = None,
     cap: int = 100_000,
 ) -> bool:
+    if delivery_id is None:  # a record always names a delivery (it is what releases it)
+        delivery_id = delivery(conn, destination)
     return dedup.record_event_id(
         conn,
         destination=destination,
@@ -523,6 +525,209 @@ def test_replacing_an_expired_row_keeps_the_row_through_the_cap(store: Store) ->
         assert seen(conn, 1, now=NOW + RET + 1)
 
 
+# --- review round 1 ----------------------------------------------------------------------
+
+
+def test_cap_evicts_by_seen_at_so_a_replaced_record_outlives_older_ones(store: Store) -> None:
+    with store.write() as conn:
+        assert record(conn, 1, now=NOW, cap=2)
+        assert record(conn, 2, now=NOW + 1, cap=2)
+        assert record(conn, 1, now=NOW + 500, retention=100, cap=2)  # replaced: row id 1, newest
+        assert record(conn, 3, now=NOW + 501, retention=100, cap=2)
+    ids = sorted(str(r[0]) for r in store.read("SELECT event_id FROM event_ids"))
+    assert ids == ["1", "3"]
+
+
+@pytest.mark.parametrize("bad", [None, 1, b"d", ["d"]])
+def test_non_string_destination_source_hook_are_value_errors(store: Store, bad: object) -> None:
+    with store.write() as conn:
+        did = delivery(conn)
+        with pytest.raises(ValueError):
+            repeat(conn, destination=bad)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            dedup.active_window(conn, destination=bad, digest=D1, now=NOW)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            dedup.bind_window(conn, destination=bad, digest=D1, delivery_id=did)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            record(conn, destination=bad, delivery_id=did)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            seen(conn, destination=bad)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            record(conn, source=bad, delivery_id=did)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            seen(conn, source=bad)  # type: ignore[arg-type]
+        if bad is not None:
+            with pytest.raises(ValueError):
+                record(conn, hook=bad, delivery_id=did)  # type: ignore[arg-type]
+            with pytest.raises(ValueError):
+                seen(conn, hook=bad)  # type: ignore[arg-type]
+
+
+def test_bind_window_refuses_a_delivery_that_self_evicted_and_drops_the_window(
+    store: Store,
+) -> None:
+    ls = q.Lease(NOW, 20)
+    with store.write() as conn:
+        assert repeat(conn).opened
+        did = delivery(conn)
+        res = q.enqueue(
+            conn,
+            delivery_id=did,
+            kind="held",
+            message="m",
+            level="info",
+            source="s",
+            deliver_after=NOW,
+            created_at=NOW,
+            lease=ls,
+            cap=0,
+        )
+        assert [e.delivery_id for e in res.evicted] == [did]
+        assert not dedup.bind_window(conn, destination="d", digest=D1, delivery_id=did)
+        assert repeat(conn, now=NOW + 10).opened  # not suppressed against a dead delivery
+
+
+@pytest.mark.parametrize("end", ["failed", "dropped", "expired", "disabled"])
+def test_bind_window_refuses_an_ended_delivery(store: Store, end: str) -> None:
+    with store.write() as conn:
+        assert repeat(conn).opened
+        did = delivery(conn, outcome=end)
+        assert not dedup.bind_window(conn, destination="d", digest=D1, delivery_id=did)
+    assert count(store, "dedup") == 0
+
+
+def test_bind_window_refuses_a_missing_delivery(store: Store) -> None:
+    with store.write() as conn:
+        assert repeat(conn).opened
+        assert not dedup.bind_window(conn, destination="d", digest=D1, delivery_id=424242)
+    assert count(store, "dedup") == 0
+
+
+@pytest.mark.parametrize("live", ["deferred", "sent", "unknown"])
+def test_bind_window_binds_a_live_delivery(store: Store, live: str) -> None:
+    with store.write() as conn:
+        assert repeat(conn).opened
+        did = delivery(conn, outcome=live)
+        assert dedup.bind_window(conn, destination="d", digest=D1, delivery_id=did)
+
+
+@pytest.mark.parametrize("bad", [None, True, 0, -1, 1.5, "1"])
+def test_record_event_id_requires_a_delivery_id(store: Store, bad: object) -> None:
+    with store.write() as conn, pytest.raises(ValueError):
+        dedup.record_event_id(
+            conn,
+            destination="d",
+            source="s",
+            hook="h",
+            event_id=17,
+            digest=D1,
+            now=NOW,
+            retention=RET,
+            delivery_id=bad,  # type: ignore[arg-type]
+        )
+    assert count(store, "event_ids") == 0
+
+
+def test_sqlite_older_than_3_35_is_refused_with_a_fixed_sentence(
+    gw: Gateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 34, 1))
+    with pytest.raises(StoreError, match="SQLite 3.35 or newer is required"):
+        open_store(gw)
+    with pytest.raises(StoreError, match="SQLite 3.35 or newer is required"):
+        open_readonly(gw)
+
+
+@pytest.mark.parametrize("bad", [1.0, 60.0, 0.5])
+def test_float_durations_are_value_errors_the_caller_converts_with_ceil(
+    store: Store, bad: float
+) -> None:
+    with store.write() as conn:
+        with pytest.raises(ValueError):
+            repeat(conn, length=bad)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            seen(conn, retention=bad)  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            record(conn, retention=bad)  # type: ignore[arg-type]
+
+
+def test_counts_equal_what_prune_deletes(store: Store) -> None:
+    with store.write() as conn:
+        for i in range(3):
+            assert repeat(conn, dedupe_digest("s", "h", "info", f"t{i}", "m", ""), now=NOW).opened
+        assert repeat(conn, D2, now=NOW + 1000).opened
+        for i in range(4):
+            assert record(conn, i, now=NOW + (0 if i < 3 else 2000))
+        assert dedup.count_prunable_windows(conn, now=NOW + W) == 3
+        assert dedup.count_prunable_event_ids(conn, now=NOW + RET + 1, retention=RET) == 3
+        assert dedup.prune_windows(conn, now=NOW + W) == 3
+        assert dedup.prune_event_ids(conn, now=NOW + RET + 1, retention=RET) == 3
+        assert dedup.count_prunable_windows(conn, now=NOW + W) == 0
+        assert dedup.count_prunable_event_ids(conn, now=NOW + RET + 1, retention=RET) == 0
+
+
+def test_a_suppressed_repeat_records_no_event_id_unless_already_present(store: Store) -> None:
+    with store.write() as conn:
+        opened(conn)
+        assert not repeat(conn, now=NOW + 1).opened  # a caller stops here: nothing recorded
+    assert count(store, "event_ids") == 0
+
+
+def test_plain_pattern_is_the_one_of_payload() -> None:
+    assert dedup._PLAIN.pattern == payload._PLAIN.pattern
+
+
+def test_router_source_rows_are_never_redelivered(store: Store) -> None:
+    with store.write() as conn:
+        did = delivery(conn)
+        conn.execute(
+            "INSERT INTO event_ids (destination, source, hook, event_id, repeat_digest, seen_at,"
+            " delivery_id) VALUES ('d', 'notice-route', 'h', '17', ?, ?, ?)",
+            (D1, NOW, did),
+        )
+        assert not seen(conn, 17, source="notice-route")
+
+
+def test_same_digest_in_two_destinations_raises_only_the_repeating_openers_count(
+    store: Store,
+) -> None:
+    with store.write() as conn:
+        a = opened(conn, destination="a")
+        b = opened(conn, destination="b")
+        assert not repeat(conn, destination="b", now=NOW + 1).opened
+    assert delivery_count(store, a) == 1
+    assert delivery_count(store, b) == 2
+
+
+def test_check_repeat_is_one_write_statement_when_no_window_exists(store: Store) -> None:
+    seen_sql: list[str] = []
+    with store.write() as conn:
+        conn.set_trace_callback(seen_sql.append)
+        try:
+            assert repeat(conn).opened
+        finally:
+            conn.set_trace_callback(None)
+    writes = [s for s in seen_sql if s.lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE"))]
+    reads = [s for s in seen_sql if s.lstrip().upper().startswith("SELECT")]
+    assert len(writes) == 1 and not reads
+
+
+def test_single_statement_is_atomic_across_two_autocommit_connections(
+    gw: Gateway, store: Store
+) -> None:
+    # no BEGIN: each call is one autocommit statement, as two interleaved writers run it
+    files = gw.prepare_state_db(create=False)
+    assert files is not None
+    conns = [sqlite3.connect(files.path, isolation_level=None) for _ in range(2)]
+    try:
+        results = [c.execute(dedup._OPEN, ("d", D1, NOW, W)).fetchone() is not None for c in conns]
+    finally:
+        for c in conns:
+            c.close()
+    assert results == [True, False]
+    assert count(store, "dedup") == 1
+
+
 # --- release and lifetime --------------------------------------------------------------------
 
 
@@ -544,6 +749,10 @@ def test_release_deletes_both_records_of_a_delivery_and_only_that_delivery(store
 def test_release_rejects_a_bad_delivery_id(store: Store, bad: object) -> None:
     with store.write() as conn, pytest.raises(ValueError):
         dedup.release(conn, bad)  # type: ignore[arg-type]
+
+
+# The lifetime tests below call ``release`` by hand: they pin the release/keep semantics only.
+# Which outcome calls it is wired by #20, #23 and #26 (TODO there).
 
 
 def test_records_stay_when_nothing_releases_them_as_after_sent_or_unknown(store: Store) -> None:
@@ -747,7 +956,10 @@ args = dict(destination="d", source="s", hook="h", event_id=17, digest=digest, n
 with open_store(gw) as store:
     with store.write() as conn:
         # no check first: the unique key must make the second writer a no-op, not an error
-        wrote = dedup.record_event_id(conn, delivery_id=None, **args)
+        did = q.insert_delivery(
+            conn, ts=int(now), source="s", level="info", outcome="deferred", destination="d"
+        )
+        wrote = dedup.record_event_id(conn, delivery_id=did, **args)
 print(json.dumps(wrote))
 """
 

@@ -27,9 +27,25 @@ Rules:
 - **Release** by ``delivery_id`` deletes both records (``failed``, ``dropped``, ``expired``,
   notifier-side ``disabled`` and cap eviction); records stay after ``sent`` and ``unknown``.
 
-Seams: TODO(#18) the decision order that calls these; TODO(#22) the send pipeline; TODO(#20) a
-delivery's end calls :func:`release`; TODO(#26) ``prune`` calls :func:`prune_windows` and
-:func:`prune_event_ids` in loops of one transaction each.
+Durations are integer seconds: the caller converts a configured duration once, with
+``math.ceil``, before calling (a float is a ``ValueError``).
+
+Seams:
+
+- TODO(#18) the decision order that calls these, per destination that is not suppressed or
+  dropped by an earlier step, in one transaction: :func:`check_repeat` (a suppressed repeat ends
+  the destination there); :func:`insert_delivery <notice_route.queue.insert_delivery>`;
+  :func:`bind_window` (it must be ``True``; ``False`` means the delivery already ended
+  unsuccessfully and the window is gone, so the caller treats the delivery as ended and does not
+  queue it); :func:`record_event_id` (only when :func:`is_redelivered` was ``False``); then
+  ``enqueue``. Convert configured durations to integer seconds with ``math.ceil`` first.
+- TODO(#22) the send pipeline.
+- TODO(#20) and TODO(#23) (flush step 4 expiry) and TODO(#26) (``prune`` expiry of queue rows):
+  every delivery end except ``sent`` and ``unknown`` (``failed``, ``dropped``, ``expired`` and a
+  notifier-side ``disabled``) calls :func:`release` in the same transaction.
+- TODO(#26) ``prune`` calls :func:`prune_windows` and :func:`prune_event_ids` in loops of one
+  transaction each; its dry run uses :func:`count_prunable_windows` and
+  :func:`count_prunable_event_ids`.
 """
 
 from __future__ import annotations
@@ -48,6 +64,8 @@ __all__ = [
     "active_window",
     "bind_window",
     "check_repeat",
+    "count_prunable_event_ids",
+    "count_prunable_windows",
     "event_id_text",
     "is_redelivered",
     "prune_event_ids",
@@ -64,6 +82,7 @@ _PLAIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/#-]{0,255}")  # as payload._PLAIN
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 
 _Conn = sqlite3.Connection
+_RELEASING = frozenset({"failed", "dropped", "expired", "disabled"})  # outcomes that release
 
 
 def _bounded(value: object, what: str, low: int) -> int:
@@ -83,9 +102,21 @@ def _digest(value: object) -> str:
 
 
 def _delivery_id(value: object) -> int:
-    if type(value) is not int or not -(1 << 63) <= value <= _INT64_MAX:
-        raise ValueError("delivery_id must be an integer within int64")
+    if type(value) is not int or not 1 <= value <= _INT64_MAX:
+        raise ValueError("delivery_id must be an integer from 1 to int64")
     return value
+
+
+def _text(value: object, what: str) -> str:
+    if type(value) is not str:
+        raise ValueError(f"{what} must be a string")
+    return value
+
+
+def _hook(value: object) -> str:
+    if value is None:
+        return ""
+    return _text(value, "hook")
 
 
 def event_id_text(value: object) -> str | None:
@@ -139,6 +170,7 @@ def check_repeat(
     conn: _Conn, *, destination: str, digest: str, now: int, window_length: int
 ) -> Repeat:
     """The repeat check of one destination, in one statement (no read-then-write gap)."""
+    _text(destination, "destination")
     _digest(digest)
     _now(now)
     _bounded(window_length, "window_length", 1)
@@ -164,17 +196,32 @@ def active_window(conn: _Conn, *, destination: str, digest: str, now: int) -> Wi
         "SELECT window_start, window_length, delivery_id FROM dedup"
         " WHERE destination = ? AND key_digest = ?"
         " AND window_start <= ? AND ? < window_start + window_length",
-        (destination, _digest(digest), _now(now), now),
+        (_text(destination, "destination"), _digest(digest), _now(now), now),
     ).fetchone()
     return None if found is None else Window(*found)
 
 
 def bind_window(conn: _Conn, *, destination: str, digest: str, delivery_id: int) -> bool:
-    """Attach the delivery to the window :func:`check_repeat` just opened (only an unbound one)."""
+    """Attach the delivery to the window :func:`check_repeat` just opened (only an unbound one).
+
+    ``False`` and nothing bound when the delivery row is missing or already ended in an outcome
+    that releases its records (``failed``, ``dropped``, ``expired``, ``disabled``; for example
+    evicted by the cap while it was queued): the still-unbound window is deleted, so repeats are
+    never suppressed against a dead delivery."""
+    _delivery_id(delivery_id)
+    _text(destination, "destination")
+    _digest(digest)
+    row = conn.execute("SELECT outcome FROM deliveries WHERE id = ?", (delivery_id,)).fetchone()
+    if row is None or row[0] in _RELEASING:
+        conn.execute(
+            "DELETE FROM dedup WHERE destination = ? AND key_digest = ? AND delivery_id IS NULL",
+            (destination, digest),
+        )
+        return False
     cur = conn.execute(
         "UPDATE dedup SET delivery_id = ? WHERE destination = ? AND key_digest = ?"
         " AND delivery_id IS NULL",
-        (_delivery_id(delivery_id), destination, _digest(digest)),
+        (delivery_id, destination, digest),
     )
     return cur.rowcount == 1
 
@@ -195,6 +242,9 @@ def is_redelivered(
 ) -> bool:
     """Both the event id and the repeat digest were recorded for this destination, source and
     hook, and the record is live. Never for a non-plain id or the router's own source."""
+    _text(destination, "destination")
+    _text(source, "source")
+    hook_text = _hook(hook)
     _digest(digest)
     _now(now)
     _bounded(retention, "retention", 1)
@@ -204,7 +254,7 @@ def is_redelivered(
     found = conn.execute(
         "SELECT 1 FROM event_ids WHERE destination = ? AND source = ? AND hook = ?"
         " AND event_id = ? AND repeat_digest = ? AND seen_at >= ? AND seen_at <= ?",
-        (destination, source, hook or "", text, digest, now - retention, now),
+        (destination, source, hook_text, text, digest, now - retention, now),
     ).fetchone()
     return found is not None
 
@@ -232,21 +282,25 @@ def record_event_id(
     digest: str,
     now: int,
     retention: int,
-    delivery_id: int | None,
+    delivery_id: int,
     cap: int = EVENT_IDS_CAP,
 ) -> bool:
     """Record the id and trim the table to ``cap`` (never the row just written). ``False`` when
     nothing was written: an ignored id, the router's own source, or a live record already there
-    (the caller should have suppressed; this is never an error under a race)."""
+    (the caller should have suppressed; this is never an error under a race). ``delivery_id`` is
+    required: a record nothing releases would outlive a failed delivery."""
+    _text(destination, "destination")
+    _text(source, "source")
+    hook_text = _hook(hook)
+    owner = _delivery_id(delivery_id)
     _digest(digest)
     _now(now)
     _bounded(retention, "retention", 1)
     text = event_id_text(event_id)
     if text is None or source == ROUTER_SOURCE:
         return False
-    owner = None if delivery_id is None else _delivery_id(delivery_id)
     row = conn.execute(
-        _RECORD, (destination, source, hook or "", text, digest, now, owner, retention)
+        _RECORD, (destination, source, hook_text, text, digest, now, owner, retention)
     ).fetchone()
     if row is None:
         return False
@@ -266,13 +320,38 @@ def release(conn: _Conn, delivery_id: int) -> int:
     return n
 
 
+_ENDED_WINDOWS = "window_start + window_length <= ?"
+_OLD_EVENT_IDS = "seen_at < ?"
+
+
+def count_prunable_windows(conn: _Conn, *, now: int) -> int:
+    """How many windows :func:`prune_windows` would delete in total (for ``prune --dry-run``)."""
+    return int(
+        conn.execute("SELECT COUNT(*) FROM dedup WHERE " + _ENDED_WINDOWS, (_now(now),)).fetchone()[
+            0
+        ]
+    )
+
+
+def count_prunable_event_ids(conn: _Conn, *, now: int, retention: int) -> int:
+    """How many event ids :func:`prune_event_ids` would delete in total."""
+    _now(now)
+    _bounded(retention, "retention", 1)
+    return int(
+        conn.execute(
+            "SELECT COUNT(*) FROM event_ids WHERE " + _OLD_EVENT_IDS, (now - retention,)
+        ).fetchone()[0]
+    )
+
+
 def prune_windows(conn: _Conn, *, now: int, batch: int = PRUNE_BATCH) -> int:
     """Delete up to ``batch`` ended windows (``start + length <= now``), oldest first."""
     _now(now)
     _bounded(batch, "batch", 1)
     return conn.execute(
-        "DELETE FROM dedup WHERE id IN (SELECT id FROM dedup"
-        " WHERE window_start + window_length <= ? ORDER BY id LIMIT ?)",
+        "DELETE FROM dedup WHERE id IN (SELECT id FROM dedup WHERE "
+        + _ENDED_WINDOWS
+        + " ORDER BY id LIMIT ?)",
         (now, batch),
     ).rowcount
 
@@ -283,7 +362,8 @@ def prune_event_ids(conn: _Conn, *, now: int, retention: int, batch: int = PRUNE
     _bounded(retention, "retention", 1)
     _bounded(batch, "batch", 1)
     return conn.execute(
-        "DELETE FROM event_ids WHERE id IN (SELECT id FROM event_ids"
-        " WHERE seen_at < ? ORDER BY id LIMIT ?)",
+        "DELETE FROM event_ids WHERE id IN (SELECT id FROM event_ids WHERE "
+        + _OLD_EVENT_IDS
+        + " ORDER BY id LIMIT ?)",
         (now - retention, batch),
     ).rowcount

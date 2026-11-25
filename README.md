@@ -78,6 +78,7 @@ None are read for configuration; a destination's `env` names the credential vari
   uv tool install git+https://github.com/agent-workflow-kit/wsl-notice
   ```
 
+- SQLite 3.35 or newer in Python's `sqlite3` module (older libraries lack `RETURNING`; the router refuses to open its state database with them).
 - `cron` for `flush` and `prune` (`notice-route cron install`).
 
 A missing notifier ends its calls `failed`, code `exec_failed`; `validate` names the destination, and the commands above install it.
