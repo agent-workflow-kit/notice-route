@@ -6,6 +6,8 @@ import json
 import threading
 from pathlib import Path
 
+import pytest
+
 from notice_route import log
 from notice_route.gateway import FakeClock, Gateway
 from tests.send_support import log_errors
@@ -122,3 +124,40 @@ def test_unknown_field_is_refused() -> None:
 
     with pytest.raises(ValueError):
         log.record("delivery", wall=1.0, actor="auto:x", decision_id=None, title="no")
+
+
+class _ShortWrites:
+    """A log file whose write puts half of the bytes down and then fails (a full disk)."""
+
+    def __init__(self, real: object) -> None:
+        self._real = real
+
+    def write(self, data: memoryview) -> int:
+        half = len(data) // 2
+        self._real.write(data[:half])  # type: ignore[attr-defined]
+        raise OSError(28, "no space left on device")
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._real, name)
+
+
+def test_a_short_write_leaves_no_partial_line_for_the_next_record(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    g = gw(home)
+    with g.open_state_dir() as state:
+        w = log.LogWriter(g, state)
+        assert w.write(delivery(source="first"))
+        real_open = Gateway.open_file
+        failing = {"on": True}
+
+        def open_file(self: Gateway, parent: object, name: str, **kw: object) -> object:
+            f = real_open(self, parent, name, **kw)  # type: ignore[arg-type]
+            return _ShortWrites(f) if failing["on"] and name == log.LOG_NAME else f
+
+        monkeypatch.setattr(Gateway, "open_file", open_file)
+        assert w.write(delivery(source="lost")) is False and w.problems == 1
+        failing["on"] = False
+        assert w.write(delivery(source="last"))
+    lines = (home / ".local" / "state" / "notice-route" / log.LOG_NAME).read_text().splitlines()
+    assert [json.loads(x)["source"] for x in lines] == ["first", "last"]

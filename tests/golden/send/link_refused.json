@@ -1,0 +1,25 @@
+{
+  "outcome": "ok",
+  "shape": "hook",
+  "source": "agent-spawn",
+  "hook": "post-state-change",
+  "rule": "h",
+  "level": "warn",
+  "reason": null,
+  "text_excluded": false,
+  "labels_ignored": 0,
+  "destinations": [
+    {
+      "name": "chat",
+      "outcome": "queued_retry",
+      "reason": "link_refused",
+      "attempts": 1,
+      "code": "link_scheme",
+      "count": null,
+      "deliver_after": 1700000060,
+      "notifier_outcome": null
+    }
+  ],
+  "dedupe": "e9e7f623a088c58ee0b04778f33e7331777852008292d916bba324a683e12850",
+  "duration_ms": 0
+}

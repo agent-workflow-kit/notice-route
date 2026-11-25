@@ -137,7 +137,9 @@ class DestinationDecision:
     set only for a recorded decision: ``delivery_id`` for everything but ``suppress``,
     ``queue_id`` for a queued row, and for ``send`` the ``claim_token`` and ``claim_expires`` of
     its row. ``count`` is the repeat count of the row that opened the window, for a ``suppress``
-    with reason ``repeat`` (this repeat included), else ``None``."""
+    with reason ``repeat`` (this repeat included), else ``None``. ``decided_at`` is the clock
+    (floored wall seconds) of the transaction that recorded the row, for the hour its count
+    belongs to."""
 
     name: str
     decision: Decision
@@ -149,6 +151,7 @@ class DestinationDecision:
     claim_token: str | None = None
     claim_expires: int | None = None
     count: int | None = None
+    decided_at: int | None = None
 
 
 @dataclass(frozen=True)
@@ -530,6 +533,7 @@ def _record(
         queued.row_id,
         token,
         lease.expires if token is not None else None,
+        decided_at=now,
     )
 
 

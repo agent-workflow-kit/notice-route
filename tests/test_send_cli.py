@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +14,8 @@ import pytest
 
 from notice_route import log as logmod
 from notice_route.gateway import SYSTEM_TZ_DIRS
-from tests.send_support import CANARY, Rig, log_errors
+from tests.fakes import scrubbed_env
+from tests.send_support import CANARY, SCRIPT, Rig, log_errors
 from tests.test_cli_rules_validate import schema_errors
 
 _HAVE_ZONES = any((Path(d) / "America" / "New_York").is_file() for d in SYSTEM_TZ_DIRS)
@@ -234,7 +237,7 @@ def test_the_log_line_follows_the_schema_and_holds_no_text(rig: Rig) -> None:
     rig.configure({"chat": {"notifier": n}})
     code, out, _ = rig.run(
         "send", "--stdin-json", "--json", "--source", "s", "--actor", "auto:test-policy",
-        "--decision-id", "d-1:x", stdin=b'{"message": "SECRETISH body", "title": "TITLETEXT"}',
+        "--decision-id", "d-1:x", stdin=b'{"message": "BODYTEXT body", "title": "TITLETEXT"}',
     )  # fmt: skip
     doc = json.loads(out)
     (line,) = rig.log_lines()
@@ -243,12 +246,12 @@ def test_the_log_line_follows_the_schema_and_holds_no_text(rig: Rig) -> None:
         "delivery", "chat", "sent", 1,
     )  # fmt: skip
     assert (line["actor"], line["decision_id"]) == ("auto:test-policy", "d-1:x")
-    assert line["message_sha256"] == logmod.sha16("SECRETISH body")
+    assert line["message_sha256"] == logmod.sha16("BODYTEXT body")
     assert line["title_sha256"] == logmod.sha16("TITLETEXT")
     assert line["dedupe_key_sha256"] == doc["dedupe"][:16]
     assert (line["source"], line["rule"], line["level"]) == ("s", "pt", "info")
     text = (rig.state / "log.jsonl").read_text()
-    assert "SECRETISH" not in text and "TITLETEXT" not in text
+    assert "BODYTEXT" not in text and "TITLETEXT" not in text
 
 
 def test_the_default_actor_is_auto_unknown_off_a_terminal(rig: Rig) -> None:
@@ -265,9 +268,9 @@ def test_every_destination_outcome_is_logged_including_suppressed(rig: Rig) -> N
     rig.send("hi", level="warn")
     rig.send("hi", level="warn")
     got = [(x["destination"], x["outcome"], x["reason"]) for x in rig.log_lines()]
-    assert got == [  # decided destinations are logged first, called ones when their result is in
-        ("late", "deferred", "quiet"),
+    assert got == [  # called destinations first (their results), then the decided ones
         ("chat", "sent", None),
+        ("late", "deferred", "quiet"),
         ("chat", "suppressed", "repeat"),
         ("late", "suppressed", "repeat"),
     ]
@@ -292,7 +295,9 @@ def test_a_bad_log_warns_and_changes_no_result(rig: Rig, tmp_path: Path) -> None
     assert target.read_text() == ""
 
 
-def test_stored_text_is_not_in_the_log_or_the_output_of_a_secret_free_run(rig: Rig) -> None:
+def test_a_run_keeps_its_text_out_of_the_log_and_a_variable_value_out_of_all(
+    rig: Rig,
+) -> None:
     rig.configure({"chat": {"notifier": rig.notifier(), "env": ["ROUTE_CRED"]}})
     code, out, err = rig.run(
         "send", "--stdin-json", "--json", "--source", "s",
@@ -300,3 +305,116 @@ def test_stored_text_is_not_in_the_log_or_the_output_of_a_secret_free_run(rig: R
         env={"ROUTE_CRED": CANARY},
     )  # fmt: skip
     assert CANARY not in out + err + rig.state_text()
+    assert "queued body text" not in out + err + (rig.state / "log.jsonl").read_text()
+
+
+# --- output that cannot be written -------------------------------------------------------------
+
+
+def run_with_streams(
+    rig: Rig, argv: list[str], body: bytes, *, out: str = "pipe", err: str = "pipe"
+) -> tuple[int, bytes, bytes]:
+    """The real ``main`` in a child whose stdout or stderr is ``/dev/full`` (``full``), closed
+    (``closed``) or a pipe nobody reads (``epipe`` for stdout); returns the exit code and what
+    arrived on the pipes that exist."""
+    redirect = {"full": "/dev/full", "closed": "&-"}
+    shell = 'exec "$@"'
+    if out in redirect:
+        shell += f" >{redirect[out]}"
+    if err in redirect:
+        shell += f" 2>{redirect[err]}"
+    proc = subprocess.Popen(
+        ["/bin/sh", "-c", shell, "sh", sys.executable, "-I", "-c", SCRIPT,
+         str(rig.home), str(rig.tmp_path), *argv],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=scrubbed_env(rig.home),
+        cwd="/",
+    )  # fmt: skip
+    rig.procs.append(proc)
+    assert proc.stdin is not None and proc.stdout is not None
+    if out == "epipe":
+        proc.stdout.close()
+    proc.stdin.write(body)
+    proc.stdin.close()
+    proc.stdin = None
+    got_out, got_err = proc.communicate(timeout=60)
+    return proc.returncode, got_out, got_err
+
+
+@pytest.mark.parametrize("out", ["full", "closed", "epipe"])
+@pytest.mark.parametrize(("error", "expected"), [(None, 0), ({"code": "credential_invalid"}, 12)])
+def test_an_unwritable_stdout_after_the_send_keeps_the_exit_code(
+    rig: Rig, out: str, error: dict[str, str] | None, expected: int
+) -> None:
+    behavior: dict[str, Any] = {"error": error} if error else {}
+    rig.configure({"chat": {"notifier": rig.notifier(**behavior)}})
+    code, _, _ = run_with_streams(
+        rig, ["send", "--stdin-json", "--json", "--source", "s"], b'{"message": "hi"}', out=out
+    )
+    assert code == expected
+    assert rig.query("SELECT outcome FROM deliveries") == [("failed" if error else "sent",)]
+
+
+@pytest.mark.parametrize("err", ["full", "closed"])
+@pytest.mark.parametrize(("error", "expected"), [(None, 0), ({"code": "credential_invalid"}, 12)])
+def test_an_unwritable_stderr_in_a_text_run_keeps_the_exit_code(
+    rig: Rig, err: str, error: dict[str, str] | None, expected: int
+) -> None:
+    behavior: dict[str, Any] = {"error": error} if error else {}
+    rig.configure({"chat": {"notifier": rig.notifier(**behavior)}})
+    code, out, _ = run_with_streams(
+        rig, ["send", "--stdin-json", "--source", "s"], b'{"message": "hi"}', err=err
+    )
+    assert (code, out) == (expected, b"")
+
+
+LATE_SIGNAL_SCRIPT = (
+    "import os, signal, sys\n"
+    "from notice_route import cli\n"
+    "from notice_route.gateway import Gateway\n"
+    "real = cli._json\n"
+    "def late(document):\n"
+    "    os.kill(os.getpid(), signal.SIGTERM)\n"
+    "    real(document)\n"
+    "cli._json = late\n"
+    "home, tmp = sys.argv[1], sys.argv[2]\n"
+    "sys.exit(cli.main(sys.argv[3:], Gateway(passwd_home=lambda: home, exec_check_from=tmp)))\n"
+)
+
+
+def test_a_signal_after_the_calls_does_not_kill_the_run_before_its_document(rig: Rig) -> None:
+    rig.configure({"chat": {"notifier": rig.notifier()}})
+    proc = subprocess.Popen(
+        [sys.executable, "-I", "-c", LATE_SIGNAL_SCRIPT, str(rig.home), str(rig.tmp_path),
+         "send", "--stdin-json", "--json", "--source", "s"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=scrubbed_env(rig.home), cwd="/",
+    )  # fmt: skip
+    rig.procs.append(proc)
+    out, _ = proc.communicate(b'{"message": "hi"}', timeout=60)
+    assert proc.returncode == 0
+    assert json.loads(out)["destinations"][0]["outcome"] == "sent"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [["--actor", "root"], ["--decision-id", "a", "--decision-id", "b"], ["--decision-id", "a b"]],
+)
+def test_a_dry_run_checks_the_audit_flags_like_a_send(rig: Rig, extra: list[str]) -> None:
+    rig.configure({"chat": {"notifier": rig.notifier()}})
+    code, out, _ = rig.run("send", "--dry-run", "--message", "x", "--source", "s", "--json", *extra)
+    assert code == 2 and error_doc(out)["code"] == "usage"
+
+
+def test_the_default_actor_on_a_terminal_is_human_and_the_login_name(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from notice_route.gateway import Gateway
+
+    monkeypatch.setattr(Gateway, "stdin_is_tty", lambda self: True)
+    monkeypatch.setattr(Gateway, "login_name", lambda self: "some.user")
+    rig.configure({"chat": {"notifier": rig.notifier()}})
+    code, _, _ = rig.run("send", "--message", "hi", "--source", "s")
+    assert code == 0 and rig.log_lines()[0]["actor"] == "human:some.user"

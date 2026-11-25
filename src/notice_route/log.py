@@ -143,17 +143,31 @@ class LogWriter:
                         log.close()
                         self._rotate(state)
                         log = gateway.open_file(state, LOG_NAME, mode="a", create=True)
-                    view = memoryview(line)
-                    while view:
-                        written = log.write(view)
-                        if not written:
-                            return False
-                        view = view[written:]
+                    before = gateway.file_size(log)
+                    if self._write_all(log, line):
+                        return True
+                    try:  # a partial line would glue to the next record
+                        gateway.truncate(log, before)
+                    except OSError:
+                        pass
+                    return False
                 finally:
                     log.close()
-                return True
             finally:
                 gateway.unlock(lock)
+
+    @staticmethod
+    def _write_all(log: Any, line: bytes) -> bool:
+        view = memoryview(line)
+        try:
+            while view:
+                written = log.write(view)
+                if not written:
+                    return False
+                view = view[written:]
+        except OSError:
+            return False
+        return True
 
     def _rotate(self, state: DirHandle) -> None:
         gateway = self._gateway

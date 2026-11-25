@@ -18,15 +18,18 @@ everything after that:
 
 Choices where the interface is silent (docs/design.md C-52 has the reasons):
 
-- A signal before the first call (``trap.received`` set when the decision is done) releases the
-  claims of this process and exits 128+N; later signals only set the flag and the calls finish
-  within their deadlines (the cli arms the trap for the input and config reads only).
+- A signal before the first call (``trap.received`` set when the decision is done, or set while a
+  call thread waits for its lock and before any call started) releases the claims of this process
+  and exits 128+N; once a call has started, signals only set the flag and the calls finish within
+  their deadlines (the cli arms the trap for the input read and config load only and keeps it
+  installed until the output is written).
 - Anything that escapes a call thread is ``record_escaped`` (``unknown``/``killed``, the queue row
   stays claimed). The exception text is never kept.
-- A result that cannot be recorded (``StoreError``, a busy database) is logged only, the claim
-  lapses and ``flush`` resends (a duplicate is possible); the command exits 1 ``internal`` after it
-  has handled every other destination. A result whose claim was lost goes to the log and the
-  output as classified (a queued retry is shown due now: the claimant that took the row sends it).
+- A result that cannot be recorded (``StoreError`` after one retry, or any other exception of the
+  recording) is logged only, the claim lapses and ``flush`` resends (a duplicate is possible); the
+  command exits 1 ``internal`` after it has handled every other destination. A result whose claim
+  was lost goes to the log and the output as classified (a queued retry is shown due now: the
+  claimant that took the row sends it).
 - ``not_started`` (an internal fault) records nothing, is not logged (``outcome`` has no word for
   it) and ends the command with exit 1.
 - Interim seams, owned by later issues and injectable through :class:`Seams`:
@@ -40,6 +43,7 @@ from __future__ import annotations
 
 import math
 import sqlite3
+import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -84,6 +88,7 @@ _RETRY_OFFSETS_S = (60, 300, 1800, 7200)  # after the end of attempt 1, 2, 3 and
 _ATTEMPT_CAP = {"wsl-notice": 3}
 _DEFAULT_ATTEMPT_CAP = 5
 _FAILED = ("failed", "unknown")
+RECORD_RETRY_PAUSE_S = 0.2  # before the one second try to record a result (C-52)
 
 
 @dataclass(frozen=True)
@@ -384,12 +389,13 @@ def _routed(
             sending.append(d)
             continue
         entries[d.name] = _decided_entry(d)
+    decided = list(entries.values())
     if sending and trap.received is not None:  # a signal before the first call
         _release(store, gateway, worst, sending)
+        _log_all(ctx, decided)
         return SendResult(128 + trap.received)
-    for entry in entries.values():
-        ctx.log(entry)
     if all(d.decision == "disabled" for d in decisions):
+        _log_all(ctx, decided)
         doc.update(outcome="no_op", reason="all_disabled", destinations=list(entries.values()))
         result.exit_code = 22
         result.lines = [_line(e) for e in entries.values()]
@@ -397,9 +403,14 @@ def _routed(
     if any(d.decision == "defer" and d.queue_id is not None for d in decisions):
         _advisory(store, gateway, result)
     if sending:
+        gate = _Gate(trap)
         _call_all(
-            gateway, config, store, state, ctx, notice, sending, entries, result, worst, seams
+            gateway, config, store, state, ctx, notice, sending, entries, result, worst, seams, gate
         )
+        if not gate.started and trap.received is not None:  # no call was made: nothing was sent
+            _log_all(ctx, decided)
+            return SendResult(128 + trap.received)
+    _log_all(ctx, decided)  # after the calls: a line waits up to 0.5 s for log.lock
     ordered = [entries[name] for name in names if name in entries]
     doc["destinations"] = ordered
     result.lines = [_line(e) for e in ordered]
@@ -407,6 +418,11 @@ def _routed(
         doc["outcome"] = "partial"
         result.exit_code = 12
     return result
+
+
+def _log_all(ctx: _Context, entries: list[dict[str, Any]]) -> None:
+    for entry in entries:
+        ctx.log(entry)
 
 
 def _release(
@@ -463,6 +479,29 @@ class _Escaped:
     pass
 
 
+@dataclass(frozen=True)
+class _Skipped:
+    """A signal came before any call started: this row's call was not made."""
+
+
+class _Gate:
+    """Shared by the call threads: the first call to start closes the gate for signals. A thread
+    that gets the lock after a signal and before any call started must not start one (the
+    command then ends 128+N: nothing was sent)."""
+
+    def __init__(self, trap: SignalTrap) -> None:
+        self._trap = trap
+        self._lock = threading.Lock()
+        self.started = False
+
+    def begin(self) -> bool:
+        with self._lock:
+            if not self.started and self._trap.received is not None:
+                return False
+            self.started = True
+            return True
+
+
 def _call(
     gateway: Gateway,
     dest: Destination,
@@ -471,11 +510,14 @@ def _call(
     lock_wait: float,
     dedupe: str,
     seams: Seams,
-) -> _Called | _Busy | _Escaped:
+    gate: _Gate,
+) -> _Called | _Busy | _Escaped | _Skipped:
     try:
         with send_lock(gateway, state, dest.name, dest.kind, lock_wait) as held:
             if not held.acquired:
                 return _Busy()
+            if not gate.begin():
+                return _Skipped()
             result = seams.call(
                 gateway,
                 dest,
@@ -486,7 +528,7 @@ def _call(
                 dedupe_key=dedupe,
             )
         return _Called(result)
-    except Exception:  # the text of an exception is never kept
+    except BaseException:  # the text of an exception is never kept; SystemExit included
         return _Escaped()
 
 
@@ -502,15 +544,10 @@ def _call_all(
     result: SendResult,
     worst: float,
     seams: Seams,
+    gate: _Gate,
 ) -> None:
-    decided_hour: int | None = None
-    try:
-        first = sending[0].delivery_id
-        rows = store.read("SELECT ts FROM deliveries WHERE id = ?", (first,))
-        if rows and isinstance(rows[0][0], int):
-            decided_hour = hour_start(rows[0][0])
-    except StoreError:
-        pass
+    decided_at = sending[0].decided_at
+    decided_hour = None if decided_at is None else hour_start(decided_at)
     queued: dict[str, tuple[Destination, QueueRow, str]] = {}
     for d in sending:
         assert d.queue_id is not None and d.delivery_id is not None and d.claim_token is not None
@@ -536,7 +573,7 @@ def _call_all(
     with ThreadPoolExecutor(max_workers=len(queued)) as pool:
         futures = {
             pool.submit(
-                _call, gateway, dest, row, state, config.lock_wait, notice.dedupe, seams
+                _call, gateway, dest, row, state, config.lock_wait, notice.dedupe, seams, gate
             ): name
             for name, (dest, row, _token) in queued.items()
         }
@@ -569,15 +606,69 @@ def _record(
     dest: Destination,
     row: QueueRow,
     token: str,
-    what: _Called | _Busy | _Escaped,
+    what: _Called | _Busy | _Escaped | _Skipped,
     count_hour: int | None,
     entries: dict[str, dict[str, Any]],
     result: SendResult,
 ) -> None:
-    if isinstance(what, _Escaped):
-        applied = None
+    """Record and log one destination's result. Whatever goes wrong here (a ``StoreError``, a
+    failing surfacing seam, anything else) is this destination's problem only: its claim is left
+    to lapse, the result is logged with what the call said, and the other destinations go on."""
+    try:
+        _record_one(gateway, store, ctx, seams, worst, dest, row, token, what, count_hour, entries,
+                    result)  # fmt: skip
+    except Exception:  # the text of an exception is never kept
+        _unrecorded(result)
+        if dest.name not in entries:
+            entry = _fallback_entry(dest, what, gateway)
+            entries[dest.name] = entry
+            ctx.log(entry)
+
+
+def _fallback_entry(
+    dest: Destination, what: _Called | _Busy | _Escaped | _Skipped, gateway: Gateway
+) -> dict[str, Any]:
+    if isinstance(what, (_Called, _Busy)):
         try:
-            held = record_escaped(store, row=row, token=token)
+            oc = (
+                LOCK_BUSY
+                if isinstance(what, _Busy)
+                else classify(what.result, kind=dest.kind, has_dedupe_key=True)
+            )
+            return _unapplied_entry(dest.name, oc, gateway)
+        except Exception:  # classify itself failed: all that is known is that a call was made
+            pass
+    return _entry(dest.name, "unknown", code="killed", attempts=1)
+
+
+def _release_row(store: Store, gateway: Gateway, worst: float, token: str) -> None:
+    with store.write() as conn:
+        release_claims(conn, token, Lease.at(gateway.wall(), worst))
+
+
+def _record_one(
+    gateway: Gateway,
+    store: Store,
+    ctx: _Context,
+    seams: Seams,
+    worst: float,
+    dest: Destination,
+    row: QueueRow,
+    token: str,
+    what: _Called | _Busy | _Escaped | _Skipped,
+    count_hour: int | None,
+    entries: dict[str, dict[str, Any]],
+    result: SendResult,
+) -> None:
+    if isinstance(what, _Skipped):  # no call was made: give the row back, the command is 128+N
+        try:
+            _release_row(store, gateway, worst, token)
+        except StoreError:
+            pass  # the claim lapses by itself
+        return
+    if isinstance(what, _Escaped):
+        try:
+            held = _with_retry(gateway, row, lambda: record_escaped(store, row=row, token=token))
         except StoreError:
             held = None
         entry = _entry(dest.name, "unknown", code="killed", attempts=1)
@@ -593,7 +684,8 @@ def _record(
         if isinstance(what, _Busy)
         else classify(what.result, kind=dest.kind, has_dedupe_key=True)
     )
-    try:
+
+    def write() -> Applied:
         with store.write() as conn:
             lease = Lease.at(gateway.wall(), worst)
             applied = apply_outcome(
@@ -620,6 +712,10 @@ def _record(
                         applied.attempts,
                     ),
                 )
+            return applied
+
+    try:
+        applied = _with_retry(gateway, row, write)
     except StoreError:
         _unrecorded(result)
         entry = _unapplied_entry(dest.name, outcome, gateway)
@@ -638,6 +734,19 @@ def _record(
         entry = _applied_entry(dest.name, applied)
     entries[dest.name] = entry
     ctx.log(entry)
+
+
+def _with_retry[T](gateway: Gateway, row: QueueRow, write: Callable[[], T]) -> T:
+    """Run a recording once more after a short pause when the database was unusable (busy), if
+    the claim has life left for it: the pause is bounded by the claim's remaining life."""
+    try:
+        return write()
+    except StoreError:
+        left = (row.claim_expires or 0) - gateway.wall()
+        if left < 4 * RECORD_RETRY_PAUSE_S:
+            raise
+        gateway.clock.sleep(RECORD_RETRY_PAUSE_S)
+        return write()
 
 
 def _unrecorded(result: SendResult) -> None:

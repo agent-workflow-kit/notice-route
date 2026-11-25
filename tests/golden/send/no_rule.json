@@ -1,0 +1,14 @@
+{
+  "outcome": "no_op",
+  "shape": "notice",
+  "source": "s",
+  "hook": null,
+  "rule": null,
+  "level": null,
+  "reason": "no_rule",
+  "text_excluded": false,
+  "labels_ignored": 0,
+  "destinations": [],
+  "dedupe": null,
+  "duration_ms": 0
+}

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -248,8 +249,120 @@ def test_several_destinations_with_a_partial_failure(rig: Rig) -> None:
 
 
 def test_calls_to_different_destinations_run_in_parallel(rig: Rig) -> None:
-    a, b = rig.notifier("a", sleep=0.8), rig.notifier("b", sleep=0.8)
-    rig.configure({"a": {"notifier": a}, "b": {"notifier": b}})
+    n = rig.notifier(sleep=0.8)
+    rig.configure({"a": {"notifier": n}, "b": {"notifier": n}})
     code, doc, _ = rig.send("hi")
     assert code == 0 and [d["outcome"] for d in doc["destinations"]] == ["sent", "sent"]
-    assert doc["duration_ms"] < 1500  # two sequential calls would take 1.6 s and more
+    order = [r["event"] for r in n.records() if r["event"] in ("invoke", "exit")]
+    assert order == ["invoke", "invoke", "exit", "exit"]  # sequential calls would interleave
+
+
+# --- refusals, retries and the advisory ----------------------------------------------------------
+
+
+LINK_RULE = {
+    "name": "h",
+    "match": {"source": "agent-spawn"},
+    "notify": ["chat"],
+    "level": "warn",
+    "message": "state {{state}}",
+    "link": "{{pr_url}}",
+}
+LINK_BODY = json.dumps(
+    {
+        "tool": "agent-spawn", "hook": "post-state-change", "event_id": 3, "state": "done",
+        "pr": "github.example.com/o/r#7",
+    }
+).encode()  # fmt: skip
+LINKS = {"hosts": {"github.example.com": "github"}}
+
+
+def test_a_refused_link_is_a_queued_retry_that_keeps_the_row_for_the_next_try(rig: Rig) -> None:
+    n = rig.notifier(error={"code": "refused", "reason": "link_scheme"})
+    rig.configure({"chat": {"notifier": n}}, rules=[LINK_RULE], links=LINKS)
+    code, out, _ = rig.run("send", "--stdin-json", "--json", stdin=LINK_BODY)
+    d = only(json.loads(out))
+    assert code == 0 and (d["outcome"], d["reason"], d["code"], d["attempts"]) == (
+        "queued_retry", "link_refused", "link_scheme", 1,
+    )  # fmt: skip
+    assert d["deliver_after"] == NOW + 60
+    ((link, message),) = rig.query("SELECT link, message FROM queue")
+    assert link is None and "https://github.example.com/o/r/pull/7" in message  # the URL is text
+
+
+def test_a_refused_command_keyword_on_ha_notice_is_a_queued_retry(rig: Rig) -> None:
+    n = rig.notifier("ha-notice", error={"code": "refused", "reason": "command_keyword"})
+    rig.configure({"chat": {"notifier": n, "kind": "ha-notice"}})
+    code, doc, _ = rig.send("hello")
+    d = only(doc)
+    assert code == 0 and (d["outcome"], d["reason"], d["code"]) == (
+        "queued_retry", "keyword_refused", "command_keyword",
+    )  # fmt: skip
+    ((message,),) = rig.query("SELECT message FROM queue")
+    assert message == "s: hello"  # the refused message is rewritten with its source
+
+
+def test_a_retry_that_the_schedule_refuses_ends_failed_retries_exhausted(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from notice_route import cli, send
+
+    real = send.run_send
+    seams = send.Seams(retry_schedule=lambda kind, now: lambda attempts: None)
+    monkeypatch.setattr(cli, "run_send", lambda *a, **k: real(*a, **{**k, "seams": seams}))
+    rig.configure({"chat": {"notifier": rig.notifier(error={"code": "rate_limited"})}})
+    code, doc, _ = rig.send("hello")
+    d = only(doc)
+    assert code == 12 and (d["outcome"], d["code"]) == ("failed", "retries_exhausted")
+
+
+def stamp_flush(rig: Rig, value: float | None) -> None:
+    conn = sqlite3.connect(rig.state / "state.db", isolation_level=None)
+    try:
+        if value is None:
+            conn.execute("DELETE FROM meta WHERE key = 'flush_last'")
+        else:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('flush_last', ?)", (value,)
+            )
+    finally:
+        conn.close()
+
+
+def test_the_advisory_is_silent_after_a_recent_flush_and_dropped_by_quiet(rig: Rig) -> None:
+    rig.configure({"chat": {"notifier": rig.notifier(), "quiet": "night"}})
+    _, _, err = rig.send("first", level="warn")
+    assert "no recent flush" in err
+    stamp_flush(rig, NOW - 10)
+    code, _, err = rig.send("second", level="warn")
+    assert code == 0 and err == ""  # a flush started 10 s ago
+    stamp_flush(rig, NOW - 1000)
+    _, _, err = rig.send("third", level="warn")
+    assert "no recent flush" in err
+    _, _, err = rig.send("fourth", level="warn", extra=("--quiet",))
+    assert err == ""
+
+
+def test_a_rule_link_reaches_the_notifier_and_the_queue_row(rig: Rig) -> None:
+    n = rig.notifier()
+    rule = {
+        "name": "h",
+        "match": {"source": "agent-spawn"},
+        "notify": ["now", "later"],
+        "level": "warn",
+        "message": "state {{state}}",
+        "link": "{{pr_url}}",
+    }
+    rig.configure(
+        {"now": {"notifier": n}, "later": {"notifier": n, "quiet": "night"}},
+        rules=[rule],
+        links=LINKS,
+    )
+    code, out, _ = rig.run("send", "--stdin-json", "--json", stdin=LINK_BODY)
+    assert code == 0, out
+    url = "https://github.example.com/o/r/pull/7"
+    assert json.loads(n.events("stdin")[0]["text"])["link"] == url
+    assert rig.query(
+        "SELECT q.link FROM queue q JOIN deliveries d ON d.id = q.delivery_id"
+        " WHERE d.destination = 'later'"
+    ) == [(url,)]

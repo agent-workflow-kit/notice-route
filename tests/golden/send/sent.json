@@ -1,0 +1,25 @@
+{
+  "outcome": "ok",
+  "shape": "notice",
+  "source": "s",
+  "hook": null,
+  "rule": "pt",
+  "level": "warn",
+  "reason": null,
+  "text_excluded": false,
+  "labels_ignored": 0,
+  "destinations": [
+    {
+      "name": "chat",
+      "outcome": "sent",
+      "reason": null,
+      "attempts": 1,
+      "code": null,
+      "count": null,
+      "deliver_after": null,
+      "notifier_outcome": "sent"
+    }
+  ],
+  "dedupe": "79e3557ca6dacbe8916985e69bc63ed198f4ebe1204fd742ef1c21012f0bd6ef",
+  "duration_ms": 0
+}

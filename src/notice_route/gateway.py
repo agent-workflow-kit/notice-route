@@ -682,6 +682,10 @@ class Gateway:
         """The size in bytes of an open file."""
         return os.fstat(file.fileno()).st_size
 
+    def truncate(self, file: io.FileIO, size: int) -> None:
+        """Cut an open file (opened for writing) back to ``size`` bytes."""
+        os.ftruncate(file.fileno(), size)
+
     def rename_in(self, parent: DirHandle, old: str, new: str) -> None:
         """Rename ``old`` to ``new``, both names inside ``parent`` (replaces ``new``)."""
         self._live(parent)
@@ -1109,13 +1113,20 @@ class Gateway:
         This redirects descriptor 1 for the rest of the process, so it is only called after a
         failed stdout write.
         Does nothing when ``sys.stdout`` is not the process's own stream (a test's capture)."""
-        stream = sys.stdout
-        if stream is None or stream is not sys.__stdout__:
+        self._discard(sys.stdout, sys.__stdout__)
+
+    def discard_stderr(self) -> None:
+        """The same for standard error (descriptor 2) after a failed write to it."""
+        self._discard(sys.stderr, sys.__stderr__)
+
+    @staticmethod
+    def _discard(stream: object, own: object) -> None:
+        if stream is None or stream is not own:
             return
         try:
             null = os.open(os.devnull, os.O_WRONLY)
             try:
-                os.dup2(null, stream.fileno())
+                os.dup2(null, stream.fileno())  # type: ignore[attr-defined]
             finally:
                 os.close(null)
         except (OSError, ValueError, AttributeError):

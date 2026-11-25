@@ -19,7 +19,7 @@ import argparse
 import json
 import re
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, NoReturn
 
 from . import __version__
@@ -29,7 +29,7 @@ from .dryrun import dry_run_document
 from .gateway import Gateway, HomeError, Interrupted, StateError
 from .payload import InputFlags, PayloadError, UsageError, load_notification
 from .report import rules_document, validate_document
-from .send import SendOptions, run_send
+from .send import SendOptions, SendResult, run_send
 from .store import StoreError, open_readonly
 from .validate import load_valid_config
 
@@ -305,6 +305,8 @@ def _run_dry_run(args: argparse.Namespace, gateway: Gateway) -> int:
         labels=tuple(args.label),
     )
     is_test = args.command == "test"
+    if not is_test:
+        _audit(args, gateway)  # send --dry-run takes --actor and --decision-id like send
     notification = load_notification(gateway, flags, started, default_stdin=is_test)
     config = load_valid_config(gateway, args.config if is_test else None)
     doc, code = dry_run_document(
@@ -374,23 +376,55 @@ def _run_send(args: argparse.Namespace, gateway: Gateway) -> int:
             return 128 + exc.signum
         finally:
             trap.armed = False
+        # The trap stays installed (a signal only sets a flag) until the output is written, so a
+        # late signal never kills the process before the document is printed.
+        _send_output(args, gateway, result)
+    return result.exit_code
+
+
+def _guarded(gateway: Gateway, stream: str, write: Callable[[], None]) -> None:
+    """One write after the send is done: a failure changes nothing (the exit code is the
+    result's), and the stream is pointed at the null device so its buffered text cannot fail
+    again when the interpreter exits."""
+    try:
+        write()
+    except (OSError, ValueError, _OutputClosed):
+        if stream == "out":
+            gateway.discard_stdout()
+        else:
+            gateway.discard_stderr()
+
+
+def _send_output(args: argparse.Namespace, gateway: Gateway, result: SendResult) -> None:
+    def err(text: str) -> None:
+        _guarded(gateway, "err", lambda: _err(f"{PROG}: {_safe(text)}\n"))
+
     for text in result.warnings:
-        _err(f"{PROG}: warning: {_safe(text)}\n")
+        err(f"warning: {text}")
     if not args.quiet:
         for text in result.advisories:
-            _err(f"{PROG}: {_safe(text)}\n")
+            err(text)
     if args.verbose:
         for text in result.verbose:
-            _err(f"{PROG}: {_safe(text)}\n")
+            err(text)
     if result.error is not None:
-        _error(result.error[0], result.error[1], None, as_json=args.json)
-    elif result.document is not None:
+        code, message = result.error
         if args.json:
-            _json(result.document)
+            envelope = {
+                "error": {"code": code, "message": message, "reason": None, "details": None}
+            }
+            _guarded(gateway, "out", lambda: _json(envelope))
         else:
             for text in result.lines:
-                _err(f"{PROG}: {_safe(text)}\n")
-    return result.exit_code
+                err(text)
+        _guarded(gateway, "err", lambda: _err(f"{PROG}: {code}: {message}\n"))
+    elif result.document is not None:
+        if args.json:
+            document = result.document
+            _guarded(gateway, "out", lambda: _json(document))
+        else:
+            for text in result.lines:
+                err(text)
 
 
 def _refused(exc: PayloadError | UsageError, *, as_json: bool) -> int:

@@ -18,7 +18,9 @@ from notice_route import cli, send
 from notice_route.gateway import SYSTEM_TZ_DIRS, Gateway
 from notice_route.notify import CallResult
 from notice_route.queue import Lease, claim_due
-from notice_route.store import open_store
+from notice_route.report import worst_case_s
+from notice_route.store import StoreError, open_store
+from notice_route.validate import load_valid_config
 from tests.send_support import NOW, Rig, RigClock
 
 _HAVE_ZONES = any((Path(d) / "America" / "New_York").is_file() for d in SYSTEM_TZ_DIRS)
@@ -80,6 +82,179 @@ def test_the_wsl_kind_shares_one_lock_between_destinations(rig: Rig) -> None:
     assert order == ["invoke", "exit", "invoke", "exit"]  # never two calls at once
 
 
+def hold_lock(rig: Rig, name: str = "chat") -> Any:
+    """Take ``locks/<name>.lock`` from the test; returns the open file (close it to release)."""
+    gw = rig.gateway()
+    with gw.open_state_dir() as state, gw.open_private_subdir(state, "locks") as locks:
+        held = gw.open_file(locks, f"{name}.lock", mode="a", create=True)
+    assert gw.try_lock(held, 0)
+    return held
+
+
+def signal_when_claimed(rig: Rig, signum: int, release: Any) -> threading.Thread:
+    """A thread that waits (bounded) for a claimed queue row, sends ``signum`` to this process,
+    gives the signal time to be handled, then calls ``release``."""
+
+    def hit() -> None:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            try:
+                if rig.query("SELECT COUNT(*) FROM queue WHERE claimed_by IS NOT NULL") == [(1,)]:
+                    break
+            except sqlite3.Error:
+                pass
+            time.sleep(0.02)
+        os.kill(os.getpid(), signum)
+        time.sleep(0.3)
+        release()
+
+    thread = threading.Thread(target=hit)
+    thread.start()
+    return thread
+
+
+def test_a_signal_during_the_lock_wait_makes_no_call_and_releases_the_claim(rig: Rig) -> None:
+    n = rig.notifier()
+    rig.configure({"chat": {"notifier": n}}, lock_wait="20s")
+    held = hold_lock(rig)
+    thread = signal_when_claimed(rig, signal.SIGTERM, held.close)
+    try:
+        code, out, err = rig.run(
+            "send", "--stdin-json", "--json", "--source", "s", stdin=b'{"message": "hi"}'
+        )
+    finally:
+        thread.join()
+    assert (code, out, err) == (128 + signal.SIGTERM, "", "")
+    assert n.events("invoke") == []
+    assert rig.query("SELECT outcome, attempts FROM deliveries") == [("sending", 0)]
+    ((owner, expires),) = rig.query("SELECT claimed_by, claim_expires FROM queue")
+    assert owner is not None and expires <= NOW  # released: the next flush may take it
+
+
+def test_a_notifier_call_that_exits_the_thread_is_unknown_and_the_run_goes_on(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def leave(*_a: object, **_k: object) -> CallResult:
+        raise SystemExit(3)
+
+    use_seams(monkeypatch, send.Seams(call=leave))
+    rig.configure({"chat": {"notifier": rig.notifier()}})
+    code, doc, _ = rig.send("hi")
+    d = only(doc)
+    assert code == 12 and (d["outcome"], d["code"], d["attempts"]) == ("unknown", "killed", 1)
+
+
+def test_a_recording_that_raises_is_one_destinations_problem_not_the_runs(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def surface(_conn: sqlite3.Connection, event: send.SurfaceEvent) -> None:
+        raise RuntimeError("SURFACETEXT")
+
+    use_seams(monkeypatch, send.Seams(surface=surface))
+    good = rig.notifier("good")
+    bad = rig.notifier("bad", error={"code": "credential_invalid"})
+    rig.configure({"a": {"notifier": bad}, "b": {"notifier": good}})
+    code, out, err = rig.run("send", "--message", "hi", "--source", "s")
+    assert code == 1 and out == ""
+    assert "a duplicate is possible" in err and "SURFACETEXT" not in err + rig.state_text()
+    assert "notice-route: b: sent" in err and "notice-route: a: failed" in err
+    assert rig.query("SELECT destination, outcome FROM deliveries ORDER BY id") == [
+        ("a", "sending"), ("b", "sent"),
+    ]  # fmt: skip
+    assert sorted((x["destination"], x["outcome"]) for x in rig.log_lines()) == [
+        ("a", "failed"), ("b", "sent"),
+    ]  # fmt: skip
+    assert len(good.events("invoke")) == 1
+
+
+def test_a_result_that_is_recorded_on_the_second_try_after_a_busy_database(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = send.apply_outcome
+    calls: list[int] = []
+
+    def flaky(*a: Any, **k: Any) -> Any:
+        calls.append(1)
+        if len(calls) == 1:
+            raise StoreError("busy")
+        return real(*a, **k)
+
+    monkeypatch.setattr(send, "apply_outcome", flaky)
+    rig.configure({"chat": {"notifier": rig.notifier()}})
+    code, doc, err = rig.send("hi")
+    assert code == 0 and only(doc)["outcome"] == "sent" and err == ""
+    assert len(calls) == 2
+    assert rig.query("SELECT outcome FROM deliveries") == [("sent",)]
+
+
+def test_a_result_that_cannot_be_recorded_after_the_retry_still_exits_1(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[int] = []
+
+    def broken(*_a: Any, **_k: Any) -> Any:
+        calls.append(1)
+        raise StoreError("busy")
+
+    monkeypatch.setattr(send, "apply_outcome", broken)
+    rig.configure({"chat": {"notifier": rig.notifier()}})
+    code, out, err = rig.run("send", "--message", "hi", "--source", "s", "--json")
+    assert code == 1 and len(calls) == 2  # one retry, no more
+    assert rig.query("SELECT COUNT(*) FROM queue WHERE claimed_by IS NOT NULL") == [(1,)]
+
+
+def test_exit_1_wins_over_12_and_the_other_destinations_are_still_handled(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = send.apply_outcome
+
+    def refuse_b(conn: Any, *, row: Any, **k: Any) -> Any:
+        if row.destination == "b":
+            raise StoreError("busy")
+        return real(conn, row=row, **k)
+
+    monkeypatch.setattr(send, "apply_outcome", refuse_b)
+    good = rig.notifier("good")
+    bad = rig.notifier("bad", error={"code": "credential_invalid"})
+    rig.configure({"a": {"notifier": good}, "b": {"notifier": good}, "c": {"notifier": bad}})
+    code, out, err = rig.run("send", "--message", "hi", "--source", "s", "--json")
+    assert code == 1 and json.loads(out)["error"]["code"] == "internal"
+    assert rig.query("SELECT destination, outcome FROM deliveries ORDER BY id") == [
+        ("a", "sent"), ("b", "sending"), ("c", "failed"),
+    ]  # fmt: skip
+    assert sorted((x["destination"], x["outcome"]) for x in rig.log_lines()) == [
+        ("a", "sent"), ("b", "sent"), ("c", "failed"),
+    ]  # fmt: skip
+
+
+def test_the_hourly_count_is_given_back_for_the_hour_that_was_counted(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from notice_route.store import Store
+
+    def no_read(self: Store, *_a: object, **_k: object) -> list[Any]:
+        raise StoreError("internal")  # the hour must not come from a later read
+
+    n = rig.notifier()
+    rig.configure({"chat": {"notifier": n}}, lock_wait="1s")
+    held = hold_lock(rig)
+    monkeypatch.setattr(Store, "read", no_read)
+
+    def cross_the_hour() -> None:
+        time.sleep(0.3)
+        rig.clock.jump_wall(3600)
+
+    thread = threading.Thread(target=cross_the_hour)
+    thread.start()
+    try:
+        code, doc, _ = rig.send("hi")
+    finally:
+        thread.join()
+        held.close()
+    assert code == 0 and only(doc)["reason"] == "lock_busy"
+    assert rig.query("SELECT hour, count FROM rate") == [(NOW - NOW % 3600, 0)]
+
+
 # --- recording faults --------------------------------------------------------------------------
 
 
@@ -92,7 +267,10 @@ def test_a_result_that_cannot_be_recorded_exits_1_and_leaves_the_claim(rig: Rig)
         n.wait_for("invoke")
         conn = sqlite3.connect(db, timeout=0, isolation_level=None)
         conn.execute("BEGIN IMMEDIATE")
-        time.sleep(1.5)
+        log = rig.state / "log.jsonl"
+        deadline = time.monotonic() + 30  # the log line is written once recording gave up
+        while time.monotonic() < deadline and not (log.exists() and log.stat().st_size):
+            time.sleep(0.02)
         conn.execute("ROLLBACK")
         conn.close()
 
@@ -183,6 +361,64 @@ def test_the_interim_schedule_follows_the_interface(kind: str, expected: list[in
     assert got == [None if e is None else 1000 + e for e in expected]
 
 
+def test_a_sender_killed_after_the_decision_and_before_the_call_leaves_a_claimed_row(
+    rig: Rig, home: Path
+) -> None:
+    n = rig.notifier()
+    rig.configure({"chat": {"notifier": n}}, lock_wait="30s")
+    held = hold_lock(rig)  # the call waits for the lock: decided, claimed, not called
+    proc = rig.spawn("send", "--stdin-json", "--json", "--source", "s", stdin=b'{"message": "hi"}')
+    deadline = time.monotonic() + 30
+    claimed: list[tuple[Any, ...]] = []
+    while time.monotonic() < deadline and not claimed:
+        try:
+            claimed = rig.query("SELECT claim_expires FROM queue WHERE claimed_by IS NOT NULL")
+        except sqlite3.Error:
+            pass
+        time.sleep(0.02)
+    assert claimed
+    proc.kill()  # the exact handle this test started
+    proc.communicate(timeout=10)
+    held.close()
+    assert n.events("invoke") == []
+    assert rig.query("SELECT outcome, attempts FROM deliveries") == [("sending", 0)]
+    ((expires,),) = claimed
+    gw = Gateway(passwd_home=lambda: str(home))
+    with open_store(gw) as store, store.write() as conn:
+        assert claim_due(conn, "chat", Lease(expires - 1, 60), "t1") == []  # still claimed
+        assert len(claim_due(conn, "chat", Lease(expires + 1, 60), "t2")) == 1  # due after it
+
+
+def test_a_claim_lost_during_the_call_is_logged_and_shown_as_classified(rig: Rig) -> None:
+    n = rig.notifier(sleep=0.5, error={"code": "rate_limited"})
+    rig.configure({"chat": {"notifier": n}})
+
+    def steal() -> None:
+        n.wait_for("invoke")
+        conn = sqlite3.connect(rig.state / "state.db", isolation_level=None)
+        conn.execute("UPDATE queue SET claimed_by = 'another-process'")
+        conn.close()
+
+    thread = threading.Thread(target=steal)
+    thread.start()
+    try:
+        code, doc, err = rig.send("hi")
+    finally:
+        thread.join()
+    d = only(doc)
+    assert code == 0 and (d["outcome"], d["code"], d["attempts"]) == (
+        "queued_retry",
+        "rate_limited",
+        1,
+    )
+    assert d["deliver_after"] == NOW  # shown due now: the claimant that took the row sends it
+    assert "the claim was lost" in err
+    assert rig.query("SELECT outcome, attempts FROM deliveries") == [("sending", 0)]
+    assert [(x["outcome"], x["code"]) for x in rig.log_lines()] == [
+        ("queued_retry", "rate_limited")
+    ]
+
+
 # --- time --------------------------------------------------------------------------------------
 
 
@@ -215,8 +451,20 @@ def test_a_call_past_its_deadline_is_killed_and_unknown(rig: Rig) -> None:
     code, doc, _ = rig.send("hi")
     d = only(doc)
     assert code == 12 and (d["outcome"], d["code"]) == ("unknown", "killed")
-    assert time.monotonic() - started < 8
+    assert doc["duration_ms"] >= 11_000  # the deadline (timeout plus 10 s) passed on the clock
+    assert time.monotonic() - started < 30  # generous: only a hung run fails this
     assert rig.query("SELECT COUNT(*) FROM queue") == [(0,)]
+
+
+def test_a_hung_call_with_the_default_settings_ends_within_the_worst_case(rig: Rig) -> None:
+    rig.clock = RigClock(rate=30.0)
+    n = rig.notifier(hang=True, max_seconds=60)
+    rig.configure({"chat": {"notifier": n}})
+    config = load_valid_config(rig.gateway(), None)
+    assert config is not None
+    code, doc, _ = rig.send("hi")
+    assert code == 12 and only(doc)["code"] == "killed"
+    assert 20_000 <= doc["duration_ms"] <= worst_case_s(config) * 1000  # default timeout 10 s
 
 
 def test_a_descendant_that_left_the_group_cannot_hold_the_router(rig: Rig) -> None:
@@ -226,22 +474,26 @@ def test_a_descendant_that_left_the_group_cannot_hold_the_router(rig: Rig) -> No
     started = time.monotonic()
     code, doc, _ = rig.send("hi")
     assert code == 0 and only(doc)["outcome"] == "sent"
-    assert time.monotonic() - started < 6
+    assert doc["duration_ms"] < 8_000  # the grandchild lives 8 s of real time: not waited for
+    assert time.monotonic() - started < 30
 
 
 # --- signals -----------------------------------------------------------------------------------
 
 
-def test_a_signal_after_the_decision_and_before_the_call_releases_the_claims(rig: Rig) -> None:
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGINT, signal.SIGHUP])
+def test_a_signal_after_the_decision_and_before_the_call_releases_the_claims(
+    rig: Rig, signum: int
+) -> None:
     n = rig.notifier()
-    rig.configure({"chat": {"notifier": n}})
+    rig.configure({"chat": {"notifier": n}, "late": {"notifier": n, "quiet": "night"}})
 
     class Signalling(Gateway):
         def new_token(self) -> str:  # called inside the decision transaction
-            os.kill(os.getpid(), signal.SIGTERM)
+            os.kill(os.getpid(), signum)
             return super().new_token()
 
-    base = rig.gateway(b'{"message": "hi"}')
+    base = rig.gateway(b'{"message": "hi", "level": "warn"}')
     gw = Signalling(
         passwd_home=base.passwd_home,
         clock=rig.clock,
@@ -250,11 +502,16 @@ def test_a_signal_after_the_decision_and_before_the_call_releases_the_claims(rig
         environ=base.environ,
     )
     code, out, err = rig.run("send", "--stdin-json", "--json", "--source", "s", gateway=gw)
-    assert (code, out, err) == (128 + signal.SIGTERM, "", "")
+    assert (code, out, err) == (128 + signum, "", "")
     assert n.events("invoke") == []
-    assert rig.query("SELECT outcome FROM deliveries") == [("sending",)]
-    ((owner, expires),) = rig.query("SELECT claimed_by, claim_expires FROM queue")
+    assert rig.query("SELECT destination, outcome FROM deliveries ORDER BY id") == [
+        ("chat", "sending"), ("late", "deferred"),
+    ]  # fmt: skip
+    ((owner, expires),) = rig.query(
+        "SELECT claimed_by, claim_expires FROM queue WHERE claimed_by IS NOT NULL"
+    )
     assert owner is not None and expires <= NOW  # released: the next flush may take it
+    assert [(x["destination"], x["outcome"]) for x in rig.log_lines()] == [("late", "deferred")]
 
 
 def test_a_signal_while_reading_input_exits_128_plus_n_and_writes_nothing(
