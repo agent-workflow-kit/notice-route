@@ -32,12 +32,11 @@ A dedup or event-id record of an evicted delivery is deleted with it, in the sam
 (:func:`notice_route.dedup.release`, #17).
 TODO(#27): an ``overflow`` eviction is surfaced once per destination per UTC hour (the caller
 gets the evicted rows back and inserts the ``surfaced`` row in the same transaction).
-TODO(#23): flush step 4 and the prune of #26 (expire unclaimed rows 24 hours old or more, never a
-row with an unexpired claim) and the digest and step-5 helpers must reuse this module's lease
-predicate (``_UNCLAIMED``) through a public helper, never a second copy of it. Also:
-release_claims takes one token, so a caller holding several needs one release per token or one
-per-process token.
-TODO(#26): ``prune`` expires unclaimed queue rows through that same public helper.
+Public helpers over the one lease predicate (``_UNCLAIMED``), for ``flush`` (#23) and ``prune``
+(#26): :func:`due_rows`, :func:`claim_row`, :func:`count_due`, :func:`expire_unclaimed`,
+:func:`drop_unclaimed` and :func:`postpone_unclaimed`. No caller needs its own copy of the
+predicate. ``release_claims`` takes one token (``flush`` claims one row per call, each with its own).
+TODO(#26): ``prune`` expires unclaimed queue rows through :func:`expire_unclaimed`.
 The outcome of a sent, failed or retried row is written to its ``deliveries`` row in the
 transaction that calls :func:`complete_row` or :func:`requeue_row`
 (:mod:`notice_route.outcome`, #20).
@@ -58,19 +57,27 @@ from .window import window_end
 __all__ = [
     "LEASE_FACTOR",
     "MAX_INSTANT",
+    "EXPIRY_S",
     "QUEUE_CAP",
     "Change",
     "Enqueued",
     "Evicted",
+    "Expired",
     "Lease",
     "QueueRow",
     "Released",
     "claim_due",
+    "claim_row",
     "complete_row",
+    "count_due",
+    "drop_unclaimed",
+    "due_rows",
     "enforce_cap",
     "enqueue",
+    "expire_unclaimed",
     "get_row",
     "insert_delivery",
+    "postpone_unclaimed",
     "quiet_deliver_after",
     "release_claims",
     "requeue_row",
@@ -78,6 +85,7 @@ __all__ = [
 ]
 
 QUEUE_CAP = 100  # unclaimed rows per destination
+EXPIRY_S = 86400  # an unclaimed row this old or older ends ``expired``
 LEASE_FACTOR = 2  # a lease is this many times ``send_worst_case_s``
 MAX_INSTANT = 1 << 40  # |epoch seconds| bound: far past year 9999, far from an int64 overflow
 _MAX_WORST_CASE_S = 1 << 20
@@ -184,6 +192,17 @@ class QueueRow:
 @dataclass(frozen=True)
 class Evicted:
     """A row dropped for overflow (its ``deliveries`` row is already updated)."""
+
+    queue_id: int
+    delivery_id: int
+    destination: str
+    kind: str
+    level: str
+
+
+@dataclass(frozen=True)
+class Expired:
+    """A row that ended ``expired`` (its ``deliveries`` row is already updated)."""
 
     queue_id: int
     delivery_id: int
@@ -563,3 +582,135 @@ def quiet_deliver_after(window: QuietWindow, wall: float) -> int:
     if end is None:
         raise RuntimeError("quiet window has no end within two days")
     return end
+
+
+# --- the helpers of flush (#23) and prune (#26) ----------------------------------------------
+
+
+def due_rows(
+    conn: _Conn,
+    destination: str,
+    lease: Lease,
+    *,
+    kind: Kind | None = None,
+    limit: int | None = None,
+) -> list[QueueRow]:
+    """The due rows of ``destination`` (unclaimed, a lapsed claim included, ``deliver_after``
+    passed), lowest id first, optionally one ``kind`` and at most ``limit``. Changes nothing."""
+    if kind is not None and kind not in _KINDS:
+        raise ValueError("kind must be held or single")
+    if limit is not None and (type(limit) is not int or not 1 <= limit < (1 << 63)):
+        raise ValueError("limit must be a positive integer within int64")
+    ids = conn.execute(
+        _SELECT_DUE,
+        (
+            destination,
+            lease.now,
+            lease.now,
+            lease.expires,
+            kind,
+            kind,
+            -1 if limit is None else limit,
+        ),
+    ).fetchall()
+    rows: list[QueueRow] = []
+    for (row_id,) in ids:
+        row = get_row(conn, row_id)
+        assert row is not None
+        rows.append(row)
+    return rows
+
+
+def count_due(conn: _Conn, destination: str, lease: Lease) -> dict[str, int]:
+    """Due rows of ``destination`` by kind (``single`` and ``held``)."""
+    counts = {"single": 0, "held": 0}
+    for kind in counts:
+        found = conn.execute(
+            "SELECT COUNT(*)"
+            + _FROM
+            + " WHERE d.destination = ? AND q.deliver_after <= ? AND "
+            + _UNCLAIMED
+            + " AND q.kind = ?",
+            (destination, lease.now, lease.now, lease.expires, kind),
+        ).fetchone()
+        counts[kind] = int(found[0])
+    return counts
+
+
+def claim_row(conn: _Conn, row_id: int, lease: Lease, token: str) -> QueueRow | None:
+    """Claim one unclaimed row for ``token`` (a lapsed claim is taken over; a fresh token fences
+    the claimant before it). ``None`` when the row is missing or its claim is live."""
+    _token(token)
+    cur = conn.execute(
+        "UPDATE queue AS q SET claimed_by = ?, claim_expires = ? WHERE q.id = ? AND " + _UNCLAIMED,
+        (token, lease.expires, _id(row_id, "row_id"), lease.now, lease.expires),
+    )
+    return get_row(conn, row_id) if cur.rowcount == 1 else None
+
+
+def expire_unclaimed(
+    conn: _Conn, lease: Lease, *, destination: str | None = None, max_age: int = EXPIRY_S
+) -> tuple[Expired, ...]:
+    """End every unclaimed row (of ``destination``, or of all) created ``max_age`` seconds ago
+    or earlier: the queue row is deleted and its delivery becomes ``expired``, code ``expired``
+    (the stored reason stays), ``deliver_after`` cleared, dedup records released. A row with a
+    live claim is never touched. Oldest (lowest id) first. TODO(#27): the caller surfaces them."""
+    _int(max_age, "max_age")
+    found = conn.execute(
+        "SELECT q.id, q.delivery_id, d.destination, q.kind, q.level"
+        + _FROM
+        + " WHERE d.destination IS NOT NULL AND (? IS NULL OR d.destination = ?)"
+        + " AND q.created_at <= ? AND "
+        + _UNCLAIMED
+        + " ORDER BY q.id",
+        (destination, destination, lease.now - max_age, lease.now, lease.expires),
+    ).fetchall()
+    out: list[Expired] = []
+    for queue_id, delivery_id, dest, kind, level in found:
+        conn.execute("DELETE FROM queue WHERE id = ?", (queue_id,))
+        conn.execute(
+            "UPDATE deliveries SET outcome = 'expired', code = 'expired', deliver_after = NULL"
+            " WHERE id = ?",
+            (delivery_id,),
+        )
+        dedup.release(conn, delivery_id)
+        out.append(Expired(queue_id, delivery_id, dest, kind, level))
+    return tuple(out)
+
+
+def drop_unclaimed(conn: _Conn, row_id: int, lease: Lease, *, reason: str) -> bool:
+    """End an unclaimed row ``dropped`` with ``reason`` (``flush`` step 5: a due ``info`` row in
+    quiet hours). ``False`` and nothing changed when the row is gone or claimed."""
+    row = _unclaimed_delivery(conn, row_id, lease)
+    if row is None:
+        return False
+    conn.execute("DELETE FROM queue WHERE id = ?", (row_id,))
+    conn.execute(
+        "UPDATE deliveries SET outcome = 'dropped', reason = ?, code = NULL, deliver_after = NULL"
+        " WHERE id = ?",
+        (reason, row),
+    )
+    dedup.release(conn, row)
+    return True
+
+
+def postpone_unclaimed(conn: _Conn, row_id: int, lease: Lease, deliver_after: int) -> bool:
+    """Set ``deliver_after`` of an unclaimed row (``flush`` step 5: the window's end), keeping
+    its kind and its stored reason. ``False`` when the row is gone or claimed."""
+    _int(deliver_after, "deliver_after")
+    delivery_id = _unclaimed_delivery(conn, row_id, lease)
+    if delivery_id is None:
+        return False
+    conn.execute("UPDATE queue SET deliver_after = ? WHERE id = ?", (deliver_after, row_id))
+    conn.execute(
+        "UPDATE deliveries SET deliver_after = ? WHERE id = ?", (deliver_after, delivery_id)
+    )
+    return True
+
+
+def _unclaimed_delivery(conn: _Conn, row_id: int, lease: Lease) -> int | None:
+    found = conn.execute(
+        "SELECT q.delivery_id FROM queue q WHERE q.id = ? AND " + _UNCLAIMED,
+        (_id(row_id, "row_id"), lease.now, lease.expires),
+    ).fetchone()
+    return None if found is None else int(found[0])
