@@ -965,3 +965,11 @@ def test_a_normal_open_leaves_the_full_busy_timeout_set(home: Path) -> None:
     with open_store(gw, busy_timeout=0.5) as store:
         assert store is not None
         assert pragma(store.conn, "busy_timeout") == 500
+
+
+def test_a_tiny_busy_timeout_stays_nonzero_after_open(gw: Gateway) -> None:
+    with open_store(gw, busy_timeout=0.0004) as store:
+        assert store is not None
+        value = pragma(store.conn, "busy_timeout")
+        assert isinstance(value, int)
+        assert value >= 1

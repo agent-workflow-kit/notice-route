@@ -258,7 +258,7 @@ def _open(
             return None
         _check_tables(conn)
         conn.execute("PRAGMA query_only=ON")
-        conn.execute(f"PRAGMA busy_timeout={round(busy_timeout * 1000)}")
+        conn.execute(f"PRAGMA busy_timeout={max(1, round(busy_timeout * 1000))}")
     except sqlite3.Error as exc:
         conn.close()
         raise _fail(exc) from None
