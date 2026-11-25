@@ -173,11 +173,11 @@ def test_env_file_owner_must_be_the_user(
     assert gw.check_env_file(str(target)) is False
 
 
-def test_env_file_is_never_read(gw: Gateway, base: Path) -> None:
-    target = _env_file(base / "env")
-    before = target.stat().st_atime_ns
+def test_env_file_is_never_read(gw: Gateway, base: Path, opened_names: list[str]) -> None:
+    target = _env_file(base / "never_read.env")
+    del opened_names[:]  # creating the file opened it
     assert gw.check_env_file(str(target)) is True
-    assert target.stat().st_atime_ns == before
+    assert not [n for n in opened_names if os.path.basename(n) == "never_read.env"]
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
 
 
@@ -191,14 +191,15 @@ def _state_dir(home: Path) -> Path:
 def _db(home: Path) -> sqlite3.Connection:
     path = _state_dir(home) / "state.db"
     conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(
         """
-        CREATE TABLE meta (key TEXT PRIMARY KEY, value REAL);
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value);
         CREATE TABLE deliveries (id INTEGER PRIMARY KEY AUTOINCREMENT, destination TEXT);
         CREATE TABLE queue (id INTEGER PRIMARY KEY AUTOINCREMENT, delivery_id INTEGER);
         CREATE TABLE surfaced (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, destination TEXT, code TEXT, period TEXT,
-            delivery_id INTEGER, processed INTEGER DEFAULT 0
+            destination TEXT, code TEXT, period TEXT, delivery_id INTEGER,
+            processed INTEGER DEFAULT 0
         );
         """
     )
@@ -272,7 +273,77 @@ def test_the_database_is_opened_read_only(home: Path) -> None:
     before = (db.read_bytes(), db.stat().st_mtime_ns)
     _state_gateway(home).read_state()
     assert (db.read_bytes(), db.stat().st_mtime_ns) == before
-    assert sorted(p.name for p in db.parent.iterdir()) == ["state.db"]
+    assert sorted(p.name for p in db.parent.iterdir()) == ["state.db"]  # no -wal, no -shm
+
+
+def test_reading_a_wal_database_creates_no_files(home: Path) -> None:
+    _db(home).close()
+    directory = home / ".local" / "state" / "notice-route"
+    before = sorted(p.name for p in directory.iterdir())
+    assert before == ["state.db"]
+    _state_gateway(home).read_state()
+    assert sorted(p.name for p in directory.iterdir()) == before
+
+
+def test_a_live_wal_is_read_including_uncheckpointed_rows(home: Path) -> None:
+    conn = _db(home)
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    conn.execute("INSERT INTO meta VALUES ('flush_last', ?)", (NOW - 5,))
+    conn.commit()
+    try:
+        assert (home / ".local/state/notice-route/state.db-wal").exists()
+        assert _state_gateway(home).read_state().flush_last == NOW - 5
+    finally:
+        conn.close()
+
+
+def test_a_database_path_with_uri_characters_is_read(tmp_path: Path) -> None:
+    odd = tmp_path / "h%?#" / "home"
+    odd.mkdir(parents=True)
+    _db(odd).close()
+    assert _state_gateway(odd).read_state().exists is True
+
+
+@pytest.mark.parametrize(("stored", "expected"), [("1699999900", NOW - 100), ("1e3", 1000.0)])
+def test_numeric_text_meta_values_are_numbers(home: Path, stored: str, expected: float) -> None:
+    conn = _db(home)
+    conn.execute("INSERT INTO meta VALUES ('flush_last', ?)", (stored,))
+    conn.commit()
+    conn.close()
+    assert _state_gateway(home).read_state().flush_last == expected
+
+
+@pytest.mark.parametrize("stored", ["abc", "nan", "inf", "-inf", ""])
+def test_non_numeric_text_meta_values_are_none(home: Path, stored: str) -> None:
+    conn = _db(home)
+    conn.execute("INSERT INTO meta VALUES ('flush_last', ?)", (stored,))
+    conn.commit()
+    conn.close()
+    assert _state_gateway(home).read_state().flush_last is None
+
+
+def test_surfaced_needs_no_id_column_and_keeps_insertion_order(home: Path) -> None:
+    conn = _db(home)
+    conn.executemany(
+        "INSERT INTO surfaced (destination, code, period) VALUES ('d', ?, '2023-11-14')",
+        [("zeta",), ("alpha",)],
+    )
+    conn.commit()
+    conn.close()
+    assert _state_gateway(home).read_state().surfaced_today == {"d": ("zeta", "alpha")}
+
+
+@pytest.mark.parametrize("mode", [0o755, 0o750, 0o705, 0o710, 0o701])
+def test_a_state_directory_with_group_or_world_access_is_a_state_error(
+    home: Path, mode: int
+) -> None:
+    _db(home).close()
+    _state_dir(home).chmod(mode)
+    try:
+        with pytest.raises(StateError):
+            _state_gateway(home).read_state()
+    finally:
+        _state_dir(home).chmod(0o700)
 
 
 def test_a_corrupt_database_is_a_state_error(home: Path) -> None:

@@ -1,12 +1,48 @@
 from __future__ import annotations
 
+import builtins
+import io
+import os
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from notice_route.gateway import DirHandle, Gateway
 from tests.fakes import Notifier, build_notifier
+
+
+@pytest.fixture
+def opened_names(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Every file name opened through ``open``, ``io.open``, ``os.open`` (also the ``Path``
+    read and open methods, which call ``io.open``) and ``Gateway.open_file`` while the test runs.
+    ``lstat`` and ``stat`` are not recorded. A name is the path as given (maybe relative to a
+    directory descriptor), so tests compare base names."""
+    seen: list[str] = []
+
+    def record(target: object) -> None:
+        if isinstance(target, (str, bytes, os.PathLike)):
+            seen.append(os.fsdecode(target))
+
+    def wrap(original: Callable[..., Any]) -> Callable[..., Any]:
+        def inner(target: object, *args: Any, **kwargs: Any) -> Any:
+            record(target)
+            return original(target, *args, **kwargs)
+
+        return inner
+
+    monkeypatch.setattr(builtins, "open", wrap(builtins.open))
+    monkeypatch.setattr(io, "open", wrap(io.open))
+    monkeypatch.setattr(os, "open", wrap(os.open))
+    original_open_file = Gateway.open_file
+
+    def open_file(self: Gateway, parent: DirHandle, name: str, **kwargs: Any) -> Any:
+        record(name)
+        return original_open_file(self, parent, name, **kwargs)
+
+    monkeypatch.setattr(Gateway, "open_file", open_file)
+    return seen
 
 
 @pytest.fixture

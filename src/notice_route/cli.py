@@ -75,9 +75,16 @@ def build_parser() -> argparse.ArgumentParser:
 # --- output ----------------------------------------------------------------------------------
 
 
+class _OutputClosed(Exception):
+    """Standard output cannot be written (a closed pipe); nothing more is written to it."""
+
+
 def _out(text: str) -> None:
-    sys.stdout.write(text)
-    sys.stdout.flush()
+    try:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    except OSError:
+        raise _OutputClosed from None
 
 
 def _err(text: str) -> None:
@@ -195,6 +202,17 @@ def _run_validate(args: argparse.Namespace, gateway: Gateway) -> int:
 
 
 def main(argv: Sequence[str] | None = None, gateway: Gateway | None = None) -> int:
+    try:
+        return _main(argv, gateway)
+    except _OutputClosed:
+        try:
+            _err(f"{PROG}: internal: cannot write to standard output\n")
+        except OSError:
+            pass
+        return EXIT_INTERNAL
+
+
+def _main(argv: Sequence[str] | None, gateway: Gateway | None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command is None:
@@ -216,6 +234,8 @@ def main(argv: Sequence[str] | None = None, gateway: Gateway | None = None) -> i
     except StateError:
         _error("internal", "state database cannot be read", None, as_json=args.json)
         return EXIT_INTERNAL
+    except _OutputClosed:
+        raise
     except Exception:  # an unexpected failure: a fixed message, never its text
         _error("internal", "internal error", None, as_json=args.json)
         return EXIT_INTERNAL

@@ -26,6 +26,7 @@ Choices where the interface is silent (the narrower reading):
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from typing import Any
 
 from .gateway import Gateway
@@ -135,18 +136,34 @@ def _covers(earlier: Match, later: Match) -> bool:
     return earlier.level_min is None or earlier.level_min == later.level_min
 
 
-def _may_route_alert(rule: Rule) -> bool:
-    match = rule.match
-    if rule.drop or match.level_min is not None or match.repo is not None:
-        return False
-    if match.source is not None and not _covers_text(match.source, "notice-route"):
-        return False
-    return match.hook is None or _covers_text(match.hook, "post-fail")
+def _alert_routed(rules: Sequence[Rule]) -> bool:
+    """Whether a post-fail alert (source ``notice-route``, hook ``post-fail``) may be routed.
+
+    Rules are walked in order, as the router does (the first match wins). A rule that cannot
+    match the sample is skipped. A rule that certainly matches it (only ``source`` and ``hook``
+    conditions, or none) ends the walk: routed if it notifies, not routed if it drops. A rule
+    that might match (``labels`` or ``where``) counts as routing when it notifies and is skipped
+    when it drops. ``level_min`` and ``repo`` rules never count as routing and never end the walk.
+    """
+    for rule in rules:
+        match = rule.match
+        if match.source is not None and not _covers_text(match.source, "notice-route"):
+            continue
+        if match.hook is not None and not _covers_text(match.hook, "post-fail"):
+            continue
+        if match.level_min is not None or match.repo is not None:
+            continue
+        if match.labels or match.where:
+            if not rule.drop:
+                return True
+            continue
+        return not rule.drop
+    return False
 
 
 def worst_case_s(config: Config) -> float:
     longest = max((d.timeout for d in config.destinations.values()), default=0.0)
-    return config.lock_wait + longest + _WORST_CASE_EXTRA
+    return round(config.lock_wait + longest + _WORST_CASE_EXTRA, 3)
 
 
 def _warning(
@@ -158,7 +175,7 @@ def _warning(
 def _warnings(
     config: Config,
     worst: float,
-    flush_age: float | None,
+    flush_age: int | None,
     env_missing: bool,
     env_file_ok: bool,
     orphans: dict[str, int],
@@ -206,7 +223,7 @@ def _warnings(
         out.append(
             _warning("env_file_unsafe", "cron.env_file is missing or fails the safety check")
         )
-    if not config.hooks_post_fail and not any(_may_route_alert(r) for r in config.rules):
+    if not config.hooks_post_fail and not _alert_routed(config.rules):
         out.append(
             _warning(
                 "alert_unrouted", "no rule routes a post-fail alert and no post-fail hook exists"
@@ -243,9 +260,9 @@ def validate_document(config: Config | None, gateway: Gateway) -> tuple[dict[str
         return doc, 22
     state = gateway.read_state()
     environ = gateway.environ()
-    flush_age: float | None = None
+    flush_age: int | None = None  # whole seconds: the printed value is the one compared
     if state.flush_last is not None:
-        flush_age = max(0.0, gateway.wall() - state.flush_last)
+        flush_age = int(max(0.0, gateway.wall() - state.flush_last))
     destinations: list[dict[str, Any]] = []
     for d in config.destinations.values():
         destinations.append(
@@ -273,6 +290,6 @@ def validate_document(config: Config | None, gateway: Gateway) -> tuple[dict[str
             dict(state.queue_by_destination),
         ),
         "send_worst_case_s": _number(worst),
-        "flush_age_s": None if flush_age is None else int(flush_age),
+        "flush_age_s": flush_age,
     }
     return doc, 12 if failed else 0

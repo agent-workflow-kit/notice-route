@@ -480,12 +480,16 @@ def test_validate_with_a_config_without_destinations_is_ok(
 
 
 def test_validate_runs_no_command_and_writes_nothing(
-    home: Path, tmp_path: Path, gw: Gateway, capsys: pytest.CaptureFixture[str]
+    home: Path,
+    tmp_path: Path,
+    gw: Gateway,
+    capsys: pytest.CaptureFixture[str],
+    opened_names: list[str],
 ) -> None:
     marker = tmp_path / "ran"
     exe = Path(make_exe(tmp_path, "spy"))
     exe.write_text(f"#!/bin/sh\ntouch {marker}\n")
-    env_file = tmp_path / "cron.env"
+    env_file = tmp_path / "never_read.env"
     env_file.write_text("NAME=value\n")
     env_file.chmod(0o600)
     config = base_config(tmp_path)
@@ -502,11 +506,12 @@ def test_validate_runs_no_command_and_writes_nothing(
                 out[str(p)] = (st.st_mtime_ns, st.st_mode, p.read_bytes())
         return out
 
-    before = snapshot()  # reads every file, so the access time is taken after it
-    env_atime = env_file.stat().st_atime_ns
+    before = snapshot()
+    del opened_names[:]  # only what validate opens counts
     code, _ = run_json(capsys, gw, "validate")
     assert code == 0
-    assert env_file.stat().st_atime_ns == env_atime
+    assert opened_names  # the recorder sees the config and the state database
+    assert not [n for n in opened_names if os.path.basename(n) == "never_read.env"]
     assert snapshot() == before
     assert not marker.exists()
 
@@ -600,6 +605,9 @@ def test_rules_never_reads_state(
 # --- warnings --------------------------------------------------------------------------------
 
 
+EMITTED_CODES: set[str] = set()  # every warning code a warning test actually saw
+
+
 def codes(doc: dict[str, Any]) -> list[str]:
     return [w["code"] for w in doc["warnings"]]
 
@@ -621,6 +629,7 @@ def validate_with(
     code, doc = run_json(capsys, gw, "validate")
     assert code in (0, 12)
     assert schema_errors(doc, "validate.json") == []
+    EMITTED_CODES.update(codes(doc))
     return doc
 
 
@@ -731,6 +740,18 @@ def test_rule_unreachable_table(
     assert ("rule_unreachable" in codes(doc)) is unreachable
 
 
+def test_worst_case_has_no_float_noise(
+    home: Path, tmp_path: Path, gw: Gateway, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def odd(config: dict[str, Any]) -> None:
+        config["lock_wait"] = "3.001s"
+        config["destinations"]["chat"]["timeout"] = "10s"
+
+    doc = validate_with(home, tmp_path, gw, capsys, odd)
+    assert doc["send_worst_case_s"] == 30.001
+    assert "30.001\n" in run(capsys, gw, "validate")[1]
+
+
 def test_worst_case_over_hook_timeout(
     home: Path, tmp_path: Path, gw: Gateway, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -757,20 +778,30 @@ def test_worst_case_over_hook_timeout(
 
 
 @pytest.mark.parametrize(
-    ("age", "stale"), [(None, True), (10, False), (300, False), (301, True), (-50, False)]
+    ("age", "stale"),
+    [
+        (None, True),
+        (10, False),
+        (300, False),
+        (300.5, False),
+        (301, True),
+        (301.5, True),
+        (-50, False),
+    ],
 )
 def test_flush_stale(
     home: Path,
     tmp_path: Path,
     gw: Gateway,
     capsys: pytest.CaptureFixture[str],
-    age: int | None,
+    age: float | None,
     stale: bool,
 ) -> None:
     flush_last = None if age is None else NOW - age
     doc = validate_with(home, tmp_path, gw, capsys, state={"flush_last": flush_last})
     assert ("flush_stale" in codes(doc)) is stale
-    assert doc["flush_age_s"] == (None if age is None else max(0, age))
+    assert doc["flush_age_s"] == (None if age is None else int(max(0, age)))
+    assert ("flush_stale" in codes(doc)) is (stale if age is None else doc["flush_age_s"] > 300)
 
 
 def test_flush_env_missing(
@@ -862,6 +893,76 @@ def test_alert_unrouted(
         )
 
     assert "alert_unrouted" not in codes(validate_with(home, tmp_path, gw, capsys, prefix_hook))
+
+    alerts = {
+        "name": "alerts",
+        "match": {"source": "notice-route"},
+        "notify": ["chat"],
+        "level": "error",
+        "message": "m",
+    }
+    catch_all = {"name": "all", "match": {}, "notify": ["chat"], "level": "error", "message": "m"}
+
+    def first_drops_source(config: dict[str, Any]) -> None:
+        no_hook(config)
+        config["rules"] += [{"name": "quiet", "match": {"source": "notice-route"}, "drop": True}]
+        config["rules"].append(catch_all)
+
+    assert "alert_unrouted" in codes(validate_with(home, tmp_path, gw, capsys, first_drops_source))
+
+    def first_drops_prefix(config: dict[str, Any]) -> None:
+        no_hook(config)
+        config["rules"] += [{"name": "quiet", "match": {"source": "notice-*"}, "drop": True}]
+        config["rules"].append(catch_all)
+
+    assert "alert_unrouted" in codes(validate_with(home, tmp_path, gw, capsys, first_drops_prefix))
+
+    def first_drops_everything(config: dict[str, Any]) -> None:
+        no_hook(config)
+        config["rules"] += [{"name": "quiet", "match": {}, "drop": True}, alerts]
+
+    assert "alert_unrouted" in codes(
+        validate_with(home, tmp_path, gw, capsys, first_drops_everything)
+    )
+
+    def drops_other_source(config: dict[str, Any]) -> None:
+        no_hook(config)
+        config["rules"] += [{"name": "quiet", "match": {"source": "other"}, "drop": True}, alerts]
+
+    assert "alert_unrouted" not in codes(
+        validate_with(home, tmp_path, gw, capsys, drops_other_source)
+    )
+
+    def drops_other_hook(config: dict[str, Any]) -> None:
+        no_hook(config)
+        config["rules"] += [
+            {"name": "quiet", "match": {"hook": "post-merge"}, "drop": True},
+            alerts,
+        ]
+
+    assert "alert_unrouted" not in codes(
+        validate_with(home, tmp_path, gw, capsys, drops_other_hook)
+    )
+
+    def drop_after_route(config: dict[str, Any]) -> None:
+        no_hook(config)
+        config["rules"] += [alerts, {"name": "quiet", "match": {}, "drop": True}]
+
+    assert "alert_unrouted" not in codes(
+        validate_with(home, tmp_path, gw, capsys, drop_after_route)
+    )
+
+    def conditional_drop_first(config: dict[str, Any]) -> None:
+        no_hook(config)
+        config["rules"] += [
+            {"name": "quiet", "match": {"labels": ["a=b"]}, "drop": True},
+            alerts,
+        ]
+
+    # a drop that might not match does not end the walk
+    assert "alert_unrouted" not in codes(
+        validate_with(home, tmp_path, gw, capsys, conditional_drop_first)
+    )
     # a post-fail hook alone satisfies it
     assert "alert_unrouted" not in codes(validate_with(home, tmp_path, gw, capsys))
 
@@ -904,8 +1005,36 @@ def test_warning_text_in_the_terminal_is_escaped(
 
 
 def test_every_warning_code_is_covered() -> None:
+    """Runs last in this file: the warning tests above record what they saw."""
     schema = json.loads((SCHEMAS / "cli" / "validate.json").read_text())
     enum = set(schema["properties"]["warnings"]["items"]["properties"]["code"]["enum"])
-    source = Path(__file__).read_text()
-    for code in enum:
-        assert f'"{code}"' in source or f"'{code}'" in source or code in source
+    assert EMITTED_CODES == enum
+
+
+class _ClosedStdout:
+    def __init__(self) -> None:
+        self.writes = 0
+
+    def write(self, text: str) -> int:
+        self.writes += 1
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self) -> None:
+        raise BrokenPipeError(32, "Broken pipe")
+
+
+@pytest.mark.parametrize("command", [["rules"], ["rules", "--json"], ["validate", "--json"]])
+def test_a_closed_stdout_returns_1_without_a_second_write(
+    home: Path,
+    tmp_path: Path,
+    gw: Gateway,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    command: list[str],
+) -> None:
+    write_config(home, base_config(tmp_path))
+    _make_state(home, flush_last=NOW - 10)
+    closed = _ClosedStdout()
+    monkeypatch.setattr("sys.stdout", closed)
+    assert main(command, gw) == 1
+    assert closed.writes == 1

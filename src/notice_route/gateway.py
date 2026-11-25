@@ -809,19 +809,40 @@ class Gateway:
             return StateView()
         with handle:
             try:
+                # the spec: no group or world access (open_config_dir only refuses writes)
+                if os.fstat(handle.fd).st_mode & 0o077:
+                    raise StateError("unsafe state directory")
+            except OSError:
+                raise StateError("unsafe state directory") from None
+            try:
                 self.open_file(handle, "state.db").close()
             except FileNotFoundError:
                 return StateView()
             except (UnsafePathError, OSError):
                 raise StateError("unsafe state.db") from None
-            return self._query_state(handle.path.rstrip("/") + "/state.db")
+            db_path = handle.path.rstrip("/") + "/state.db"
+            # a read-only open of a WAL database without a -wal file would create -wal and -shm;
+            # such a database holds no uncheckpointed data, so it is opened immutable instead
+            wal_exists = self._exists_in(handle, "state.db-wal")
+            return self._query_state(db_path, immutable=not wal_exists)
 
-    def _query_state(self, db_path: str) -> StateView:
+    @staticmethod
+    def _exists_in(handle: DirHandle, name: str) -> bool:
+        try:
+            os.stat(name, dir_fd=handle.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True  # unknown: take the plain read-only path
+        return True
+
+    def _query_state(self, db_path: str, *, immutable: bool = False) -> StateView:
         day = time.strftime("%Y-%m-%d", time.gmtime(self.wall()))
         uri = "file:" + db_path.replace("%", "%25").replace("?", "%3f").replace("#", "%23")
         surfaced: dict[str, list[str]] = {}
         try:
-            conn = sqlite3.connect(uri + "?mode=ro", uri=True, timeout=5.0)
+            options = "?mode=ro&immutable=1" if immutable else "?mode=ro"
+            conn = sqlite3.connect(uri + options, uri=True, timeout=5.0)
             try:
                 meta = {
                     str(k): v
@@ -831,7 +852,7 @@ class Gateway:
                     )
                 }
                 for dest, code in conn.execute(
-                    "SELECT destination, code FROM surfaced WHERE period LIKE ? ORDER BY id",
+                    "SELECT destination, code FROM surfaced WHERE period LIKE ? ORDER BY rowid",
                     (day + "%",),
                 ):
                     if (
@@ -855,9 +876,13 @@ class Gateway:
             raise StateError("state.db cannot be read") from None
 
         def number(value: object) -> float | None:
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
+            if isinstance(value, bool) or not isinstance(value, (int, float, str)):
                 return None
-            return float(value) if math.isfinite(value) else None
+            try:
+                result = float(value)
+            except ValueError:
+                return None
+            return result if math.isfinite(result) else None
 
         return StateView(
             True,
