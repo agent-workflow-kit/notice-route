@@ -20,7 +20,7 @@ Rules kept here (docs/interface.md: Destinations, Quiet hours, Rules, Links, Con
 Templates and links are checked for grammar only.
 
 The rule matcher (``match.py``) consumes :class:`Match`.
-TODO(#11): template rendering consumes ``Rule.title``, ``Rule.message`` and ``TEMPLATE``.
+``render.py`` (#11) renders ``Rule.title`` and ``Rule.message`` and reuses ``TOKEN_PATH``.
 TODO(#12): link building consumes :class:`Links` and ``Rule.link``.
 The ``validate`` command (``report.py``) calls ``load_valid_config`` and adds its warnings.
 """
