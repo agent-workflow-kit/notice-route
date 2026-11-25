@@ -605,7 +605,8 @@ def test_non_string_keys_and_deep_payloads_do_not_raise() -> None:
     for _ in range(2000):
         cur["a"] = {}
         cur = cur["a"]
-    got = msg("{{a.a.a.a}}{{1}}", {"a": deep, 1: "x"})
+    odd: dict[Any, Any] = {"a": deep, 1: "x"}
+    got = msg("{{a.a.a.a}}{{1}}", odd)
     assert got.message == "{{1}}"  # not a placeholder: it is literal text
 
 
@@ -661,7 +662,8 @@ def test_the_pinned_producer_examples_render_without_surprises(name: str) -> Non
     payload = load_example(name)
     n = hook(payload, source=payload["tool"], hook=payload["hook"], object_id=payload["object_id"])
     r = rule(
-        "{{object_type}} {{object_id}} {{kind}} is {{status}} ({{needs_attention}}), run {{run_kind}},"
+        "{{object_type}} {{object_id}} {{kind}} is {{status}} ({{needs_attention}}),"
+        " run {{run_kind}},"
         " labels {{labels.ticket}} {{labels.stage}}",
         title="{{source}} {{hook}} {{object_id}}",
     )
