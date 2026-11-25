@@ -97,8 +97,6 @@ class _Table(dict[int, str | None]):
                 answer = " "
             elif category in _DELETE_CATEGORIES and cp != _KEEP_CF:
                 answer = None
-            elif category == "Cs" or category == "Co":
-                answer = None
             else:
                 answer = ""  # keep
         if answer == "":
@@ -234,12 +232,11 @@ class _Run:
         if kind in ("plain", "derived"):
             return text
         if kind == "missing":
-            if path not in _NOTICE_EMPTY_OK or self._n.shape != "notice":
-                self.missing[path] = None
+            self.missing[path] = None
             return ""
         if kind == "text" and not title and path in self._include and self._text_allowed():
             if path not in self._quoted:
-                clean = sanitize(text, False)[:TEXT_MAX]
+                clean = sanitize(text, False)[:TEXT_MAX].rstrip(" ")
                 self._quoted[path] = '"' + clean.replace('"', "'") + '"' if clean else ""
             if self._quoted[path]:
                 return self._quoted[path]
@@ -266,11 +263,11 @@ def render(
     else:
         title_raw = run.expand(rule.title, True) if rule.title is not None else ""
         message_raw = run.expand(rule.message, False)
-    title = sanitize(title_raw, False)[:TITLE_MAX]
-    message = sanitize(message_raw, True)[:MESSAGE_MAX]
-    if not message.strip("\n"):
+    title = sanitize(title_raw, False)[:TITLE_MAX].rstrip(" ")
+    message = sanitize(message_raw, True)[:MESSAGE_MAX].rstrip(" ")
+    if not message.strip("\n \u200d"):
         fallback = f"{n.source} {n.hook}" if n.shape == "hook" and n.hook else n.source
-        message = sanitize(fallback, True)[:MESSAGE_MAX]
+        message = sanitize(fallback, True)[:MESSAGE_MAX].rstrip(" ")
     return Rendered(
         title=title,
         message=message,

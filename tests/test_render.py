@@ -548,6 +548,46 @@ def test_a_pass_through_message_that_sanitizes_empty_falls_back() -> None:
     assert got.message == "direct"
 
 
+# --- invisible messages and trailing spaces after cuts ------------------------------------------
+
+
+def test_a_joiner_only_message_falls_back_on_a_hook() -> None:
+    got = render(rule("\u200d \n\u200d"), hook(), level="info")
+    assert got.message == "agent-spawn post-fail"
+
+
+def test_a_joiner_only_message_falls_back_on_a_notice() -> None:
+    got = render(rule("\u200d"), notice(), level="info")
+    assert got.message == "direct"
+
+
+def test_a_message_with_a_visible_character_beside_a_joiner_is_unchanged() -> None:
+    assert render(rule("\u200da"), notice(), level="info").message == "\u200da"
+
+
+def test_the_title_cut_strips_a_trailing_space() -> None:
+    n = notice(title="t" * 255 + " b")
+    assert render(rule(None), n, level="info").title == "t" * 255
+
+
+def test_the_message_cut_strips_a_trailing_space() -> None:
+    n = notice(message="m" * 3999 + " b")
+    assert render(rule(None), n, level="info").message == "m" * 3999
+
+
+def test_the_text_value_cut_strips_a_trailing_space_before_quoting() -> None:
+    got = msg("{{v}}", {"v": "x" * 199 + " b", **SAFE}, include_text=("v",))
+    assert got.message == '"' + "x" * 199 + '"'
+
+
+def test_cuts_landing_on_a_non_space_are_unchanged() -> None:
+    n = notice(title="t" * 255 + "b c", message="m" * 3999 + "b c")
+    got = render(rule(None), n, level="info")
+    assert got.title == "t" * 255 + "b" and got.message == "m" * 3999 + "b"
+    text = msg("{{v}}", {"v": "x" * 199 + "b c", **SAFE}, include_text=("v",))
+    assert text.message == '"' + "x" * 199 + 'b"'
+
+
 # --- hostile input: never raises, deterministic ------------------------------------------------
 
 HOSTILE = [
