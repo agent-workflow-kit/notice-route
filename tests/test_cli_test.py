@@ -929,12 +929,20 @@ def test_nothing_is_written_locked_spawned_or_opened(
         m.setattr(os, "open", guarded_os_open(os.open))
         for extra, stdin, expected in cases:
             argv = [*prefix, *extra]
+            body = stdin if stdin is not None else b""
+            if mode == "file" and extra and extra[0].endswith(".json"):
+                body = Path(extra[0]).read_bytes()
+            # a database that cannot be opened is exit 1, but only for a notification that
+            # reaches a state-dependent decision (not a drop rule, no_rule or a refusal)
+            reads_state = expected == 0 and b"post-launch" not in body
+            want = 1 if reads_state and state_kind in ("garbage", "valid") else expected
             for as_json in (False, True):
                 code, _, _ = inv.run(*argv, *(["--json"] if as_json else []), stdin=stdin)
-                assert code == expected, argv
+                assert code == want, argv
     names = [os.path.basename(n) for n in opened_names[mark:]]
     assert snapshot(tmp_path) == before
-    assert not [n for n in names if n.startswith("state.db") or n.endswith(".lock")]
+    # state.db is opened read-only (the guards above refuse any write open); never a lock
+    assert not [n for n in names if n.endswith(".lock")]
     assert "log.jsonl" not in names
     if content is None:
         assert not db.exists()

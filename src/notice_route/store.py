@@ -232,7 +232,7 @@ def open_readonly(
     that is not at this build's version. A database without a ``-wal`` file is opened
     ``immutable`` (SQLite would otherwise create ``-wal`` and ``-shm``); a writer that starts in
     between may be missed, which is fine for advisory reads (``test``, ``send --dry-run``,
-    ``validate``). TODO(#18): ``test`` and ``send --dry-run`` read their state through this.
+    ``validate``). ``test`` and ``send --dry-run`` read through this (``decide.preview``).
     """
     return _open(gateway, busy_timeout, True, migrations)
 

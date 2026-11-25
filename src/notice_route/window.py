@@ -25,7 +25,7 @@ Choices where the interface is silent (the narrower reading):
 - When no minute in the next two days is outside the window (not reachable for a valid window in
   a real zone), :func:`window_end` returns ``None`` and the caller decides.
 
-TODO(#18): the decision order consumes :func:`in_window` (quiet drops and defers).
+The decision order (``decide.py``, #18) consumes :func:`in_window` for quiet drops and defers.
 ``queue.quiet_deliver_after`` stores :func:`window_end` as a held row's ``deliver_after`` (#16).
 TODO(#23): ``flush`` calls it again for a due row while the destination is still quiet.
 """

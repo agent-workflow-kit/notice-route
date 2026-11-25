@@ -23,10 +23,12 @@ from typing import Any, NoReturn
 
 from . import __version__
 from .config import ConfigError
+from .decide import instant
 from .dryrun import dry_run_document
 from .gateway import Gateway, HomeError, StateError
 from .payload import InputFlags, PayloadError, UsageError, load_notification
 from .report import rules_document, validate_document
+from .store import Store, StoreError, open_readonly
 from .validate import load_valid_config
 
 PROG = "notice-route"
@@ -266,15 +268,16 @@ def _dry_run_text(doc: dict[str, Any]) -> None:
     ]
     for d in doc["destinations"]:
         why = f" ({d['reason']})" if d["reason"] else ""
-        lines.append(f"destination {d['name']}: {d['decision']}{why}")
+        after = "" if d["deliver_after"] is None else f" deliver_after={d['deliver_after']}"
+        lines.append(f"destination {d['name']}: {d['decision']}{why}{after}")
     for line in lines:
         _out(_safe(line) + "\n")
 
 
 def _run_dry_run(args: argparse.Namespace, gateway: Gateway) -> int:
     """``test`` and ``send --dry-run``: send steps 1 to 6 for the config alone. Nothing is
-    written, locked, spawned or sent; ``state.db`` is not opened at all yet (TODO(#18): open it
-    read-only, when it exists, for the redelivery, repeat and cap decisions)."""
+    written, locked, spawned or sent; ``state.db`` is opened read-only, and only when a destination
+    reaches a state-dependent decision (nothing is created, migrated or locked)."""
     started = gateway.monotonic()
     flags = InputFlags(
         stdin_json=args.stdin_json,
@@ -287,7 +290,21 @@ def _run_dry_run(args: argparse.Namespace, gateway: Gateway) -> int:
     is_test = args.command == "test"
     notification = load_notification(gateway, flags, started, default_stdin=is_test)
     config = load_valid_config(gateway, args.config if is_test else None)
-    doc, code = dry_run_document(config, notification)
+    opened: list[Store | None] = []
+
+    def open_state() -> Store | None:
+        store = open_readonly(gateway)
+        opened.append(store)
+        return store
+
+    try:
+        doc, code = dry_run_document(
+            config, notification, open_state, instant(gateway.wall()), dict(gateway.environ())
+        )
+    finally:
+        for store in opened:
+            if store is not None:
+                store.close()
     if args.json:
         _json(doc)
     else:
@@ -369,7 +386,7 @@ def _main(argv: Sequence[str] | None, gateway: Gateway | None) -> int:
     except HomeError:
         _error("config_invalid", "invalid configuration", {"key": "home"}, as_json=args.json)
         return EXIT_USAGE
-    except StateError:
+    except (StateError, StoreError):
         _error("internal", "state database cannot be read", None, as_json=args.json)
         return EXIT_INTERNAL
     except _OutputClosed:

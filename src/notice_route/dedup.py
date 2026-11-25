@@ -32,13 +32,8 @@ Durations are integer seconds: the caller converts a configured duration once, w
 
 Seams:
 
-- TODO(#18) the decision order that calls these, per destination that is not suppressed or
-  dropped by an earlier step, in one transaction: :func:`check_repeat` (a suppressed repeat ends
-  the destination there); :func:`insert_delivery <notice_route.queue.insert_delivery>`;
-  :func:`bind_window` (it must be ``True``; ``False`` means the delivery already ended
-  unsuccessfully and the window is gone, so the caller treats the delivery as ended and does not
-  queue it); :func:`record_event_id` (only when :func:`is_redelivered` was ``False``); then
-  ``enqueue``. Convert configured durations to integer seconds with ``math.ceil`` first.
+- The decision order (``decide.py``, #18) calls these in one transaction: :func:`check_repeat`,
+  ``insert_delivery``, :func:`bind_window`, :func:`record_event_id`, ``enqueue``.
 - TODO(#22) the send pipeline.
 - TODO(#20) and TODO(#23) (flush step 4 expiry) and TODO(#26) (``prune`` expiry of queue rows):
   every delivery end except ``sent`` and ``unknown`` (``failed``, ``dropped``, ``expired`` and a

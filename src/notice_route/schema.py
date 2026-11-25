@@ -6,7 +6,7 @@ knows; the router still refuses a ``user_version`` above what it was built for (
 Every statement is a fixed string: no value from outside ever reaches SQL by formatting.
 
 Row ids are ``AUTOINCREMENT`` (never reused). Which tables hold which rows is
-[Files](interface.md#files); their logic is owned by later issues (counters #18).
+[Files](interface.md#files); their logic lives in the modules that own them (counters: decide.py).
 """
 
 from __future__ import annotations
@@ -118,7 +118,7 @@ _V1: tuple[str, ...] = (
     "CREATE INDEX surfaced_delivery ON surfaced (delivery_id)",
     "CREATE INDEX surfaced_pending ON surfaced (processed, id)",
     # ``hour`` is the UTC epoch second of the hour's start.
-    # TODO(#18): the counter statements.
+    # The counter statements live in decide.py (#18).
     """
     CREATE TABLE rate (
         destination TEXT NOT NULL,
