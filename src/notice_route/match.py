@@ -15,7 +15,7 @@ Choices where the interface is silent (the narrower reading):
 - ``reads_third_party`` and ``tainted`` are ``False`` only when the payload holds the boolean
   ``False``; absent, null, non-boolean and notices all read as ``True`` (fail closed).
 
-TODO(#11): template rendering consumes :func:`reads_third_party` and :func:`tainted`.
+``render.py`` (#11) consumes :func:`reads_third_party` and :func:`tainted`.
 TODO(#18): destination decisions (floors, quiet hours, caps) start from :class:`Decision`.
 """
 
