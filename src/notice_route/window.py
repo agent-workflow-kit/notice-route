@@ -26,8 +26,8 @@ Choices where the interface is silent (the narrower reading):
   a real zone), :func:`window_end` returns ``None`` and the caller decides.
 
 TODO(#18): the decision order consumes :func:`in_window` (quiet drops and defers).
-TODO(#16): the queue stores :func:`window_end` as the ``deliver_after`` of a held row and
-``flush`` calls it again for a due row while the destination is still quiet.
+``queue.quiet_deliver_after`` stores :func:`window_end` as a held row's ``deliver_after`` (#16).
+TODO(#23): ``flush`` calls it again for a due row while the destination is still quiet.
 """
 
 from __future__ import annotations

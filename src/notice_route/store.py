@@ -487,7 +487,7 @@ def trim_deliveries(
     rows beyond ``cap``, at most ``batch``, ``dropped`` rows first, never a row that has a queue
     row or an unprocessed ``surfaced`` row (the table may then stay above the cap). Returns the
     number of rows deleted. ``keep_id`` (the row the caller just inserted) is never deleted.
-    TODO(#16): call it from the decision transaction."""
+    ``queue.insert_delivery`` calls it (#16); the decision transaction inserts through that."""
     want = _excess(conn, "deliveries", cap, batch)
     if want == 0:
         return 0
