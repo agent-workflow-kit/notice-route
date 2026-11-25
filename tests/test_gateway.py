@@ -1,3 +1,6 @@
+import math
+import subprocess
+
 import pytest
 
 from notice_route import gateway
@@ -64,11 +67,49 @@ def test_default_gateway_token_is_random_hex() -> None:
     int(first, 16)
 
 
-def test_run_uses_no_shell_and_passes_stdin() -> None:
-    result = Gateway().run(["cat"], stdin="a; echo $HOME")
-    assert result.returncode == 0
-    assert result.stdout == "a; echo $HOME"
+def test_run_uses_no_shell_and_passes_stdin(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((args, kwargs))
+        return subprocess.CompletedProcess(args=["x"], returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+    Gateway().run(["tool", "--flag"], stdin="a; echo $HOME", timeout=3.0)
+    (args, kwargs) = calls[0]
+    assert args == (["tool", "--flag"],)
+    assert not kwargs.get("shell", False)
+    assert kwargs["input"] == "a; echo $HOME"
+    assert kwargs["timeout"] == 3.0
 
 
-def test_module_exposes_no_global_clock_state() -> None:
-    assert not hasattr(gateway, "_clock")
+def test_gateway_module_holds_no_clock_instances() -> None:
+    clocks = (FakeClock, SystemClock)
+    held = [n for n, v in vars(gateway).items() if isinstance(v, clocks)]
+    assert held == []
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_fake_clock_rejects_non_finite_values(bad: float) -> None:
+    with pytest.raises(ValueError):
+        FakeClock(wall=bad)
+    with pytest.raises(ValueError):
+        FakeClock(monotonic=bad)
+    clock = FakeClock()
+    with pytest.raises(ValueError):
+        clock.jump_wall(bad)
+    with pytest.raises(ValueError):
+        clock.advance(bad)
+    with pytest.raises(ValueError):
+        clock.advance_monotonic(bad)
+    assert (clock.wall(), clock.monotonic()) == (FakeClock().wall(), FakeClock().monotonic())
+
+
+def test_fixed_tokens_refuses_a_bare_string() -> None:
+    with pytest.raises(TypeError):
+        FixedTokens("abc")  # type: ignore[arg-type]
+
+
+def test_fixed_tokens_refuses_duplicates() -> None:
+    with pytest.raises(ValueError):
+        FixedTokens(["aa", "bb", "aa"])

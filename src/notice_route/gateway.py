@@ -11,12 +11,29 @@ files, never in argv or the environment.
 
 from __future__ import annotations
 
+import math
 import secrets
 import subprocess
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
+
+__all__ = [
+    "Clock",
+    "FakeClock",
+    "FixedTokens",
+    "Gateway",
+    "SystemClock",
+    "SystemTokens",
+    "TokenSource",
+]
+
+
+def _finite(value: float, what: str) -> float:
+    if not math.isfinite(value):
+        raise ValueError(f"{what} must be finite")
+    return value
 
 
 class Clock(Protocol):
@@ -45,8 +62,8 @@ class FakeClock:
     """A deterministic clock whose wall and monotonic time move independently."""
 
     def __init__(self, wall: float = 1_700_000_000.0, monotonic: float = 1_000.0) -> None:
-        self._wall = wall
-        self._monotonic = monotonic
+        self._wall = _finite(wall, "wall")
+        self._monotonic = _finite(monotonic, "monotonic")
 
     def wall(self) -> float:
         return self._wall
@@ -56,18 +73,18 @@ class FakeClock:
 
     def jump_wall(self, seconds: float) -> None:
         """Move only wall time, in either direction (an NTP step or a manual change)."""
-        self._wall += seconds
+        self._wall += _finite(seconds, "seconds")
 
     def advance_monotonic(self, seconds: float) -> None:
         """Move only monotonic time; it never goes backwards."""
-        if seconds < 0:
-            raise ValueError("monotonic time cannot go backwards")
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError("monotonic time must advance by a finite, non-negative amount")
         self._monotonic += seconds
 
     def advance(self, seconds: float) -> None:
         """Let real time pass: both clocks move forward together."""
-        if seconds < 0:
-            raise ValueError("time cannot go backwards")
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError("time must advance by a finite, non-negative amount")
         self._wall += seconds
         self._monotonic += seconds
 
@@ -89,6 +106,10 @@ class FixedTokens:
     """A fixed sequence of tokens for deterministic tests; refuses to run dry silently."""
 
     def __init__(self, tokens: Sequence[str]) -> None:
+        if isinstance(tokens, str):
+            raise TypeError("tokens must be a sequence of strings, not a single string")
+        if len(set(tokens)) != len(tokens):
+            raise ValueError("tokens must be unique")
         self._tokens = list(tokens)
         self._next = 0
 
@@ -123,7 +144,12 @@ class Gateway:
         stdin: str | None = None,
         timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        """Run ``argv`` without a shell, capturing text stdout and stderr."""
+        """Run ``argv`` without a shell, capturing text stdout and stderr.
+
+        PLACEHOLDER, unsafe for notifier calls: it raises raw ``subprocess`` exceptions
+        (``TimeoutExpired``, ``OSError``), reads unbounded output into memory and starts no
+        process group of its own. Issue #4 replaces it.
+        """
         # TODO(#4): own process group, bounded reader, monotonic deadline, group TERM then KILL.
         return subprocess.run(
             argv,

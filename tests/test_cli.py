@@ -1,6 +1,7 @@
+from importlib import metadata
+
 import pytest
 
-from notice_route import __version__
 from notice_route.cli import main
 
 
@@ -8,7 +9,7 @@ def test_version_prints_version_and_exits_zero(capsys: pytest.CaptureFixture[str
     with pytest.raises(SystemExit) as exc:
         main(["--version"])
     assert exc.value.code == 0
-    assert capsys.readouterr().out.strip() == f"notice-route {__version__}"
+    assert capsys.readouterr().out.strip() == f"notice-route {metadata.version('notice-route')}"
 
 
 def test_no_arguments_returns_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
