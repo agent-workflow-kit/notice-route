@@ -19,10 +19,10 @@ Rules kept here (docs/interface.md: Destinations, Quiet hours, Rules, Links, Con
 
 Templates and links are checked for grammar only.
 
-TODO(#10): the rule matcher consumes :class:`Match`.
+The rule matcher (``match.py``) consumes :class:`Match`.
 TODO(#11): template rendering consumes ``Rule.title``, ``Rule.message`` and ``TEMPLATE``.
 TODO(#12): link building consumes :class:`Links` and ``Rule.link``.
-TODO(#9): the ``validate`` command calls ``load_valid_config`` and adds its warnings.
+The ``validate`` command (``report.py``) calls ``load_valid_config`` and adds its warnings.
 """
 
 from __future__ import annotations
@@ -149,7 +149,7 @@ class Links:
 
 @dataclass(frozen=True, slots=True)
 class Match:
-    """Conditions as written; the matcher (#10) gives them meaning. ``where`` keeps file order."""
+    """Conditions as written; ``match.py`` gives them meaning. ``where`` keeps file order."""
 
     source: str | None
     hook: str | None

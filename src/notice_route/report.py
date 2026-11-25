@@ -30,6 +30,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from .gateway import Gateway
+from .match import rule_covers, wildcard_matches
 from .validate import DAYS, Config, Match, Rule
 
 __all__ = ["rules_document", "validate_document"]
@@ -115,27 +116,6 @@ def rules_document(config: Config | None) -> dict[str, Any]:
 # --- validate --------------------------------------------------------------------------------
 
 
-def _covers_text(earlier: str, later: str) -> bool:
-    if earlier.endswith("*"):
-        return later.startswith(earlier[:-1])
-    return earlier == later
-
-
-def _covers(earlier: Match, later: Match) -> bool:
-    """Every condition of ``earlier`` is also in ``later``, so ``later`` never sees a
-    notification ``earlier`` did not take."""
-    for key in ("source", "hook", "repo"):
-        a, b = getattr(earlier, key), getattr(later, key)
-        if a is not None and (b is None or not _covers_text(a, b)):
-            return False
-    if not set(earlier.labels) <= set(later.labels):
-        return False
-    later_where = {(k, type(v), v) for k, v in later.where}
-    if any((k, type(v), v) not in later_where for k, v in earlier.where):
-        return False
-    return earlier.level_min is None or earlier.level_min == later.level_min
-
-
 def _alert_routed(rules: Sequence[Rule]) -> bool:
     """Whether a post-fail alert (source ``notice-route``, hook ``post-fail``) may be routed.
 
@@ -147,9 +127,9 @@ def _alert_routed(rules: Sequence[Rule]) -> bool:
     """
     for rule in rules:
         match = rule.match
-        if match.source is not None and not _covers_text(match.source, "notice-route"):
+        if match.source is not None and not wildcard_matches(match.source, "notice-route"):
             continue
-        if match.hook is not None and not _covers_text(match.hook, "post-fail"):
+        if match.hook is not None and not wildcard_matches(match.hook, "post-fail"):
             continue
         if match.level_min is not None or match.repo is not None:
             continue
@@ -198,7 +178,7 @@ def _warnings(
                     rule=rule.name,
                 )
             )
-        if any(_covers(config.rules[i].match, rule.match) for i in range(index)):
+        if any(rule_covers(config.rules[i].match, rule.match) for i in range(index)):
             out.append(
                 _warning(
                     "rule_unreachable",
