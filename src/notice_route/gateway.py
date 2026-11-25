@@ -31,9 +31,13 @@ __all__ = [
 
 
 def _finite(value: float, what: str) -> float:
-    if not math.isfinite(value):
+    try:
+        number = float(value)
+    except OverflowError:
+        raise ValueError(f"{what} must be finite") from None
+    if not math.isfinite(number):
         raise ValueError(f"{what} must be finite")
-    return value
+    return number
 
 
 class Clock(Protocol):
@@ -73,20 +77,23 @@ class FakeClock:
 
     def jump_wall(self, seconds: float) -> None:
         """Move only wall time, in either direction (an NTP step or a manual change)."""
-        self._wall += _finite(seconds, "seconds")
+        self._wall = _finite(self._wall + _finite(seconds, "seconds"), "wall")
 
     def advance_monotonic(self, seconds: float) -> None:
         """Move only monotonic time; it never goes backwards."""
-        if not math.isfinite(seconds) or seconds < 0:
+        seconds = _finite(seconds, "seconds")
+        if seconds < 0:
             raise ValueError("monotonic time must advance by a finite, non-negative amount")
-        self._monotonic += seconds
+        self._monotonic = _finite(self._monotonic + seconds, "monotonic")
 
     def advance(self, seconds: float) -> None:
         """Let real time pass: both clocks move forward together."""
-        if not math.isfinite(seconds) or seconds < 0:
+        seconds = _finite(seconds, "seconds")
+        if seconds < 0:
             raise ValueError("time must advance by a finite, non-negative amount")
-        self._wall += seconds
-        self._monotonic += seconds
+        wall = _finite(self._wall + seconds, "wall")
+        monotonic = _finite(self._monotonic + seconds, "monotonic")
+        self._wall, self._monotonic = wall, monotonic
 
 
 class TokenSource(Protocol):

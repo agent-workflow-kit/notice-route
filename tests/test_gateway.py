@@ -105,6 +105,26 @@ def test_fake_clock_rejects_non_finite_values(bad: float) -> None:
     assert (clock.wall(), clock.monotonic()) == (FakeClock().wall(), FakeClock().monotonic())
 
 
+def test_fake_clock_rejects_huge_ints_and_overflowing_sums() -> None:
+    with pytest.raises(ValueError):
+        FakeClock(wall=10**400)  # type: ignore[arg-type]
+    clock = FakeClock()
+    for call in (clock.jump_wall, clock.advance, clock.advance_monotonic):
+        with pytest.raises(ValueError):
+            call(10**400)  # type: ignore[arg-type]
+    before = (clock.wall(), clock.monotonic())
+    clock.jump_wall(1e308)
+    with pytest.raises(ValueError):
+        clock.jump_wall(1e308)
+    clock.advance_monotonic(1e308)
+    with pytest.raises(ValueError):
+        clock.advance_monotonic(1e308)
+    with pytest.raises(ValueError):
+        clock.advance(1e308)
+    assert math.isfinite(clock.wall()) and math.isfinite(clock.monotonic())
+    assert before != (clock.wall(), clock.monotonic())
+
+
 def test_fixed_tokens_refuses_a_bare_string() -> None:
     with pytest.raises(TypeError):
         FixedTokens("abc")  # type: ignore[arg-type]

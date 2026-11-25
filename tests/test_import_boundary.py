@@ -8,7 +8,8 @@ re-importing a banned name from the gateway module (``from .gateway import os``)
 clock-reading attributes (``now``, ``utcnow``, ``today``, ``fromtimestamp``); and calls to the
 builtin ``open``.
 
-Deliberately not banned: ``importlib.metadata`` (package version lookup only), and
+Deliberately not banned: ``from importlib.metadata import X``, ``from importlib import metadata``
+and ``import importlib.metadata as m`` (the plain form binds ``importlib``), and
 ``pathlib`` and ``datetime`` imports, because pure path and time arithmetic is legitimate
 (design.md needs ``datetime`` and ``zoneinfo``). ``sqlite3`` stays allowed. Filesystem IO
 through ``pathlib`` methods is therefore covered by review only. No module that design.md or
@@ -53,9 +54,6 @@ def _is_gateway_module(module: str, level: int) -> bool:
 
 
 def _banned_module(name: str) -> bool:
-    # importlib.metadata only reads installed package metadata (the version); it is allowed.
-    if name == "importlib.metadata" or name.startswith("importlib.metadata."):
-        return False
     return name.split(".")[0] in BANNED
 
 
@@ -64,12 +62,26 @@ def violations(source: str) -> list[str]:
     found: list[str] = []
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.Import):
-            found.extend(a.name for a in node.names if _banned_module(a.name))
+            for a in node.names:
+                # Plain ``import importlib.metadata`` binds ``importlib`` (import_module
+                # bypass); only the aliased form binds just the metadata module.
+                if a.name == "importlib.metadata" and a.asname:
+                    continue
+                if a.name.startswith("importlib.metadata.") and a.asname:
+                    continue
+                if _banned_module(a.name):
+                    found.append(a.name)
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
             if node.level == 0 and module == "importlib":
                 if any(a.name != "metadata" for a in node.names):
                     found.append(module)
+            elif (
+                node.level == 0
+                and module.split(".")[0] == "importlib"
+                and (module == "importlib.metadata" or module.startswith("importlib.metadata."))
+            ):
+                pass
             elif node.level == 0 and _banned_module(module):
                 found.append(module)
             if _is_gateway_module(module, node.level):
@@ -118,7 +130,12 @@ def test_checker_catches_dynamic_import_helpers() -> None:
     assert violations("from importlib import import_module") == ["importlib"]
     assert violations("from importlib import metadata") == []
     assert violations("from importlib.metadata import version") == []
-    assert violations("import importlib.metadata") == []
+    assert violations("import importlib.metadata as m") == []
+    assert violations("import importlib.metadata") == ["importlib.metadata"]
+    assert violations("import importlib.metadata\nimportlib.import_module('os')") == [
+        "importlib.metadata"
+    ]
+    assert violations("import importlib.metadata, os") == ["importlib.metadata", "os"]
     assert violations("import importlib.util") == ["importlib.util"]
     assert violations("__import__(name)") == ["__import__(dynamic)"]
     assert violations("__import__('a' + 'b')") == ["__import__(dynamic)"]
