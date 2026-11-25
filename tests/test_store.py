@@ -372,11 +372,13 @@ def test_a_newer_schema_is_refused_read_only_too(gw: Gateway, db: Path) -> None:
     assert err.value.reason == "newer"
 
 
-def test_an_older_database_is_not_migrated_read_only(gw: Gateway) -> None:
+def test_an_older_database_is_not_migrated_read_only(gw: Gateway, state: Path) -> None:
     open_store(gw).close()
+    before = {p.name: p.read_bytes() for p in state.iterdir()}
     with pytest.raises(StoreError) as err:
         open_readonly(gw, migrations=V2)
     assert err.value.reason == "older"
+    assert {p.name: p.read_bytes() for p in state.iterdir()} == before  # nothing migrated
 
 
 # --- refused databases -----------------------------------------------------------------------

@@ -16,7 +16,7 @@ Choices where the interface is silent (the narrower reading):
   ``False``; absent, null, non-boolean and notices all read as ``True`` (fail closed).
 
 ``render.py`` (#11) consumes :func:`reads_third_party` and :func:`tainted`.
-TODO(#18): destination decisions (floors, quiet hours, caps) start from :class:`Decision`.
+Destination decisions (floors, quiet hours, caps; ``decide.py``) start from :class:`Decision`.
 """
 
 from __future__ import annotations

@@ -1,27 +1,33 @@
-"""What ``send`` would do, computed without state: the document of ``test`` and ``send --dry-run``.
+"""What ``send`` would do, without doing it: the document of ``test`` and ``send --dry-run``.
 
 docs/interface.md (``test``, Other outputs) is normative and schemas/cli/test.json is the shape.
-This module is pure: it reads a validated config and a notification, and touches no file, lock,
+This module reads a validated config and a notification, and touches no file, lock,
 clock or process, so a dry run cannot change anything.
 
-The per-destination decision is computed from the config alone: a disabled destination is
-``disabled`` and a level below the floor is ``drop`` (``below_floor``); every other destination is
-``send``. TODO(#18): the quiet, redelivery, repeat, ``env_missing`` and ``rate_capped`` decisions
-of ``send`` step 7 (they read ``state.db`` read-only and the clock).
+The per-destination decision is ``decide.preview``: the same classification ``send`` runs, over
+a read-only database that is opened (``open_state``) once the config is enabled and has
+destinations, before any rule is matched, so a database that cannot be opened is exit 1 whatever
+the notification decides (docs/interface.md); a disabled or unconfigured router exits 22 before any
+state read. It uses the instant ``now`` and the environment ``environ`` the caller passes and never
+writes. This module closes the store it opened.
 """
 
 from __future__ import annotations
 
 import hashlib
+import math
+from collections.abc import Callable, Mapping
 from typing import Any
 
+from .decide import DestinationDecision, Notice, preview
 from .links import build_links
 from .match import decide
-from .payload import LEVELS, Notification
-from .render import render
-from .validate import Config
+from .payload import Notification
+from .render import Rendered, render
+from .store import Store
+from .validate import Config, Rule
 
-__all__ = ["EXIT_NOOP", "EXIT_OK", "dedupe_digest", "dry_run_document"]
+__all__ = ["EXIT_NOOP", "EXIT_OK", "dedupe_digest", "dry_run_document", "make_notice"]
 
 EXIT_OK = 0
 EXIT_NOOP = 22
@@ -56,22 +62,60 @@ def _base(n: Notification, reason: str | None) -> dict[str, Any]:
     }
 
 
-def _destination(config: Config, name: str, level: str) -> dict[str, Any]:
-    dest = config.destinations[name]
-    decision, reason = "send", None
-    if not dest.enabled:
-        decision = "disabled"
-    elif LEVELS.index(level) < LEVELS.index(dest.floor):
-        decision, reason = "drop", "below_floor"
-    return {"name": name, "decision": decision, "reason": reason, "deliver_after": None}
+def make_notice(
+    n: Notification, rule: Rule, level: str, rendered: Rendered, link: str, *, pass_through: bool
+) -> Notice:
+    """The rendered notification the decision order works on (shared by ``send`` and ``test`` so
+    both use one digest). The rule's window is converted once, to whole seconds, with ``ceil``."""
+    return Notice(
+        source=n.source,
+        hook=n.hook if n.shape == "hook" else None,
+        level=level,
+        rule=rule.name,
+        title=rendered.title,
+        message=rendered.message,
+        link=link,
+        dedupe=dedupe_digest(n.source, n.hook, level, rendered.title, rendered.message, link),
+        dedup_window=math.ceil(rule.dedup_window),
+        event_id=n.event_id,
+        object_id=n.object_id,
+        labels=n.labels,
+        pass_through=pass_through,
+    )
 
 
-def dry_run_document(config: Config | None, n: Notification) -> tuple[dict[str, Any], int]:
+def _destination(d: DestinationDecision) -> dict[str, Any]:
+    return {
+        "name": d.name,
+        "decision": d.decision,
+        "reason": d.reason,
+        "deliver_after": d.deliver_after,
+    }
+
+
+def dry_run_document(
+    config: Config | None,
+    n: Notification,
+    open_state: Callable[[], Store | None],
+    now: int,
+    environ: Mapping[str, str],
+) -> tuple[dict[str, Any], int]:
     """The document and the exit code (0, or 22 when nothing would be done)."""
     if config is None or (config.enabled and not config.destinations):
         return _base(n, "unconfigured"), EXIT_NOOP
     if not config.enabled:
         return _base(n, "disabled"), EXIT_NOOP
+    store = open_state()  # StoreError (exit 1) for a database that cannot be used
+    try:
+        return _document(config, n, store, now, environ)
+    finally:
+        if store is not None:
+            store.close()
+
+
+def _document(
+    config: Config, n: Notification, store: Store | None, now: int, environ: Mapping[str, str]
+) -> tuple[dict[str, Any], int]:
     decision = decide(config.rules, n)
     if decision.rule is None:
         return _base(n, "no_rule"), EXIT_NOOP
@@ -85,6 +129,10 @@ def dry_run_document(config: Config | None, n: Notification) -> tuple[dict[str, 
     rendered = render(
         decision.rule, n, level=decision.level, pr_url=built.pr_url, ticket_url=built.ticket_url
     )
+    notice = make_notice(
+        n, decision.rule, decision.level, rendered, built.link, pass_through=decision.pass_through
+    )
+    results = preview(lambda: store, config, notice, decision.rule.notify, now=now, environ=environ)
     doc.update(
         title=rendered.title,
         message=rendered.message,
@@ -93,10 +141,8 @@ def dry_run_document(config: Config | None, n: Notification) -> tuple[dict[str, 
         excluded=list(rendered.excluded),
         text_excluded=rendered.text_excluded,
         level=decision.level,
-        dedupe=dedupe_digest(
-            n.source, n.hook, decision.level, rendered.title, rendered.message, built.link
-        ),
-        destinations=[_destination(config, name, decision.level) for name in decision.rule.notify],
+        dedupe=notice.dedupe,
+        destinations=[_destination(d) for d in results],
     )
     if all(d["decision"] == "disabled" for d in doc["destinations"]):
         doc["reason"] = "all_disabled"

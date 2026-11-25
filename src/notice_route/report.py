@@ -26,14 +26,14 @@ Choices where the interface is silent (the narrower reading):
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from .gateway import Gateway
 from .match import rule_covers, wildcard_matches
 from .validate import DAYS, Config, Match, Rule
 
-__all__ = ["rules_document", "validate_document"]
+__all__ = ["env_unset", "rules_document", "validate_document"]
 
 HOOK_TIMEOUT_S = 30.0  # the default hook timeout the worst case is compared with
 FLUSH_STALE_S = 300.0
@@ -139,6 +139,12 @@ def _alert_routed(rules: Sequence[Rule]) -> bool:
             continue
         return not rule.drop
     return False
+
+
+def env_unset(names: Sequence[str], environ: Mapping[str, str]) -> list[str]:
+    """The variables of ``names`` that are missing or empty in ``environ`` (``validate`` reports
+    them; ``decide`` defers a destination that has one)."""
+    return [n for n in names if environ.get(n, "") == ""]
 
 
 def worst_case_s(config: Config) -> float:
@@ -249,7 +255,7 @@ def validate_document(config: Config | None, gateway: Gateway) -> tuple[dict[str
             {
                 "name": d.name,
                 "cmd_ok": gateway.check_exec(d.cmd[0]),
-                "env_unset": [n for n in d.env if environ.get(n, "") == ""],
+                "env_unset": env_unset(d.env, environ),
                 "probe": None,  # TODO(#29): validate --probe fills this
                 "surfaced_today": list(state.surfaced_today.get(d.name, ())),
             }

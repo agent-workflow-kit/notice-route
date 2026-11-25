@@ -232,7 +232,10 @@ def open_readonly(
     that is not at this build's version. A database without a ``-wal`` file is opened
     ``immutable`` (SQLite would otherwise create ``-wal`` and ``-shm``); a writer that starts in
     between may be missed, which is fine for advisory reads (``test``, ``send --dry-run``,
-    ``validate``). TODO(#18): ``test`` and ``send --dry-run`` read their state through this.
+    ``validate``). ``test`` and ``send --dry-run`` read through this (``decide.preview``).
+
+    When a ``-wal`` file exists SQLite may create or touch the shared-memory index ``state.db-shm``
+    (reader marks); ``state.db`` and ``state.db-wal`` are never changed.
     """
     return _open(gateway, busy_timeout, True, migrations)
 
@@ -253,6 +256,12 @@ def _open(
         raise ValueError("busy_timeout must be in (0, 60] seconds")
     try:
         files = gateway.prepare_state_db(create=not readonly)
+    # todo(#22): tests/test_queue.py::test_concurrent_enqueuers_at_the_cap_lose_no_row_and_keep_
+    # exactly_100 saw this branch once (Python 3.13, 8 processes opening a new state directory
+    # together). It did not reproduce in 70+ later runs (40 rounds of 8 concurrent openers and 30
+    # reruns of the test). The cause is unknown; the reason is dropped here (``from None``), so the
+    # next sighting should log the UnsafePathError reason and path before it is raised. Deferred:
+    # no reproduction, no clearly correct fix, and the #22 pipeline owns the send-side retry.
     except (UnsafePathError, ValueError):
         raise StoreError("unsafe") from None
     except (PermissionError, FileNotFoundError):
