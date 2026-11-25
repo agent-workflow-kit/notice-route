@@ -432,7 +432,8 @@ class Gateway:
         memoryview), all before anything starts. Raises ``SigchldIgnoredError`` (nothing started)
         when SIGCHLD is ignored (the kernel would reap children and the results would be wrong)
         and ``ChildLostError`` (the child ran; its fate is unknown) when it could not be reaped
-        or another reaper took it; both are ``RuntimeError``. Precondition: SIGPIPE is ignored, as Python does by default.
+        or another reaper took it; both are ``RuntimeError``.
+        Precondition: SIGPIPE is ignored, as Python does by default.
         """
         # The notifier argv and environment are built by ``notice_route.notify`` (#19); this
         # method passes ``env`` through untouched.

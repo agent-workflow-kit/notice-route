@@ -8,6 +8,7 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -158,8 +159,8 @@ def test_a_child_that_cannot_be_reaped_is_a_typed_error(
     made: list[subprocess.Popen[bytes]] = []
     real_init = subprocess.Popen.__init__
 
-    def spy(self: subprocess.Popen[bytes], *a: object, **k: object) -> None:
-        real_init(self, *a, **k)  # pyright: ignore[reportArgumentType]
+    def spy(self: subprocess.Popen[bytes], *a: Any, **k: Any) -> None:
+        real_init(self, *a, **k)
         made.append(self)
 
     monkeypatch.setattr(subprocess.Popen, "__init__", spy)
