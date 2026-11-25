@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 from .gateway import Gateway, InputFileError, InputRead
@@ -181,6 +181,9 @@ USAGE_MESSAGES = {
     "labels": "too many --label flags",
     "terminal": "standard input is a terminal",
     "input_file": "the --file path cannot be used",
+    "argv": "the command line cannot be used",
+    "config": "--config is not accepted by this command",
+    "verbose_quiet": "--verbose and --quiet cannot be combined",
 }
 # The pointers a refusal may carry: fixed strings, never built from the input.
 POINTERS = frozenset(
@@ -220,12 +223,17 @@ class PayloadError(Exception):
         }
 
 
+UsageReason = Literal[
+    "flags", "labels", "terminal", "input_file", "argv", "config", "verbose_quiet"
+]
+
+
 class UsageError(Exception):
     """Exit 2, code ``usage``: a flag combination or a ``--file`` path that cannot be used."""
 
     exit_code = 2
 
-    def __init__(self, reason: Literal["flags", "labels", "terminal", "input_file"]) -> None:
+    def __init__(self, reason: UsageReason) -> None:
         super().__init__(USAGE_MESSAGES[reason])
         self.reason = reason
         self.message = USAGE_MESSAGES[reason]
@@ -454,13 +462,18 @@ class InputFlags:
     labels: tuple[str, ...] = ()
 
 
-def check_flags(flags: InputFlags, gateway: Gateway) -> Literal["stdin", "file", "flags"]:
+def check_flags(
+    flags: InputFlags, gateway: Gateway, *, default_stdin: bool = False
+) -> Literal["stdin", "file", "flags"]:
     """``send`` step 1: refuse the exit 2 combinations and name where the input comes from.
 
     Refused: ``--stdin-json`` with ``--file``; a JSON source with ``--title`` or ``--message``;
     ``--title`` without ``--message``; no source and no ``--message``; more than 32 ``--label``;
-    and stdin from a terminal when stdin is the source. TODO(#13): ``test`` defaults to stdin.
+    and stdin from a terminal when stdin is the source. ``default_stdin`` (``test``) makes stdin the
+    source when no source flag and no ``--message`` is given.
     """
+    if default_stdin and flags.file is None and flags.message is None and flags.title is None:
+        flags = replace(flags, stdin_json=True)
     json_source = flags.stdin_json or flags.file is not None
     if flags.stdin_json and flags.file is not None:
         raise UsageError("flags")
@@ -479,7 +492,9 @@ def check_flags(flags: InputFlags, gateway: Gateway) -> Literal["stdin", "file",
     return "file" if flags.file is not None else "flags"
 
 
-def load_notification(gateway: Gateway, flags: InputFlags, started: float) -> Notification:
+def load_notification(
+    gateway: Gateway, flags: InputFlags, started: float, *, default_stdin: bool = False
+) -> Notification:
     """``send`` steps 1 to 3: check the flags (exit 2), refuse ``hook_recursion`` before reading
     anything, read the input and validate it (exit 20).
 
@@ -489,7 +504,7 @@ def load_notification(gateway: Gateway, flags: InputFlags, started: float) -> No
     failure (a timeout, a closed stdin, too many bytes, the strict reader's refusals) is
     ``payload_invalid`` with the pointer ``""``.
     """
-    plan = check_flags(flags, gateway)
+    plan = check_flags(flags, gateway, default_stdin=default_stdin)
     if gateway.env_present("NOTICE_ROUTE_HOOK"):
         raise PayloadError("hook_recursion")
     if plan == "flags":

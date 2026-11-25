@@ -349,6 +349,9 @@
           },
           "destinations": {
             "maxItems": 0
+          },
+          "level": {
+            "type": "null"
           }
         }
       }
@@ -375,6 +378,9 @@
                 }
               }
             }
+          },
+          "level": {
+            "$ref": "../defs.json#/$defs/level"
           }
         }
       }
