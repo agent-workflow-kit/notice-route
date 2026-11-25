@@ -605,9 +605,6 @@ def test_rules_never_reads_state(
 # --- warnings --------------------------------------------------------------------------------
 
 
-EMITTED_CODES: set[str] = set()  # every warning code a warning test actually saw
-
-
 def codes(doc: dict[str, Any]) -> list[str]:
     return [w["code"] for w in doc["warnings"]]
 
@@ -629,7 +626,6 @@ def validate_with(
     code, doc = run_json(capsys, gw, "validate")
     assert code in (0, 12)
     assert schema_errors(doc, "validate.json") == []
-    EMITTED_CODES.update(codes(doc))
     return doc
 
 
@@ -1004,11 +1000,70 @@ def test_warning_text_in_the_terminal_is_escaped(
     assert "\x1b" not in out and "\\xe9" in out
 
 
+def _spare_destination(config: dict[str, Any]) -> None:
+    config["destinations"]["spare"] = copy.deepcopy(config["destinations"]["chat"])
+
+
+def _level_from_notice(config: dict[str, Any]) -> None:
+    config["rules"][2]["match"]["level_min"] = "warn"
+
+
+def _shadowed_rule(config: dict[str, Any]) -> None:
+    config["rules"].insert(
+        1,
+        {
+            "name": "wide",
+            "match": {"source": "agent-*", "labels": ["k=v"]},
+            "notify": ["chat"],
+            "level": "info",
+            "message": "m",
+        },
+    )
+
+
+def _slow_destination(config: dict[str, Any]) -> None:
+    config["destinations"]["chat"]["timeout"] = "20s"
+
+
+def _loose_env_file(config: dict[str, Any]) -> None:
+    config["cron"] = {"env_file": "/nonexistent/notice-route-cron.env"}  # missing: unsafe
+
+
+def _no_hooks(config: dict[str, Any]) -> None:
+    del config["hooks"]
+
+
+# One way to make validate emit each warning code; the coverage test below pins the keys to the
+# schema enum, so a new code without an entry here fails.
+WARNING_CASES: dict[str, tuple[Any, dict[str, Any]]] = {
+    "destination_unused": (_spare_destination, {}),
+    "level_from_notice": (_level_from_notice, {}),
+    "rule_unreachable": (_shadowed_rule, {}),
+    "worst_case_over_hook_timeout": (_slow_destination, {}),
+    "flush_stale": (None, {"flush_last": None}),
+    "env_file_unsafe": (_loose_env_file, {}),
+    "alert_unrouted": (_no_hooks, {}),
+    "orphaned_queue": (None, {"queued": ["gone"]}),
+    "flush_env_missing": (None, {"env_missing": NOW - 30}),
+}
+
+
+@pytest.mark.parametrize("code", list(WARNING_CASES))
+def test_each_warning_code_can_be_emitted(
+    code: str,
+    home: Path,
+    tmp_path: Path,
+    gw: Gateway,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    edit, state = WARNING_CASES[code]
+    assert code in codes(validate_with(home, tmp_path, gw, capsys, edit, state))
+
+
 def test_every_warning_code_is_covered() -> None:
-    """Runs last in this file: the warning tests above record what they saw."""
     schema = json.loads((SCHEMAS / "cli" / "validate.json").read_text())
     enum = set(schema["properties"]["warnings"]["items"]["properties"]["code"]["enum"])
-    assert EMITTED_CODES == enum
+    assert set(WARNING_CASES) == enum
 
 
 class _ClosedStdout:

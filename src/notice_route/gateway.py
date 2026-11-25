@@ -841,6 +841,8 @@ class Gateway:
         uri = "file:" + db_path.replace("%", "%25").replace("?", "%3f").replace("#", "%23")
         surfaced: dict[str, list[str]] = {}
         try:
+            # Accepted race: a writer may create the -wal between the caller's stat and this
+            # open, so immutable=1 can miss its newest rows. The output is advisory and read-only.
             options = "?mode=ro&immutable=1" if immutable else "?mode=ro"
             conn = sqlite3.connect(uri + options, uri=True, timeout=5.0)
             try:
