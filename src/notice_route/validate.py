@@ -21,7 +21,7 @@ Templates and links are checked for grammar only.
 
 The rule matcher (``match.py``) consumes :class:`Match`.
 ``render.py`` (#11) renders ``Rule.title`` and ``Rule.message`` and reuses ``TOKEN_PATH``.
-TODO(#12): link building consumes :class:`Links` and ``Rule.link``.
+Link building (#12) consumes :class:`Links` and ``Rule.link`` in ``links.py``.
 The ``validate`` command (``report.py``) calls ``load_valid_config`` and adds its warnings.
 """
 
@@ -51,6 +51,7 @@ __all__ = [
     "Match",
     "QuietWindow",
     "Rule",
+    "is_literal_url",
     "load_valid_config",
     "validate_config",
 ]
@@ -317,13 +318,18 @@ def _template(value: Any, path: Path) -> str:
     return value
 
 
-def _literal_url(value: Any, path: Path, high: int = MAX_LINK) -> str:
-    if not isinstance(value, str) or not 9 <= len(value) <= high:
-        raise _bad(path)
+def is_literal_url(value: object, high: int = MAX_LINK) -> bool:
+    """Whether ``value`` is a literal link of the config grammar (Links)."""
+    if type(value) is not str or not 9 <= len(value) <= high:
+        return False
     found = _URL.fullmatch(value)
-    if found is None or not _port_ok(found.group(2)):
+    return found is not None and _port_ok(found.group(2))
+
+
+def _literal_url(value: Any, path: Path, high: int = MAX_LINK) -> str:
+    if not is_literal_url(value, high):
         raise _bad(path)
-    return value
+    return cast(str, value)
 
 
 # --- destinations and quiet hours ------------------------------------------------------------
