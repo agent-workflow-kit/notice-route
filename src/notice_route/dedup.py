@@ -34,7 +34,7 @@ Seams:
 
 - The decision order (``decide.py``, #18) calls these in one transaction: :func:`check_repeat`,
   ``insert_delivery``, :func:`bind_window`, :func:`record_event_id`, ``enqueue``.
-- TODO(#22) the send pipeline.
+- ``send.py`` (#22) is the pipeline that calls them (through ``decide.py``).
 - Every delivery end except ``sent`` and ``unknown`` (``failed``, ``dropped``, ``expired`` and a
   notifier-side ``disabled``) calls :func:`release` in the same transaction: ``outcome.py`` does so
   for a call; TODO(#23) (flush step 4 expiry) and TODO(#26) (``prune`` expiry of queue rows) must.

@@ -29,7 +29,7 @@ Choices where the interface is silent (the narrower reading):
 
 Link building is ``links.py`` (#12); this module takes the two derived URLs as arguments and
 renders no link.
-TODO(#22): the send pipeline calls :func:`render` after :func:`~notice_route.match.decide`.
+``send.py`` (#22) calls :func:`render` after :func:`~notice_route.match.decide`.
 """
 
 from __future__ import annotations
