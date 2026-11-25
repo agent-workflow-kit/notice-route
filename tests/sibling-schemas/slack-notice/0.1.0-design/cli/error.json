@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "slack-notice/cli/error.json",
+  "title": "Error envelope (any command with --json)",
+  "description": "Printed on stdout for a non-zero exit with --json. Exit 20 has code refused with reason set; reason is null elsewhere; retryable and unknown_outcome are booleans on exit 12 and exit 1 and null on exit 2 and 20; retry_after_s is set only for rate_limited (the tool's own backoff, not a server hint). message and details are fixed strings.",
+  "type": "object",
+  "properties": {
+    "error": {
+      "$ref": "../defs.json#/$defs/error"
+    }
+  },
+  "required": [
+    "error"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,13 @@
+{
+  "tool": "ha-notice",
+  "version": "0.28.0",
+  "source_commit": "c614d97e8cf567682b6a59ad3a6ccd359f4bc704",
+  "note": "copied: byte-for-byte from the sibling's schemas/ at source_commit; authored: written here (producers publish no payload examples). Re-pin: copy, update version/source_commit/hashes together.",
+  "copied": {
+    "cli/error.json": "d9706615042c346679e38e8a41595a623d100da6841b2998d01244cb8b095bf3",
+    "cli/send.json": "b873f5eeb60254cd50a0a23f7e7910c481cfdd3f692eea6408de4d549ebeeb98",
+    "defs.json": "d2becef90b5cee8e25a65bc91c769649f23a7e564fd748b74c669717b9acf461",
+    "notification.json": "61bdfa50402a25521980121bea55d67de44e12e5f9b929fb9edc32c853bec908"
+  },
+  "authored": {}
+}

@@ -123,7 +123,7 @@ Still to verify (live tests in the plan, with conservative defaults until then):
 | `flush.py` | due rows in the order of `flush`, digests, delivery |
 | `history.py`, `hooks.py`, `cron.py`, `log.py` | `history`, `post-fail` from `flush`, the cron block, `log.jsonl` |
 
-Dependencies: `pyyaml` (YAML cannot be read from the standard library) and `pydantic` (the design guide's config validation); everything else is the standard library (`argparse`, `sqlite3`, `zoneinfo`, `subprocess`, `selectors`, `fcntl`, `hashlib`, `json`). No HTTP client is needed: the router never speaks to a network.
+Dependencies: `pyyaml` (YAML cannot be read from the standard library) and `pydantic` (the design guide's config validation); everything else is the standard library (`argparse`, `sqlite3`, `zoneinfo`, `subprocess`, `selectors`, `fcntl`, `hashlib`, `json`). No HTTP client is needed: the router never speaks to a network. Development only: `jsonschema` validates the fakes' output and every `--json` output against the schemas in tests (it is never imported by the package).
 
 ## Data model
 
@@ -144,7 +144,7 @@ Failures are values: every call ends in one of the outcomes of [Retries and outc
 ## Test strategy
 
 - Every subprocess, lock and clock use goes through `gateway.py`; tests substitute fakes. Fake notifiers live in `tests/fakebin/` and can exit with any code, print any envelope, sleep, ignore SIGTERM, spawn a grandchild, close stdin early and write oversized output.
-- `--json` outputs have golden files and are validated against `schemas/`; the sibling notifiers' error envelope and `send` schemas are copied into `tests/` at a pinned version.
+- `--json` outputs have golden files and are validated against `schemas/`; the sibling notifiers' error envelope and `send` schemas, with their `defs.json` and `notification.json`, are copied into `tests/` at a pinned version.
 - Process tests run in CI: group kill with a grandchild, the bounded reader, `flock` serialization across 8 processes including a SIGKILLed holder, concurrent `send` and `flush` claiming each row once, SIGKILL after the decision transaction and before the call (the row is sent by the next `flush` and a redelivery of the same `event_id` is `redelivered`), SIGTERM before the call (claims cleared, exit 128+N), two `flush` on one destination with 40 due rows (each row sent once), the dedup statement under 8 writers.
 - Spike regressions: the window brute force as a property test; the strict reader cases; the template non-re-expansion case; bad time zone keys; the fixture "New York, 2026-11-01, window 22:00 to 01:30: inside until 01:30 EDT, inside again 01:00 to 01:30 EST".
 - Behavior cases: a `failed` first send, then the next identical notification inside the window is sent; agent-spawn and claude-session both send `event_id: 41` to one destination, and both are sent; an evicted (`overflow`) and an `expired` row: the producer's redelivery of the same event is sent; a release after a later window opened with the same key leaves the later window.
@@ -153,7 +153,7 @@ Failures are values: every call ends in one of the outcomes of [Retries and outc
 - Database timing: a `prune` of 100000 rows and 8 concurrent `send`s: no `send` waits more than 0.5 s per transaction; the record transaction fails after a call: exit 1, the row is resent by `flush` once.
 - Text and config cases: sanitize: tab becomes a space; a ZWJ emoji survives; a title of U+3164 renders empty and the message fallback applies; a NUL in literal template text becomes a space; an overnight window with `days: [fri]`: Saturday 02:00 inside, Sunday 02:00 outside; a symlink to a user-owned venv script passes and the resolved path runs, and the same with a group-writable directory on the resolved path fails `exec_failed`.
 - Fake notifiers also include a double fork with `setsid` holding stdout.
-- The example config and the drop-in are validated as one config and rendered in CI against pinned copies of the producers' hook schemas' examples; any `missing` or `excluded` token fails.
+- The example config and the drop-in are validated as one config and rendered in CI against hook payload examples written in this repository and validated against pinned copies of the producers' hook schemas; any `missing` or `excluded` token fails.
 - `live` tests (deselected, never in CI): the real notifier trio, a marked test to the user's own Slack direct messages only.
 - `make verify` runs ruff, pyright, pytest and markdown lint, and checks that every relative link in `docs/` and the README resolves. CI is Linux only; macOS is checked locally.
 
