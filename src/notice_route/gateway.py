@@ -38,6 +38,7 @@ from typing import Literal, Protocol
 from .schema import APPLICATION_ID, SCHEMA_VERSION
 
 __all__ = [
+    "ChildLostError",
     "Clock",
     "DirHandle",
     "FakeClock",
@@ -50,6 +51,7 @@ __all__ = [
     "POLL_INTERVAL",
     "RunResult",
     "SYSTEM_TZ_DIRS",
+    "SigchldIgnoredError",
     "StateError",
     "StateFiles",
     "StateView",
@@ -222,6 +224,16 @@ class UnsafePathError(Exception):
         super().__init__(f"refused {path!r}: {reason}")
         self.reason = reason
         self.path = path
+
+
+class SigchldIgnoredError(RuntimeError):
+    """``Gateway.run`` refused to start: SIGCHLD is ignored, so the kernel would reap children
+    unseen. Nothing was started."""
+
+
+class ChildLostError(RuntimeError):
+    """``Gateway.run`` started a child but cannot report how it ended: it was reaped by someone
+    else, or could not be reaped. The group is already killed; the outcome is unknown."""
 
 
 class StateError(Exception):
@@ -417,12 +429,13 @@ class Gateway:
         Raises ``ValueError`` for a bad ``argv`` (not a non-empty list of strings without NUL),
         ``env`` (keys with ``=`` or NUL, values with NUL, non-strings), ``timeout`` (not a
         finite positive int or float) or ``stdin`` (not None, str, bytes, bytearray or
-        memoryview), all before anything starts. Raises ``RuntimeError`` when SIGCHLD is
-        ignored (the kernel would reap children and the results would be wrong) or when the
-        child could not be reaped. Precondition: SIGPIPE is ignored, as Python does by default.
+        memoryview), all before anything starts. Raises ``SigchldIgnoredError`` (nothing started)
+        when SIGCHLD is ignored (the kernel would reap children and the results would be wrong)
+        and ``ChildLostError`` (the child ran; its fate is unknown) when it could not be reaped
+        or another reaper took it; both are ``RuntimeError``. Precondition: SIGPIPE is ignored, as Python does by default.
         """
-        # TODO(#19): the notifier argv/env builders (scrubbed PATH, locale, named variables)
-        # live in the caller; this method passes ``env`` through untouched.
+        # The notifier argv and environment are built by ``notice_route.notify`` (#19); this
+        # method passes ``env`` through untouched.
         if isinstance(argv, (str, bytes)):
             raise ValueError("argv must be a list of strings, not one string")
         args = list(argv)
@@ -447,7 +460,7 @@ class Gateway:
         else:
             raise ValueError("stdin must be None, str, bytes, bytearray or memoryview")
         if signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN:
-            raise RuntimeError("SIGCHLD is ignored: the kernel would reap children unseen")
+            raise SigchldIgnoredError("SIGCHLD is ignored: the kernel would reap children unseen")
         started = self.clock.monotonic()
         try:
             proc = subprocess.Popen(
@@ -770,11 +783,15 @@ class Gateway:
                 return True
             current = parent
 
-    def check_exec(self, path: str) -> bool:
-        """``cmd_ok``: ``path`` resolved with ``realpath`` is a regular file owned by the user or
-        root, not group- or world-writable, without setuid or setgid, in directories that are
-        owned by the user or root and not group- or world-writable. Runs nothing."""
+    def resolve_exec(self, path: str) -> str | None:
+        """The ``realpath`` of ``path`` when it passes the ``cmd_ok`` check, else None.
+
+        The file is a regular file owned by the user or root, not group- or world-writable,
+        without setuid or setgid, in directories owned by the user or root and not group- or
+        world-writable. A notifier call executes the returned path, not ``path``. Runs nothing."""
         try:
+            if not path.startswith("/"):
+                return None
             resolved = os.path.realpath(path, strict=True)
             info = os.stat(resolved)
             uid = os.geteuid()
@@ -783,10 +800,32 @@ class Gateway:
                 or info.st_uid not in (uid, 0)
                 or info.st_mode & (0o022 | stat.S_ISUID | stat.S_ISGID)
             ):
-                return False
-            return self._dirs_trusted(os.path.dirname(resolved))
+                return None
+            return resolved if self._dirs_trusted(os.path.dirname(resolved)) else None
         except (OSError, ValueError):
-            return False
+            return None
+
+    def check_exec(self, path: str) -> bool:
+        """``cmd_ok``: :meth:`resolve_exec` finds a path. Runs nothing."""
+        return self.resolve_exec(path) is not None
+
+    def clean_path(self, value: str) -> str:
+        """``value`` (a ``PATH``) without its empty, relative, missing and unsafe entries, in order.
+
+        An entry is kept when it is an absolute path that, after symlinks, is a directory owned
+        by the user or root and not group- or world-writable. Nothing else is changed."""
+        uid = os.geteuid()
+        kept: list[str] = []
+        for entry in value.split(":"):
+            if not entry.startswith("/") or "\x00" in entry:
+                continue
+            try:
+                info = os.stat(entry)
+            except (OSError, ValueError):
+                continue
+            if stat.S_ISDIR(info.st_mode) and info.st_uid in (uid, 0) and not info.st_mode & 0o022:
+                kept.append(entry)
+        return ":".join(kept)
 
     def check_env_file(self, path: str) -> bool:
         """``cron.env_file``: by ``lstat`` a regular file (not a symlink) owned by the user with
@@ -1240,9 +1279,9 @@ class _Supervisor:
                 self._release()
             raise
         if self.foreign_reap:
-            raise RuntimeError("child was reaped by someone else; status unknown")
+            raise ChildLostError("child was reaped by someone else; status unknown")
         if self.proc.returncode is None:
-            raise RuntimeError(f"could not reap child pid {self.pgid}")
+            raise ChildLostError(f"could not reap child pid {self.pgid}")
         return result
 
     def _release(self) -> None:
