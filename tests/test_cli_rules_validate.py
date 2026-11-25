@@ -382,10 +382,11 @@ def test_config_flag_with_a_missing_file_is_config_invalid_key_config_flag(
 def test_config_flag_is_refused_before_the_command_and_by_unknown_commands(
     gw: Gateway,
 ) -> None:
-    for argv in (["--config", "/x", "rules"], ["send", "--config", "/x"]):
+    for argv in (["--config", "/x", "rules"], ["bogus", "--config", "/x"]):
         with pytest.raises(SystemExit) as exc:
             main(argv, gw)
         assert exc.value.code == 2
+    assert main(["send", "--config", "/x"], gw) == 2  # send refuses it itself (exit 2 usage)
 
 
 # --- validate --------------------------------------------------------------------------------

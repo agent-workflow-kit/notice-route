@@ -10,7 +10,7 @@ Output rules (docs/interface.md, Output and Exit codes):
 - Without ``--json`` the commands print readable lines on stdout; ``--quiet`` drops the
   advisory stderr line of an unconfigured run.
 - ``--config`` is accepted only by the commands that run nothing and write nothing (``rules`` and
-  ``validate`` now, ``test`` later); a missing file is ``config_invalid``, key ``--config``.
+  ``validate`` and ``test``); a missing file is ``config_invalid``, key ``--config``.
 """
 
 from __future__ import annotations
@@ -23,7 +23,9 @@ from typing import Any
 
 from . import __version__
 from .config import ConfigError
+from .dryrun import dry_run_document
 from .gateway import Gateway, HomeError, StateError
+from .payload import InputFlags, PayloadError, UsageError, load_notification
 from .report import rules_document, validate_document
 from .validate import load_valid_config
 
@@ -68,8 +70,31 @@ def build_parser() -> argparse.ArgumentParser:
     _add_global_flags(validate, top=False)
     _add_config_flag(validate)
     # TODO(#29): --probe (it refuses --config, like every command that runs a notifier).
-    # TODO(#13): the test command takes --config too. TODO(#22): send refuses it (exit 2 usage).
+
+    test = commands.add_parser(
+        "test", help="show what send would do, without doing it", allow_abbrev=False
+    )
+    _add_global_flags(test, top=False)
+    _add_config_flag(test)
+    _add_input_flags(test)
+
+    # TODO(#22): the real send (without --dry-run) and its own flags (--actor, --decision-id).
+    send = commands.add_parser("send", help="route one notification", allow_abbrev=False)
+    _add_global_flags(send, top=False)
+    _add_input_flags(send)
+    send.add_argument("--dry-run", action="store_true", help="same as test; changes nothing")
+    # Parsed only to refuse it with exit 2 `usage`: send never reads a config from a flag.
+    send.add_argument("--config", metavar="PATH", default=None, help=argparse.SUPPRESS)
     return parser
+
+
+def _add_input_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--stdin-json", action="store_true", help="read one JSON object on stdin")
+    parser.add_argument("--file", metavar="PATH", default=None, help="read the JSON from a file")
+    parser.add_argument("--title", default=None, help="a plain title (untrusted text)")
+    parser.add_argument("--message", default=None, help="a plain message (untrusted text)")
+    parser.add_argument("--source", default=None, help="the source of a channel notice")
+    parser.add_argument("--label", action="append", default=[], metavar="K=V", help="a label")
 
 
 # --- output ----------------------------------------------------------------------------------
@@ -201,6 +226,77 @@ def _run_validate(args: argparse.Namespace, gateway: Gateway) -> int:
     return code
 
 
+def _list_text(items: Sequence[str]) -> str:
+    return ",".join(items) or "none"
+
+
+def _dry_run_text(doc: dict[str, Any]) -> None:
+    def show(value: object) -> str:
+        return "none" if value is None else str(value)
+
+    lines = [
+        f"shape: {doc['shape']}",
+        f"source: {doc['source']}",
+        f"hook: {show(doc['hook'])}",
+        f"rule: {show(doc['rule'])}",
+        f"reason: {show(doc['reason'])}",
+        f"level: {show(doc['level'])}",
+        f"title: {show(doc['title'])}",
+        f"message: {show(doc['message'])}",
+        f"link: {show(doc['link'])}",
+        f"missing: {_list_text(doc['missing'])}",
+        f"excluded: {_list_text(doc['excluded'])}",
+        f"text_excluded: {str(doc['text_excluded']).lower()}",
+        f"labels_ignored: {doc['labels_ignored']}",
+        f"dedupe: {show(doc['dedupe'])}",
+    ]
+    for d in doc["destinations"]:
+        why = f" ({d['reason']})" if d["reason"] else ""
+        lines.append(f"destination {d['name']}: {d['decision']}{why}")
+    for line in lines:
+        _out(_safe(line) + "\n")
+
+
+def _run_dry_run(args: argparse.Namespace, gateway: Gateway) -> int:
+    """``test`` and ``send --dry-run``: send steps 1 to 6 for the config alone. Nothing is
+    written, locked, spawned or sent; ``state.db`` is not opened at all yet (TODO(#18): open it
+    read-only, when it exists, for the redelivery, repeat and cap decisions)."""
+    started = gateway.monotonic()
+    flags = InputFlags(
+        stdin_json=args.stdin_json,
+        file=args.file,
+        title=args.title,
+        message=args.message,
+        source=args.source,
+        labels=tuple(args.label),
+    )
+    is_test = args.command == "test"
+    notification = load_notification(gateway, flags, started, default_stdin=is_test)
+    config = load_valid_config(gateway, args.config if is_test else None)
+    doc, code = dry_run_document(config, notification)
+    if args.json:
+        _json(doc)
+    else:
+        _dry_run_text(doc)
+    if config is None and not args.quiet:
+        _err(f"{PROG}: no config\n")
+    return code
+
+
+def _refused(exc: PayloadError | UsageError, *, as_json: bool) -> int:
+    """Exit 20 (refused) or 2 (usage): the fixed message, and a pointer word for a refusal."""
+    if as_json:
+        _json(exc.to_error())
+    pointer = getattr(exc, "pointer", None)
+    code = "refused" if isinstance(exc, PayloadError) else "usage"
+    _err(
+        f"{PROG}: {code}: {exc.message}"
+        + (f" (pointer {pointer or '.'})" if pointer is not None else "")
+        + "\n"
+    )
+    return exc.exit_code
+
+
 def main(argv: Sequence[str] | None = None, gateway: Gateway | None = None) -> int:
     try:
         return _main(argv, gateway)
@@ -224,7 +320,17 @@ def _main(argv: Sequence[str] | None, gateway: Gateway | None) -> int:
     try:
         if args.command == "rules":
             return _run_rules(args, gateway)
+        if args.command == "send" and args.config is not None:
+            raise UsageError("flags")  # send never takes --config, --dry-run included
+        if args.command == "test" or (args.command == "send" and args.dry_run):
+            return _run_dry_run(args, gateway)
+        if args.command == "send":
+            # TODO(#22): the real send.
+            _error("internal", "send is not implemented yet", None, as_json=args.json)
+            return EXIT_INTERNAL
         return _run_validate(args, gateway)
+    except (PayloadError, UsageError) as exc:
+        return _refused(exc, as_json=args.json)
     except ConfigError as exc:
         _error(exc.code, str(exc), {"key": exc.key}, as_json=args.json)
         return EXIT_USAGE
