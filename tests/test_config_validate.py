@@ -225,6 +225,11 @@ def test_rule_dedup_window_defaults_to_the_defaults_key() -> None:
     )
 
 
+def test_a_cmd_element_that_only_starts_with_send_is_accepted() -> None:
+    cfg = build({"destinations.chat.cmd": ["/bin/x", "send=1", "sender"]})
+    assert check(cfg).destinations["chat"].cmd == ("/bin/x", "send=1", "sender")
+
+
 def test_the_input_is_not_modified() -> None:
     cfg = good()
     before = copy.deepcopy(cfg)
@@ -381,7 +386,6 @@ for word in [
     "--dedupe-key=ab",
     "--json=1",
     "--stdin-json=1",
-    "send=1",
 ]:
     bad(
         f"cmd-forbidden-{word}",

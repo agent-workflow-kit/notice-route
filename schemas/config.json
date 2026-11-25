@@ -196,7 +196,7 @@
             "not": {
               "contains": {
                 "type": "string",
-                "pattern": "^(?:send|--stdin-json|--json|--actor|--dedupe-key)(?:=[\\s\\S]*)?(?![\\s\\S])"
+                "pattern": "^(?:send|(?:--stdin-json|--json|--actor|--dedupe-key)(?:=[\\s\\S]*)?)(?![\\s\\S])"
               }
             },
             "maxItems": 32,

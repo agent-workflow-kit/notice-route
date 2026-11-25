@@ -120,6 +120,31 @@ def test_clean_path_drops_a_file_and_a_directory_of_another_owner(
     assert gw.clean_path(str(a)) == ""
 
 
+def test_clean_path_drops_a_missing_entry_alone(gw: Gateway, base: Path) -> None:
+    assert gw.clean_path(f"{base}/missing") == ""
+
+
+def test_clean_path_drops_a_non_directory_entry_alone(gw: Gateway, base: Path) -> None:
+    assert gw.clean_path(str(_exe(base / "file", 0o600))) == ""
+
+
+def test_clean_path_drops_a_foreign_owned_entry_but_not_a_foreign_owned_ancestor(
+    gw: Gateway, base: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    a = _dir(base / "a")
+    real_stat = os.stat
+
+    def foreign(path: Any, *args: Any, **kw: Any) -> Any:
+        info = real_stat(path, *args, **kw)
+        owner = 54321 if str(path) == str(a) else info.st_uid
+        return os.stat_result((*tuple(info)[:4], owner, *tuple(info)[5:]))
+
+    monkeypatch.setattr(gw_mod.os, "stat", foreign)
+    assert gw.clean_path(str(a)) == ""
+    inner = _dir(a / "inner")
+    assert gw.clean_path(str(inner)) == str(inner)  # the entry is judged, its ancestors are not
+
+
 def test_clean_path_follows_a_symlink_to_a_wide_directory(gw: Gateway, base: Path) -> None:
     wide = _dir(base / "wide", 0o777)
     link = base / "link"

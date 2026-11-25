@@ -94,11 +94,14 @@ The sources are the notifiers' interfaces (`Calling from automation`, `Exit code
 
 ## Unverified (for the live-verification issue, #31)
 
-- wsl-notice: no repository or interface exists yet in the workspace; its call shape, exit
-  codes and envelope are assumed to be the same as the other two. Its `WSL_INTEROP` and
-  `WSL_DISTRO_NAME` handling and its lock behavior are not modeled.
-- slack-notice is pinned at its design version (0.1.0-design, no implementation released):
-  everything about it comes from its interface and schemas. ha-notice is pinned at 0.28.0 and was
+- wsl-notice: its repository is `desktop-notice` (design 0.1.0, schemas in `schemas/cli`); this
+  fake assumes the same call shape, exit codes and envelope as the other two and has no
+  wsl-notice shape of its own. Its `WSL_INTEROP` and `WSL_DISTRO_NAME` handling and its lock
+  behavior are not modeled. todo(#31): re-pin from that repository and give the fake a
+  wsl-notice shape.
+- slack-notice has an implementation (0.25.1) but the pin here is still its design version
+  (0.1.0-design), and the schemas have drifted since. todo(#31): re-pin and compare. Until
+  then everything about it comes from the pinned interface and schemas. ha-notice is pinned at 0.28.0 and was
   compared with a real `ha-notice send --dry-run --config <scratch>` differential on payloads
   and argv (2026-11-24, 0.28.0); slack-notice was not compared with anything real.
 - That the real tool loads and checks its config before reading input (so `config_invalid`,

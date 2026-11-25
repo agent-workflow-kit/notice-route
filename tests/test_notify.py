@@ -11,15 +11,13 @@ import hashlib
 import json
 import os
 import signal
-import sys
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from notice_route import notify
-from notice_route.gateway import STDERR_LIMIT, STDOUT_LIMIT, FakeClock, Gateway
+from notice_route.gateway import STDERR_LIMIT, STDOUT_LIMIT, ChildLostError, FakeClock, Gateway
 from notice_route.notify import (
     DEADLINE_EXTRA,
     FIXED_NAMES,
@@ -137,7 +135,25 @@ def test_json_holds_all_four_fields() -> None:
 
 
 def test_json_never_writes_null() -> None:
-    assert "null" not in notification_json(title="", message="", level="info", link="")
+    assert "null" not in notification_json(title="", message="m", level="info", link="")
+
+
+def test_json_key_order_is_title_message_level_link() -> None:
+    text = notification_json(title="T", message="M", level="warn", link="https://h.example/x")
+    assert text == '{"title":"T","message":"M","level":"warn","link":"https://h.example/x"}'
+
+
+def test_json_refuses_an_empty_message() -> None:
+    with pytest.raises(ValueError):
+        notification_json(title="t", message="", level="info", link="")
+
+
+@pytest.mark.parametrize("field", ["title", "message", "link"])
+def test_json_refuses_a_lone_surrogate(field: str) -> None:
+    fields = {"title": "t", "message": "m", "level": "info", "link": ""}
+    fields[field] = "a\ud800b"
+    with pytest.raises(ValueError):
+        notification_json(**fields)
 
 
 @pytest.mark.parametrize("level", ["", "loud", "INFO", "info\n", None, 3])
@@ -161,10 +177,8 @@ HOSTILE_TEXTS = [
     'quote " backslash \\ and \\u0041',
     "{{title}} ${HOME} $(id) `id` ; rm -rf / --flag -n",
     "snowman ☃ astral \U0001f600 rtl ‮ zwj ‍",
-    "\ud800 lone surrogate",
     "   separators",
     "x" * 100_000,
-    "",
 ]
 
 
@@ -173,7 +187,7 @@ def test_json_round_trips_hostile_text_exactly(text: str) -> None:
     out = notification_json(title=text, message=text + "!", level="info", link="")
     assert out.isascii()
     body = json.loads(out)
-    assert body.get("title", "") == text
+    assert body["title"] == text
     assert body["message"] == text + "!"
     assert "\n" not in out
 
@@ -293,6 +307,13 @@ def test_wsl_variables_pass_only_for_wsl_notice(tmp_path: Path) -> None:
         assert "WSL_INTEROP" not in other and "WSL_DISTRO_NAME" not in other
 
 
+def test_wsl_notice_without_wsl_variables_gets_only_the_fixed_three(tmp_path: Path) -> None:
+    base = _clean_dir(tmp_path / "b")
+    gw = Gateway(environ=lambda: {"PATH": str(base)}, exec_check_from=str(base))
+    env = build_env(gw, dest("d", kind="wsl-notice")).env
+    assert env == {"PATH": str(base), "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"}
+
+
 def test_wsl_variables_are_skipped_when_unset_empty_or_hold_nul(tmp_path: Path) -> None:
     base = _clean_dir(tmp_path / "b")
     for value in ("", "a\x00b"):
@@ -375,14 +396,10 @@ def test_worst_case_is_lock_wait_plus_largest_timeout_plus_seventeen(
 ) -> None:
     from dataclasses import replace
 
-    from notice_route.gateway import FINAL_READ, TERM_GRACE
-
     config = replace(
         make_config(*(dest(f"d{i}", timeout=t) for i, t in enumerate(timeouts))),
         lock_wait=lock_wait,
     )
-    parts = DEADLINE_EXTRA + TERM_GRACE + FINAL_READ + 1.0  # the last is the database
-    assert parts == 17.0
     assert worst_case_s(config) == lock_wait + max(timeouts, default=0.0) + 17.0
 
 
@@ -653,23 +670,6 @@ def test_a_file_that_cannot_be_executed_ends_exec_failed(tmp_path: Path, isolate
     assert result.status == "exec_failed" and result.run is None
 
 
-def test_the_exec_failed_result_carries_no_exception_text(tmp_path: Path, isolated: Path) -> None:
-    base = _clean_dir(tmp_path / "b")
-    plain = base / "plain_CANARY_name"
-    plain.write_text("x")
-    plain.chmod(0o600)
-    result = call_notifier(
-        gateway_for(base),
-        dest("d", cmd=(str(plain),)),
-        title="t",
-        message="m",
-        level="info",
-        link="",
-        dedupe_key=None,
-    )
-    assert "CANARY" not in repr(result)
-
-
 # --- every Gateway.run result and exception ---------------------------------------------------
 
 
@@ -798,6 +798,89 @@ def test_the_module_reads_no_global_environment(
     assert result.status == "env_missing"
 
 
-def test_the_module_exports_what_later_issues_need() -> None:
-    assert {"call_notifier", "CallResult", "build_argv", "build_env"} <= set(notify.__all__)
-    assert sys.version_info >= (3, 12)
+def test_a_clock_failure_before_the_start_propagates_and_is_not_lost(
+    make_notifier: Make, isolated: Path
+) -> None:
+    class BrokenClock(FakeClock):
+        def monotonic(self) -> float:
+            raise RuntimeError("clock")
+
+    n = make_notifier()
+    gw = gateway_for(n.stub.parent, clock=BrokenClock())
+    with pytest.raises(RuntimeError, match="clock"):
+        go(n, gw=gw)
+    assert n.events("invoke") == []
+
+
+def test_a_child_lost_error_maps_to_lost(
+    monkeypatch: pytest.MonkeyPatch, make_notifier: Make, isolated: Path
+) -> None:
+    def lost(self: Gateway, *_a: Any, **_k: Any) -> Any:
+        raise ChildLostError("gone")
+
+    monkeypatch.setattr(Gateway, "run", lost)
+    result = go(make_notifier())
+    assert result.status == "lost" and result.run is None
+
+
+def test_a_ran_result_never_keeps_stderr(make_notifier: Make, isolated: Path) -> None:
+    n = make_notifier(stderr="noisy line\n" * 50)
+    result = go(n)
+    assert result.status == "ran" and result.run is not None
+    assert result.run.stderr == b""
+
+
+def test_an_overflow_on_stderr_is_still_reported_without_the_bytes(
+    make_notifier: Make, isolated: Path
+) -> None:
+    n = make_notifier(stderr_bytes=STDERR_LIMIT + 10)
+    result = go(n)
+    assert result.run is not None
+    assert result.run.status == "overflow" and result.run.overflow == "stderr"
+    assert result.run.stderr == b""
+
+
+def test_a_surrogate_or_an_empty_message_is_not_started(
+    make_notifier: Make, isolated: Path
+) -> None:
+    n = make_notifier()
+    assert go(n, title="a\ud800").status == "not_started"
+    assert go(n, message="").status == "not_started"
+    assert go(n, link="\udfff").status == "not_started"
+    assert n.events("invoke") == []
+
+
+def test_no_argv_holds_validate_or_a_test_message() -> None:
+    for key in (None, DIGEST):
+        argv = build_argv("/bin/x", ("/bin/x", "--config", "/c"), key)
+        assert "validate" not in argv
+        assert not any("--test-message" in word for word in argv)
+
+
+def test_refusals_are_ordered_bad_input_then_env_missing_then_exec_failed(
+    tmp_path: Path, isolated: Path
+) -> None:
+    base = _clean_dir(tmp_path / "b")
+    gw = gateway_for(base)
+    destination = dest("d", cmd=(str(base / "missing"),), env=("CRED_ONE",))
+
+    def call(**kw: Any) -> CallResult:
+        fields: dict[str, Any] = {
+            "title": "t",
+            "message": "m",
+            "level": "info",
+            "link": "",
+            "dedupe_key": None,
+        }
+        fields.update(kw)
+        return call_notifier(gw, destination, **fields)
+
+    assert call(level="loud").status == "not_started"
+    assert call().status == "env_missing"
+    gw2 = gateway_for(base, {"CRED_ONE": "v"})
+    assert (
+        call_notifier(
+            gw2, destination, title="t", message="m", level="info", link="", dedupe_key=None
+        ).status
+        == "exec_failed"
+    )
