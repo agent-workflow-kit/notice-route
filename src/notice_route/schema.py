@@ -75,7 +75,7 @@ _V1: tuple[str, ...] = (
     "CREATE INDEX queue_delivery ON queue (delivery_id)",
     "CREATE INDEX queue_due ON queue (deliver_after)",
     # One window per destination and key; the window length is stored and never changed.
-    # TODO(#17): the dedup statements (open, replace an ended window, release by delivery_id).
+    # The dedup statements live in dedup.py (#17).
     """
     CREATE TABLE dedup (
         id INTEGER PRIMARY KEY AUTOINCREMENT,

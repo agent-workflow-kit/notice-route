@@ -506,8 +506,7 @@ def trim_event_ids(
     keep_id: int | None = None,
 ) -> int:
     """As :func:`trim_deliveries` for ``event_ids`` (nothing protects an event id row
-    but ``keep_id``, the row the caller just inserted).
-    TODO(#17): call it where an event id is recorded."""
+    but ``keep_id``, the row the caller just inserted). ``dedup.record_event_id`` calls it."""
     want = _excess(conn, "event_ids", cap, batch)
     if want == 0:
         return 0
