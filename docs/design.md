@@ -124,6 +124,7 @@ Still to verify (live tests in the plan, with conservative defaults until then):
 | `window.py` | quiet-hour membership and window ends (pure functions) |
 | `decide.py` | the per-destination decision order and the dedup and rate statements |
 | `store.py` | SQLite access, migrations, bounded tables, counters |
+| `schema.py` | the table definitions as versioned migrations, `user_version` and `application_id` (no I/O) |
 | `queue.py` | queue claims and recovery: every call claims its rows, lease expiry, the flush lock, the 100-row cap on unclaimed rows and lowest-level eviction |
 | `notifier.py` | building the call, classifying a result, the retry schedule |
 | `gateway.py` | the only place that spawns processes, locks files, reads clocks and touches the filesystem outside the store |
@@ -135,6 +136,8 @@ Dependencies: `pyyaml` (YAML cannot be read from the standard library); everythi
 ## Data model
 
 See [Files](interface.md#files). Migrations are versioned and additive. Rows are updated in place; repeats are counted, not stored. Every table is bounded: queue 100 unclaimed rows per destination, `deliveries` and `event_ids` 100000 rows each, enforced on insert, at most 16 stored labels per row, dedup rows until their window ends or their delivery fails. The queue row carries rendered text only until its delivery, expiry or drop. A destination's identity in every table is its name; renaming a destination in config starts a fresh history for it.
+
+C-43: the state database (#14). `Gateway.prepare_state_db` does every filesystem check on descriptors (directory 0700 and owned; `state.db` opened with `O_NOFOLLOW`, regular, owned, mode 0600, one link; `-wal`, `-shm` and `-journal` the same by `lstat`) because SQLite opens by path and cannot use `O_NOFOLLOW`; `store.py` then connects, which keeps `sqlite3` and the schema out of the gateway. `user_version` counts applied migrations and `application_id` marks the file as ours; a file with another `application_id`, a newer `user_version`, a missing table, or SQLite's own refusal is a `StoreError` whose text is a fixed sentence per reason. Migrations run in one `BEGIN IMMEDIATE` transaction that re-reads the version, so two first-run processes cannot both create the tables, and a crash leaves the old version. The connection is in autocommit with `query_only` on and `Store.write` is the only way to write (`BEGIN IMMEDIATE`). Pragmas: `foreign_keys`, `trusted_schema` off, `cell_size_check`, `secure_delete` (a row's text is overwritten when the row goes), `synchronous=NORMAL`, WAL, memory temp store; defensive mode and low SQLite limits (no `ATTACH`). `quick_check` (about 0.1 s at 100000 rows) runs only before a migration and through `Store.check_integrity`, not on every open, to keep `send` inside its 0.5 s transaction. `surfaced.period` is `YYYY-MM-DD`, or `YYYY-MM-DDThh` for the hourly codes, and `(destination, code, period)` is unique, which enforces the once-per-period surfacing limit. `dedup` is unique per `(destination, key_digest)` and `event_ids` per `(destination, source, hook, event_id, repeat_digest)`. Only `queue.delivery_id` has a foreign key: `surfaced`, `dedup` and `event_ids` rows may outlive their `deliveries` row.
 
 ## Queue and row model
 

@@ -21,6 +21,7 @@ from notice_route.store import (
     DELIVERIES_CAP,
     Store,
     StoreError,
+    open_readonly,
     open_store,
     trim_deliveries,
     trim_event_ids,
@@ -52,6 +53,12 @@ def pragma(conn: sqlite3.Connection, name: str) -> object:
 
 def raw(db: Path) -> sqlite3.Connection:
     return sqlite3.connect(db)
+
+
+def ro(gw: Gateway) -> Store:
+    store = open_readonly(gw)
+    assert store is not None
+    return store
 
 
 def add_delivery(store: Store, outcome: str = "sent", destination: str = "d") -> int:
@@ -344,7 +351,7 @@ def test_a_failing_migration_leaves_the_old_version_usable(gw: Gateway) -> None:
 
 
 def test_a_newer_schema_is_refused_and_untouched(gw: Gateway, db: Path) -> None:
-    open_store(gw).close()  # type: ignore[union-attr]
+    open_store(gw).close()
     c = raw(db)
     c.execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
     c.close()
@@ -356,19 +363,19 @@ def test_a_newer_schema_is_refused_and_untouched(gw: Gateway, db: Path) -> None:
 
 
 def test_a_newer_schema_is_refused_read_only_too(gw: Gateway, db: Path) -> None:
-    open_store(gw).close()  # type: ignore[union-attr]
+    open_store(gw).close()
     c = raw(db)
     c.execute("PRAGMA user_version=99")
     c.close()
     with pytest.raises(StoreError) as err:
-        open_store(gw, readonly=True)
+        open_readonly(gw)
     assert err.value.reason == "newer"
 
 
 def test_an_older_database_is_not_migrated_read_only(gw: Gateway) -> None:
-    open_store(gw).close()  # type: ignore[union-attr]
+    open_store(gw).close()
     with pytest.raises(StoreError) as err:
-        open_store(gw, readonly=True, migrations=V2)
+        open_readonly(gw, migrations=V2)
     assert err.value.reason == "older"
 
 
@@ -457,7 +464,7 @@ def test_another_programs_sqlite_database_is_refused_and_untouched(
 
 
 def test_a_database_missing_a_table_is_refused(gw: Gateway, db: Path) -> None:
-    open_store(gw).close()  # type: ignore[union-attr]
+    open_store(gw).close()
     c = raw(db)
     c.execute("DROP TABLE rate")
     c.close()
@@ -467,7 +474,7 @@ def test_a_database_missing_a_table_is_refused(gw: Gateway, db: Path) -> None:
 
 
 def test_a_read_only_file_is_refused(gw: Gateway, db: Path) -> None:
-    open_store(gw).close()  # type: ignore[union-attr]
+    open_store(gw).close()
     db.chmod(0o400)
     try:
         with pytest.raises(StoreError) as err:
@@ -478,7 +485,7 @@ def test_a_read_only_file_is_refused(gw: Gateway, db: Path) -> None:
 
 
 def test_a_read_only_directory_is_refused(gw: Gateway, state: Path) -> None:
-    open_store(gw).close()  # type: ignore[union-attr]
+    open_store(gw).close()
     for name in ("state.db-wal", "state.db-shm"):
         (state / name).unlink(missing_ok=True)
     state.chmod(0o500)
@@ -491,7 +498,7 @@ def test_a_read_only_directory_is_refused(gw: Gateway, state: Path) -> None:
 
 
 def test_a_busy_database_is_refused_after_the_timeout(gw: Gateway, db: Path) -> None:
-    open_store(gw).close()  # type: ignore[union-attr]
+    open_store(gw).close()
     holder = sqlite3.connect(db, isolation_level=None)
     holder.execute("BEGIN IMMEDIATE")
     try:
@@ -542,7 +549,7 @@ def test_a_symlinked_db_is_refused_read_only_too(gw: Gateway, state: Path, tmp_p
     sqlite3.connect(real).close()
     (state / "state.db").symlink_to(real)
     with pytest.raises(StoreError):
-        open_store(gw, readonly=True)
+        open_readonly(gw)
 
 
 def test_a_fifo_in_place_of_the_db_is_refused(gw: Gateway, state: Path) -> None:
@@ -565,7 +572,7 @@ def test_a_directory_in_place_of_the_db_is_refused(gw: Gateway, state: Path) -> 
 def test_a_symlink_or_fifo_sidecar_is_refused(
     gw: Gateway, state: Path, tmp_path: Path, suffix: str
 ) -> None:
-    open_store(gw).close()  # type: ignore[union-attr]
+    open_store(gw).close()
     side = state / f"state.db{suffix}"
     side.unlink(missing_ok=True)
     victim = tmp_path / "victim"
@@ -582,7 +589,7 @@ def test_a_symlink_or_fifo_sidecar_is_refused(
 
 
 def test_a_hard_linked_db_is_refused(gw: Gateway, state: Path, db: Path, tmp_path: Path) -> None:
-    open_store(gw).close()  # type: ignore[union-attr]
+    open_store(gw).close()
     os.link(db, tmp_path / "second-name")
     with pytest.raises(StoreError) as err:
         open_store(gw)
@@ -590,7 +597,7 @@ def test_a_hard_linked_db_is_refused(gw: Gateway, state: Path, db: Path, tmp_pat
 
 
 def test_a_db_with_group_or_world_access_is_refused(gw: Gateway, db: Path) -> None:
-    open_store(gw).close()  # type: ignore[union-attr]
+    open_store(gw).close()
     for bad in (0o640, 0o604, 0o660):
         db.chmod(bad)
         with pytest.raises(StoreError) as err:
@@ -600,7 +607,7 @@ def test_a_db_with_group_or_world_access_is_refused(gw: Gateway, db: Path) -> No
 
 
 def test_a_wide_state_directory_is_refused(gw: Gateway, state: Path) -> None:
-    open_store(gw).close()  # type: ignore[union-attr]
+    open_store(gw).close()
     for bad in (0o750, 0o705, 0o770):
         state.chmod(bad)
         with pytest.raises(StoreError) as err:
@@ -632,8 +639,8 @@ def test_a_path_with_uri_characters_works(tmp_path: Path) -> None:
     odd = tmp_path / "h?me#1%20 x"
     odd.mkdir()
     g = Gateway(passwd_home=lambda: str(odd), clock=FakeClock())
-    open_store(g).close()  # type: ignore[union-attr]
-    with open_store(g, readonly=True) as store:
+    open_store(g).close()
+    with ro(g) as store:
         assert store is not None
         assert pragma(store.conn, "user_version") == 1
 
@@ -642,7 +649,7 @@ def test_a_path_with_uri_characters_works(tmp_path: Path) -> None:
 
 
 def test_read_only_open_of_a_missing_database_creates_nothing(gw: Gateway, home: Path) -> None:
-    assert open_store(gw, readonly=True) is None
+    assert open_readonly(gw) is None
     assert not (home / ".local").exists()
 
 
@@ -653,11 +660,11 @@ def test_read_only_open_reads_and_cannot_write(gw: Gateway, state: Path) -> None
     for name in ("state.db-wal", "state.db-shm"):
         (state / name).unlink(missing_ok=True)
     before = sorted(p.name for p in state.iterdir())
-    with open_store(gw, readonly=True) as store:
+    with ro(gw) as store:
         assert store is not None
         assert store.conn.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0] == 1
-        with pytest.raises(sqlite3.OperationalError), store.conn.execute("DELETE FROM deliveries"):
-            pass
+        with pytest.raises(sqlite3.OperationalError):
+            store.conn.execute("DELETE FROM deliveries")
         with pytest.raises(RuntimeError), store.write():
             pass
     assert sorted(p.name for p in state.iterdir()) == before
@@ -667,7 +674,7 @@ def test_read_only_open_sees_uncheckpointed_rows(gw: Gateway) -> None:
     with open_store(gw) as writer:
         assert writer is not None
         add_delivery(writer)
-        with open_store(gw, readonly=True) as store:
+        with ro(gw) as store:
             assert store is not None
             assert store.conn.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0] == 1
 

@@ -36,6 +36,7 @@ __all__ = [
     "SEND_BUSY_S",
     "Store",
     "StoreError",
+    "open_readonly",
     "open_store",
     "trim_deliveries",
     "trim_event_ids",
@@ -183,21 +184,43 @@ def open_store(
     gateway: Gateway,
     *,
     busy_timeout: float = DEFAULT_BUSY_S,
-    readonly: bool = False,
     migrations: tuple[Migration, ...] = MIGRATIONS,
-) -> Store | None:
-    """Open (and, read-write, create and migrate) ``state.db``.
+) -> Store:
+    """Open ``state.db`` for reading and writing, creating and migrating it.
 
-    Read-write creates the state directory (0700) and the file (0600) when absent, switches the
-    file to WAL and migrates it to the newest version in one ``BEGIN IMMEDIATE`` transaction.
-    ``readonly`` never creates, writes or migrates anything: it returns ``None`` when there is no
-    database and refuses one that is not at this build's version. A read-only open of a database
-    without a ``-wal`` file is ``immutable`` (SQLite would otherwise create ``-wal`` and ``-shm``);
-    a writer that starts in between may be missed, which is fine for advisory reads.
-
+    Creates the state directory (0700) and the file (0600) when absent, switches the file to WAL
+    and migrates it to the newest version in one ``BEGIN IMMEDIATE`` transaction.
     ``HomeError`` propagates (the caller reports it as it reports a bad home for the config).
     Everything else is a :class:`StoreError`.
     """
+    store = _open(gateway, busy_timeout, False, migrations)
+    assert store is not None
+    return store
+
+
+def open_readonly(
+    gateway: Gateway,
+    *,
+    busy_timeout: float = DEFAULT_BUSY_S,
+    migrations: tuple[Migration, ...] = MIGRATIONS,
+) -> Store | None:
+    """Open ``state.db`` read-only: nothing is created, written or migrated.
+
+    Returns ``None`` when there is no database; refuses (``older``, ``newer``, ``foreign``) one
+    that is not at this build's version. A database without a ``-wal`` file is opened
+    ``immutable`` (SQLite would otherwise create ``-wal`` and ``-shm``); a writer that starts in
+    between may be missed, which is fine for advisory reads (``test``, ``send --dry-run``,
+    ``validate``). TODO(#18): ``test`` and ``send --dry-run`` read their state through this.
+    """
+    return _open(gateway, busy_timeout, True, migrations)
+
+
+def _open(
+    gateway: Gateway,
+    busy_timeout: float,
+    readonly: bool,
+    migrations: tuple[Migration, ...],
+) -> Store | None:
     if not (isinstance(busy_timeout, (int, float)) and 0 < busy_timeout <= 60):
         raise ValueError("busy_timeout must be in (0, 60] seconds")
     try:
@@ -268,7 +291,18 @@ def _harden(conn: sqlite3.Connection) -> None:
 
 
 def _identity(conn: sqlite3.Connection) -> tuple[int, int, int]:
-    """``(application_id, user_version, number of schema objects)``."""
+    """``(application_id, user_version, number of schema objects)``, read in one snapshot: a
+    concurrent creator commits all three together, and three separate reads could see a mix."""
+    if conn.in_transaction:
+        return _identity_rows(conn)
+    conn.execute("BEGIN")
+    try:
+        return _identity_rows(conn)
+    finally:
+        conn.execute("ROLLBACK")
+
+
+def _identity_rows(conn: sqlite3.Connection) -> tuple[int, int, int]:
     app = conn.execute("PRAGMA application_id").fetchone()[0]
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     objects = conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0]

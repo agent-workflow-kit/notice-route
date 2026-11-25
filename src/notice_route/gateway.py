@@ -913,7 +913,8 @@ class Gateway:
                     )
                 }
                 for dest, code in conn.execute(
-                    "SELECT destination, code FROM surfaced WHERE substr(period, 1, 10) = ? ORDER BY id",
+                    "SELECT destination, code FROM surfaced "
+                    "WHERE substr(period, 1, 10) = ? ORDER BY id",
                     (day,),
                 ):
                     if (
