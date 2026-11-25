@@ -29,7 +29,7 @@ Rules (interface: Calling the notifiers, Files):
 
 On ``acquired`` False the pipeline records :data:`notice_route.outcome.LOCK_BUSY` for the row
 (requeue 60 s later, no attempt, hourly count given back with ``count_hour``).
-TODO(#22): the send pipeline wraps its :func:`~notice_route.notify.call_notifier` call with this.
+``send.py`` (#22) wraps its :func:`~notice_route.notify.call_notifier` call with this.
 TODO(#23): ``flush`` does the same for each row it sends (and for a digest).
 TODO(#29): ``validate --probe`` calls a notifier under the same lock.
 """

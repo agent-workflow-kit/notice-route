@@ -19,7 +19,7 @@ Safety properties:
 Choices where the interface is silent (the narrower reading): ``pr`` is at most 1024 characters;
 a built URL is at most 1024 characters (else empty); a port must also be 1 to 65535.
 
-TODO(#22): the send pipeline calls :func:`build_links` and passes ``pr_url`` and ``ticket_url``
+``send.py`` (#22) calls :func:`build_links` and passes ``pr_url`` and ``ticket_url``
 to :func:`~notice_route.render.render`, and stores ``link`` with the notification.
 """
 

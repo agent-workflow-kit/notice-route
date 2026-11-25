@@ -41,8 +41,8 @@ Choices where the interface is silent (the narrower reading):
 
 TODO(#25): the real retry schedule and attempt caps; ``retry_at`` is the seam.
 TODO(#27): the caller inserts the ``surfaced`` row for ``failed`` and ``unknown`` ends.
-TODO(#22): the pipeline logs the result of a call that was not applied, and treats an exception
-escaping ``call_notifier`` through :func:`record_escaped`.
+``send.py`` (#22) logs the result of a call that was not applied, and treats an exception escaping
+``call_notifier`` through :func:`record_escaped`.
 """
 
 from __future__ import annotations

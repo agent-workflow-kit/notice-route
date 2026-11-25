@@ -1,0 +1,25 @@
+{
+  "outcome": "ok",
+  "shape": "notice",
+  "source": "s",
+  "hook": null,
+  "rule": "pt",
+  "level": "info",
+  "reason": null,
+  "text_excluded": false,
+  "labels_ignored": 0,
+  "destinations": [
+    {
+      "name": "chat",
+      "outcome": "queued_retry",
+      "reason": null,
+      "attempts": 1,
+      "code": "rate_limited",
+      "count": null,
+      "deliver_after": 1700000000,
+      "notifier_outcome": null
+    }
+  ],
+  "dedupe": "5168afed686381b2ee61845a4db06fbb7d0beb60b05aa8e2f98c1cafa9a22273",
+  "duration_ms": 0
+}

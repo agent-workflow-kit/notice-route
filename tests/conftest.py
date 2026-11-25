@@ -11,6 +11,7 @@ import pytest
 
 from notice_route.gateway import DirHandle, Gateway
 from tests.fakes import Notifier, build_notifier
+from tests.send_support import Rig
 
 
 @pytest.fixture
@@ -66,3 +67,24 @@ def make_notifier(tmp_path: Path) -> Iterator[Callable[..., Notifier]]:
     yield make
     for notifier in built:
         notifier.kill_tracked()
+
+
+@pytest.fixture
+def send_environment(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A private environment for the tests of ``send``: nothing of the user's leaks in."""
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(home / ".local" / "state"))
+    monkeypatch.delenv("NOTICE_ROUTE_HOOK", raising=False)
+
+
+@pytest.fixture
+def rig(
+    home: Path,
+    tmp_path: Path,
+    make_notifier: Callable[..., Notifier],
+    capsys: pytest.CaptureFixture[str],
+) -> Iterator[Rig]:
+    r = Rig(home, tmp_path, make_notifier, capsys)
+    yield r
+    r.finish()

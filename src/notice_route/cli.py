@@ -17,17 +17,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, NoReturn
 
 from . import __version__
 from .config import ConfigError
 from .decide import instant
 from .dryrun import dry_run_document
-from .gateway import Gateway, HomeError, StateError
+from .gateway import Gateway, HomeError, Interrupted, StateError
 from .payload import InputFlags, PayloadError, UsageError, load_notification
 from .report import rules_document, validate_document
+from .send import SendOptions, SendResult, run_send
 from .store import StoreError, open_readonly
 from .validate import load_valid_config
 
@@ -53,7 +55,19 @@ def _add_global_flags(parser: argparse.ArgumentParser, *, top: bool) -> None:
 
 
 def _add_config_flag(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--config", metavar="PATH", default=None, help="config file to use")
+    parser.add_argument(
+        "--config", metavar="PATH", default=argparse.SUPPRESS, help="config file to use"
+    )
+
+
+def _add_audit_flags(parser: argparse.ArgumentParser) -> None:
+    """``--actor`` and ``--decision-id`` of the commands that act (``send``; ``flush`` #23)."""
+    parser.add_argument(
+        "--actor", default=None, metavar="ACTOR", help="human:<name> or auto:<name>"
+    )
+    parser.add_argument(
+        "--decision-id", action="append", default=[], metavar="ID", help="a caller's decision id"
+    )
 
 
 class _ArgvError(Exception):
@@ -71,6 +85,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog=PROG, description=DESCRIPTION, allow_abbrev=False)
     parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")
     _add_global_flags(parser, top=True)
+    # A global flag, accepted before or after the command; main refuses it for every command
+    # except rules, test and validate.
+    parser.add_argument("--config", metavar="PATH", default=None, help="config file to use")
     commands = parser.add_subparsers(dest="command", metavar="<command>")
 
     rules = commands.add_parser("rules", help="list the rules in order", allow_abbrev=False)
@@ -89,13 +106,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_flag(test)
     _add_input_flags(test)
 
-    # TODO(#22): the real send (without --dry-run) and its own flags (--actor, --decision-id).
     send = commands.add_parser("send", help="route one notification", allow_abbrev=False)
     _add_global_flags(send, top=False)
     _add_input_flags(send)
     send.add_argument("--dry-run", action="store_true", help="same as test; changes nothing")
+    _add_audit_flags(send)
     # Parsed only to refuse it with exit 2 `usage`: send never reads a config from a flag.
-    send.add_argument("--config", metavar="PATH", default=None, help=argparse.SUPPRESS)
+    send.add_argument("--config", metavar="PATH", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     return parser
 
 
@@ -288,6 +305,8 @@ def _run_dry_run(args: argparse.Namespace, gateway: Gateway) -> int:
         labels=tuple(args.label),
     )
     is_test = args.command == "test"
+    if not is_test:
+        _audit(args, gateway)  # send --dry-run takes --actor and --decision-id like send
     notification = load_notification(gateway, flags, started, default_stdin=is_test)
     config = load_valid_config(gateway, args.config if is_test else None)
     doc, code = dry_run_document(
@@ -304,6 +323,118 @@ def _run_dry_run(args: argparse.Namespace, gateway: Gateway) -> int:
     if doc["reason"] == "unconfigured" and not args.quiet:
         _err(f"{PROG}: no config\n")
     return code
+
+
+_ACTOR = re.compile(r"(?:human|auto):[A-Za-z0-9._@/-]{1,64}")
+_DECISION_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+_NAME_OUTSIDE = re.compile(r"[^A-Za-z0-9._@-]")
+
+
+def _audit(args: argparse.Namespace, gateway: Gateway) -> tuple[str, str | None]:
+    """The actor and the decision id of the call (design guide section 6): ``--actor``, else
+    ``human:<login name>`` when stdin is a terminal, else ``auto:unknown``."""
+    actor = args.actor
+    if actor is None:
+        user = _NAME_OUTSIDE.sub("_", gateway.login_name())[:64]
+        actor = f"human:{user}" if user and gateway.stdin_is_tty() else "auto:unknown"
+    elif not _ACTOR.fullmatch(actor):
+        raise UsageError("actor")
+    if len(args.decision_id) > 1 or (
+        args.decision_id and not _DECISION_ID.fullmatch(args.decision_id[0])
+    ):
+        raise UsageError("decision_id")
+    return actor, (args.decision_id[0] if args.decision_id else None)
+
+
+def _run_send(args: argparse.Namespace, gateway: Gateway) -> int:
+    """``send`` steps 1 to 8. The trap is armed for the input and config reads, where a signal
+    exits 128+N at once; once the decision is written a signal is handled by ``run_send``."""
+    started = gateway.monotonic()
+    actor, decision_id = _audit(args, gateway)
+    flags = InputFlags(
+        stdin_json=args.stdin_json,
+        file=args.file,
+        title=args.title,
+        message=args.message,
+        source=args.source,
+        labels=tuple(args.label),
+    )
+    with gateway.trapped_signals() as trap:
+        trap.armed = True
+        try:
+            notification = load_notification(gateway, flags, started)
+            config = load_valid_config(gateway, None)
+            result = run_send(
+                gateway,
+                config,
+                notification,
+                SendOptions(actor, decision_id, args.verbose),
+                started,
+                trap,
+            )
+        except Interrupted as exc:
+            return 128 + exc.signum
+        finally:
+            trap.armed = False
+        # The trap stays installed (a signal only sets a flag) until the output is written, so a
+        # late signal never kills the process before the document is printed. During the output
+        # a signal ends the process at once (128+N): the result is final and a reader that
+        # stopped reading must not hold the process until SIGKILL.
+        trap.armed = True
+        try:
+            _send_output(args, gateway, result)
+        except Interrupted as exc:
+            gateway.discard_stdout()
+            gateway.discard_stderr()
+            return 128 + exc.signum
+        finally:
+            trap.armed = False
+    return result.exit_code
+
+
+def _guarded(gateway: Gateway, stream: str, write: Callable[[], None]) -> None:
+    """One write after the send is done: a failure changes nothing (the exit code is the
+    result's), and the stream is pointed at the null device so its buffered text cannot fail
+    again when the interpreter exits."""
+    try:
+        write()
+    except (OSError, ValueError, _OutputClosed):
+        if stream == "out":
+            gateway.discard_stdout()
+        else:
+            gateway.discard_stderr()
+
+
+def _send_output(args: argparse.Namespace, gateway: Gateway, result: SendResult) -> None:
+    def err(text: str) -> None:
+        _guarded(gateway, "err", lambda: _err(f"{PROG}: {_safe(text)}\n"))
+
+    for text in result.warnings:
+        err(f"warning: {text}")
+    if not args.quiet:
+        for text in result.advisories:
+            err(text)
+    if args.verbose:
+        for text in result.verbose:
+            err(text)
+    if result.error is not None:
+        code, message = result.error
+        if args.json:
+            envelope = {
+                "error": {"code": code, "message": message, "reason": None, "details": None}
+            }
+            _guarded(gateway, "out", lambda: _json(envelope))
+        else:
+            for text in result.lines:
+                err(text)
+        _guarded(gateway, "err", lambda: _err(f"{PROG}: {code}: {message}\n"))
+    elif result.document is not None:
+        if args.json:
+            document = result.document
+            _guarded(gateway, "out", lambda: _json(document))
+        else:
+            for text in result.lines:
+                err(text)
 
 
 def _refused(exc: PayloadError | UsageError, *, as_json: bool) -> int:
@@ -361,14 +492,12 @@ def _main(argv: Sequence[str] | None, gateway: Gateway | None) -> int:
     try:
         if args.command == "rules":
             return _run_rules(args, gateway)
-        if args.command == "send" and args.config is not None:
-            raise UsageError("config")  # send never takes --config, --dry-run included
+        if args.config is not None and args.command not in ("test", "validate"):
+            raise UsageError("config")  # only the commands that run nothing take --config
         if args.command == "test" or (args.command == "send" and args.dry_run):
             return _run_dry_run(args, gateway)
         if args.command == "send":
-            # TODO(#22): the real send.
-            _error("internal", "send is not implemented yet", None, as_json=args.json)
-            return EXIT_INTERNAL
+            return _run_send(args, gateway)
         return _run_validate(args, gateway)
     except (PayloadError, UsageError) as exc:
         return _refused(exc, as_json=args.json)

@@ -46,7 +46,7 @@ Seams (owned by later issues):
 The notifier call (``notify.py``) and the recording of its outcome (``outcome.py``: ``attempts``
 and ``give_back`` for a call never made) exist,
 and so does ``lock_busy`` (:data:`notice_route.outcome.LOCK_BUSY`);
-TODO(#22) the pipeline that renders, calls :func:`decide_and_record`, prints and logs;
+``send.py`` (#22) renders, calls :func:`decide_and_record`, calls, prints and logs;
 TODO(#23) ``flush`` claims a due row with :func:`claim_call` (single rows) or :func:`count_call`
 (a digest); TODO(#26) ``prune`` deletes ``rate`` rows of past hours older than 2 days;
 TODO(#27) surfacing ``env_missing`` and routing the alert (alerts skip the redelivery check,
@@ -136,7 +136,10 @@ class DestinationDecision:
     ``deliveries`` one. ``deliver_after`` is set for ``defer`` only. The ids and the claim are
     set only for a recorded decision: ``delivery_id`` for everything but ``suppress``,
     ``queue_id`` for a queued row, and for ``send`` the ``claim_token`` and ``claim_expires`` of
-    its row."""
+    its row. ``count`` is the repeat count of the row that opened the window, for a ``suppress``
+    with reason ``repeat`` (this repeat included), else ``None``. ``decided_at`` is the clock
+    (floored wall seconds) of the transaction that recorded the row, for the hour its count
+    belongs to."""
 
     name: str
     decision: Decision
@@ -147,6 +150,8 @@ class DestinationDecision:
     queue_id: int | None = None
     claim_token: str | None = None
     claim_expires: int | None = None
+    count: int | None = None
+    decided_at: int | None = None
 
 
 @dataclass(frozen=True)
@@ -429,7 +434,17 @@ def decide_and_record(
                 retention=retention,
             )
             if plan.decision == "suppress":
-                out.append(DestinationDecision(name, "suppress", "suppressed", plan.reason))
+                repeats = None
+                if plan.reason == "repeat":
+                    found = conn.execute(
+                        "SELECT d.count FROM dedup x JOIN deliveries d ON d.id = x.delivery_id"
+                        " WHERE x.destination = ? AND x.key_digest = ?",
+                        (name, notice.dedupe),
+                    ).fetchone()
+                    repeats = None if found is None else int(found[0])
+                out.append(
+                    DestinationDecision(name, "suppress", "suppressed", plan.reason, count=repeats)
+                )
                 continue
             out.append(_record(conn, gateway, plan, dest, notice, lease, retention))
         return out
@@ -518,6 +533,7 @@ def _record(
         queued.row_id,
         token,
         lease.expires if token is not None else None,
+        decided_at=now,
     )
 
 

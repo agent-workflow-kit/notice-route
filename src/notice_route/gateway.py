@@ -48,10 +48,12 @@ __all__ = [
     "HomeError",
     "InputFileError",
     "InputRead",
+    "Interrupted",
     "POLL_INTERVAL",
     "RunResult",
     "SYSTEM_TZ_DIRS",
     "SigchldIgnoredError",
+    "SignalTrap",
     "StateError",
     "StateFiles",
     "StateView",
@@ -236,6 +238,26 @@ class ChildLostError(RuntimeError):
     else, or could not be reaped. The group is already killed; the outcome is unknown."""
 
 
+class Interrupted(BaseException):  # noqa: N818 - like KeyboardInterrupt, never caught by accident
+    """A trapped signal arrived while the trap was armed (see :class:`SignalTrap`). A
+    ``BaseException`` so that no ``except Exception`` of the caller swallows it."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+class SignalTrap:
+    """What :meth:`Gateway.trapped_signals` yields: ``received`` is the first trapped signal
+    number (or ``None``); while ``armed`` a signal also raises :class:`Interrupted` in the main
+    thread, so a blocking read or a wait is cut short. Disarm before anything that must not be
+    interrupted (a write transaction, a call that started a process)."""
+
+    def __init__(self) -> None:
+        self.received: int | None = None
+        self.armed = False
+
+
 class StateError(Exception):
     """``state.db`` cannot be read (unsafe path, corrupt, not the expected schema): exit 1."""
 
@@ -349,6 +371,13 @@ def _passwd_home() -> str:
         raise HomeError("unresolvable", "no password-database entry") from exc
 
 
+def _passwd_name() -> str:
+    try:
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except KeyError:
+        return ""
+
+
 def _open_checked_dir(path: str, dir_fd: int | None, shown: str) -> DirHandle:
     """Create ``path`` (0700, umask 077) when absent, open it without following a symlink, and
     refuse it unless it is a directory owned by the effective user with no group/world access.
@@ -390,6 +419,7 @@ class Gateway:
     clock: Clock = field(default_factory=SystemClock)
     tokens: TokenSource = field(default_factory=SystemTokens)
     passwd_home: Callable[[], str] = _passwd_home
+    passwd_name: Callable[[], str] = _passwd_name
     tz_dirs: tuple[str, ...] = SYSTEM_TZ_DIRS
     stdin_fd: int = 0
     environ: Callable[[], Mapping[str, str]] = _system_environ
@@ -631,6 +661,73 @@ class Gateway:
         """Release a lock taken with :meth:`try_lock`; harmless when not held."""
         fcntl.flock(file.fileno(), fcntl.LOCK_UN)
 
+    def login_name(self) -> str:
+        """The login name from the password database, or the empty string when it has none."""
+        try:
+            name = self.passwd_name()
+        except (KeyError, OSError):
+            return ""
+        return name if isinstance(name, str) else ""
+
+    def state_dir_path(self) -> str:
+        """The state directory, ``<home>/.local/state/notice-route`` (never ``XDG_STATE_HOME``)."""
+        return str(self.home_dir()).rstrip("/") + "/.local/state/notice-route"
+
+    def open_state_dir(self) -> DirHandle:
+        """Open (creating at 0700) the state directory with the checks of
+        :meth:`open_private_dir`. The caller closes the handle."""
+        return self.open_private_dir(self.state_dir_path())
+
+    def file_size(self, file: io.FileIO) -> int:
+        """The size in bytes of an open file."""
+        return os.fstat(file.fileno()).st_size
+
+    def truncate(self, file: io.FileIO, size: int) -> None:
+        """Cut an open file (opened for writing) back to ``size`` bytes."""
+        os.ftruncate(file.fileno(), size)
+
+    def rename_in(self, parent: DirHandle, old: str, new: str) -> None:
+        """Rename ``old`` to ``new``, both names inside ``parent`` (replaces ``new``)."""
+        self._live(parent)
+        os.rename(_component(old), _component(new), src_dir_fd=parent.fd, dst_dir_fd=parent.fd)
+
+    def remove_in(self, parent: DirHandle, name: str) -> None:
+        """Delete the file ``name`` inside ``parent``; a missing file is not an error."""
+        self._live(parent)
+        try:
+            os.unlink(_component(name), dir_fd=parent.fd)
+        except FileNotFoundError:
+            pass
+
+    @contextmanager
+    def trapped_signals(self) -> Iterator[SignalTrap]:
+        """Trap SIGTERM, SIGINT and SIGHUP for the body of the ``with`` block (main thread
+        only; from another thread nothing is trapped and ``received`` stays ``None``). The old
+        handlers come back on exit. See :class:`SignalTrap`."""
+        trap = SignalTrap()
+        previous: dict[int, object] = {}
+
+        def handler(signum: int, frame: object) -> None:
+            if trap.received is None:
+                trap.received = signum
+            if trap.armed:
+                trap.armed = False  # raise once; cleanup code must not be cut short again
+                raise Interrupted(signum)
+
+        try:
+            for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                previous[signum] = signal.signal(signum, handler)
+        except ValueError:  # not the main thread
+            pass
+        try:
+            yield trap
+        finally:
+            for signum, old in previous.items():
+                try:
+                    signal.signal(signum, old)  # type: ignore[arg-type]
+                except (ValueError, TypeError):
+                    pass
+
     def open_config_dir(self, path: str, parent: DirHandle | None = None) -> DirHandle | None:
         """Open an existing config directory without creating anything; ``None`` when absent.
 
@@ -862,7 +959,7 @@ class Gateway:
         Accepted race: a swap of ``state.db`` between this check and SQLite's open needs write
         access to the 0700 directory, which only the user has.
         """
-        directory = str(self.home_dir()).rstrip("/") + "/.local/state/notice-route"
+        directory = self.state_dir_path()
         if create:
             handle = self.open_private_dir(directory)
         else:
@@ -1016,13 +1113,20 @@ class Gateway:
         This redirects descriptor 1 for the rest of the process, so it is only called after a
         failed stdout write.
         Does nothing when ``sys.stdout`` is not the process's own stream (a test's capture)."""
-        stream = sys.stdout
-        if stream is None or stream is not sys.__stdout__:
+        self._discard(sys.stdout, sys.__stdout__)
+
+    def discard_stderr(self) -> None:
+        """The same for standard error (descriptor 2) after a failed write to it."""
+        self._discard(sys.stderr, sys.__stderr__)
+
+    @staticmethod
+    def _discard(stream: object, own: object) -> None:
+        if stream is None or stream is not own:
             return
         try:
             null = os.open(os.devnull, os.O_WRONLY)
             try:
-                os.dup2(null, stream.fileno())
+                os.dup2(null, stream.fileno())  # type: ignore[attr-defined]
             finally:
                 os.close(null)
         except (OSError, ValueError, AttributeError):

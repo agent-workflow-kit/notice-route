@@ -40,10 +40,10 @@ Choices where the interface is silent (the narrower reading):
 Classification of a :class:`CallResult` lives in :mod:`notice_route.outcome` (#20).
 The send lock (:func:`notice_route.sendlock.send_lock`, #21) is taken by the caller around
 :func:`call_notifier`; the call itself does not lock.
-TODO(#22): the send pipeline builds the arguments from the ``sending`` row of ``decide``.
-TODO(#22): any exception that escapes :func:`call_notifier` (it raises only for faults outside the
-child's own fate, after the gateway has killed the group) is ``unknown``: the pipeline keeps the
-row claimed and never retries it as ``not_started``.
+``send.py`` (#22) builds the arguments from the ``sending`` row of ``decide``. Any exception that
+escapes :func:`call_notifier` (it raises only for faults outside the child's own fate, after the
+gateway has killed the group) is ``unknown``: the pipeline keeps the row claimed and never retries
+it as ``not_started``.
 """
 
 from __future__ import annotations
