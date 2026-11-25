@@ -22,6 +22,7 @@ import selectors
 import signal
 import stat
 import subprocess
+import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -82,7 +83,10 @@ class Clock(Protocol):
     def monotonic(self) -> float: ...
 
     def sleep(self, seconds: float) -> None:
-        """Let ``seconds`` pass; the fake moves both clocks instead of waiting."""
+        """Let ``seconds`` pass; the fake moves both clocks instead of waiting.
+
+        Contract: after ``sleep(n)`` returns, ``monotonic()`` has advanced by at least ``n``.
+        """
         ...
 
 
@@ -219,16 +223,19 @@ class DirHandle:
 
 FileMode = Literal["r", "a", "rw"]
 _FILE_FLAGS: dict[str, int] = {"r": os.O_RDONLY, "a": os.O_WRONLY | os.O_APPEND, "rw": os.O_RDWR}
-_FILE_FDOPEN: dict[str, str] = {"r": "rb", "a": "ab", "rw": "r+b"}
+_FILE_IO_MODES: dict[str, str] = {"r": "rb", "a": "ab", "rw": "rb+"}
+_UMASK_LOCK = threading.Lock()
 
 
 @contextmanager
 def _umask_077() -> Iterator[None]:
-    old = os.umask(0o077)
-    try:
-        yield
-    finally:
-        os.umask(old)
+    """Run with umask 077; the swap is process-wide, so one thread at a time holds it."""
+    with _UMASK_LOCK:
+        old = os.umask(0o077)
+        try:
+            yield
+        finally:
+            os.umask(old)
 
 
 def _component(name: str) -> str:
@@ -246,7 +253,8 @@ def _passwd_home() -> str:
 
 def _open_checked_dir(path: str, dir_fd: int | None, shown: str) -> DirHandle:
     """Create ``path`` (0700, umask 077) when absent, open it without following a symlink, and
-    refuse it unless it is a directory owned by the effective user with no group/world access."""
+    refuse it unless it is a directory owned by the effective user with no group/world access
+    and no setgid or sticky bit."""
     with _umask_077():
         try:
             os.mkdir(path, 0o700, dir_fd=dir_fd)
@@ -268,7 +276,7 @@ def _open_checked_dir(path: str, dir_fd: int | None, shown: str) -> DirHandle:
             raise UnsafePathError("not_directory", shown)
         if info.st_uid != os.geteuid():
             raise UnsafePathError("owner", shown)
-        if info.st_mode & 0o077:
+        if info.st_mode & 0o7077:  # group/world access, setgid or sticky
             raise UnsafePathError("mode", shown)
     except BaseException:
         os.close(fd)
@@ -404,17 +412,37 @@ class Gateway:
         The last component is opened with ``O_NOFOLLOW``; the directory is refused
         (:class:`UnsafePathError`, never repaired) when it is a symlink or not a directory, is
         not owned by the effective user (``owner``) or has any group or world access
-        (``mode``). Parents that already exist are not checked. The caller closes the handle.
+        (``mode``; setgid and sticky count). The caller closes the handle.
+
+        Trust assumption: parents that already exist are neither checked nor protected from
+        symlinks; they are followed as the operating system resolves them, so the user's home
+        and every ancestor of the state directory are trusted. Only the last component is checked.
+
+        The path is validated before anything is created: it must be an absolute ``str`` (or
+        path-like giving one) without NUL and without ``.`` or ``..`` components, else
+        ``ValueError``; empty components (``//``) are collapsed, so ``DirHandle.path`` is
+        normalized. A parent that is not a directory (a regular file) is
+        ``UnsafePathError("not_directory")``. Other ``OSError`` values (``PermissionError`` on an
+        unreadable directory, ``ENAMETOOLONG``, ...) propagate unchanged.
         """
         text = os.fspath(path)
+        if isinstance(text, bytes):
+            raise ValueError("path must be a str, not bytes")
         if not isinstance(text, str) or not text.startswith("/") or "\x00" in text:
             raise ValueError("path must be an absolute path without NUL")
-        parent = os.path.dirname(text.rstrip("/")) or "/"
-        with _umask_077():
-            os.makedirs(parent, mode=0o700, exist_ok=True)
-        if text.rstrip("/") == "":
+        parts = [part for part in text.split("/") if part]
+        if any(part in (".", "..") for part in parts):
+            raise ValueError("path must not contain '.' or '..' components")
+        normalized = "/" + "/".join(parts)
+        if not parts:
             return _open_checked_dir("/", None, "/")
-        return _open_checked_dir(text.rstrip("/"), None, text)
+        parent = os.path.dirname(normalized)
+        try:
+            with _umask_077():
+                os.makedirs(parent, mode=0o700, exist_ok=True)
+        except (FileExistsError, NotADirectoryError) as exc:
+            raise UnsafePathError("not_directory", normalized) from exc
+        return _open_checked_dir(normalized, None, normalized)
 
     def open_private_subdir(self, parent: DirHandle, name: str) -> DirHandle:
         """Open (creating at 0700) the directory ``name`` inside ``parent``, with the same
@@ -432,13 +460,18 @@ class Gateway:
         socket (``not_regular``) raises :class:`UnsafePathError`. ``mode`` is ``r`` (read), ``a``
         (append) or ``rw``; ``create`` makes a missing file with mode 0600 (before the umask).
         A missing file without ``create`` is ``FileNotFoundError``. The descriptor is not
-        inherited by children.
+        inherited by children and cannot become a controlling terminal (``O_NOCTTY``).
+
+        Precondition: ``parent`` is a private directory handle from :meth:`open_private_dir` or
+        :meth:`open_private_subdir`; this method does not re-check the directory. Typed errors
+        are :class:`UnsafePathError` and ``ValueError`` (a bad ``name`` or ``mode``); other
+        ``OSError`` values propagate.
         """
         self._live(parent)
-        if mode not in _FILE_FLAGS:
+        if not isinstance(mode, str) or mode not in _FILE_FLAGS:
             raise ValueError(f"unknown mode {mode!r}")
         shown = f"{parent.path.rstrip('/')}/{_component(name)}"
-        flags = _FILE_FLAGS[mode] | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        flags = _FILE_FLAGS[mode] | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOCTTY
         if create:
             flags |= os.O_CREAT
         try:
@@ -446,13 +479,14 @@ class Gateway:
         except OSError as exc:
             if exc.errno in (errno.ELOOP, errno.EMLINK):
                 raise UnsafePathError("symlink", shown) from exc
-            if exc.errno == errno.EISDIR:
+            if exc.errno in (errno.EISDIR, errno.ENXIO):  # ENXIO: socket, or FIFO with no reader
                 raise UnsafePathError("not_regular", shown) from exc
             raise
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise UnsafePathError("not_regular", shown)
-            return os.fdopen(fd, _FILE_FDOPEN[mode], buffering=0)  # type: ignore[return-value]
+            # FileIO takes ownership of fd only once constructed; a failure leaves it ours.
+            return io.FileIO(fd, _FILE_IO_MODES[mode], closefd=True)
         except BaseException:
             os.close(fd)
             raise
@@ -464,7 +498,12 @@ class Gateway:
         clock's monotonic time have passed (the last sleep is shortened to the deadline, and one
         last try follows it). Returns False when not acquired. The kernel releases the lock when
         the holder dies or closes the file; :meth:`unlock` releases it early. ``wait`` must be a
-        finite number of seconds >= 0 (``ValueError`` otherwise, before anything is tried).
+        finite number of seconds >= 0 (``ValueError`` otherwise, before anything is tried); the
+        1 to 60 s range of ``lock_wait`` is enforced by the config loader (#7), not here. Any
+        ``OSError`` other than "would block" (``ENOLCK``, a closed file) propagates.
+
+        Lock files must never be renamed or unlinked while in use: a second process would
+        create a new file and hold a different lock.
         """
         if isinstance(wait, bool) or not isinstance(wait, (int, float)):
             raise ValueError("wait must be a number of seconds")

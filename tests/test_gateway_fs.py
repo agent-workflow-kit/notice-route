@@ -32,6 +32,11 @@ def _mode(path: Path) -> int:
     return stat.S_IMODE(path.lstat().st_mode)
 
 
+needs_proc_fd = pytest.mark.skipif(
+    not os.path.isdir("/proc/self/fd"), reason="needs /proc/self/fd to count descriptors"
+)
+
+
 def _open_fds() -> int:
     return len(os.listdir("/proc/self/fd"))
 
@@ -202,6 +207,7 @@ def test_private_dir_rejects_nul(gw: Gateway, tmp_path: Path) -> None:
         gw.open_private_dir(str(tmp_path / "a\x00b"))
 
 
+@needs_proc_fd
 def test_refusals_do_not_leak_descriptors(gw: Gateway, tmp_path: Path) -> None:
     loose = tmp_path / "loose"
     loose.mkdir()
@@ -213,6 +219,7 @@ def test_refusals_do_not_leak_descriptors(gw: Gateway, tmp_path: Path) -> None:
     assert _open_fds() == before
 
 
+@needs_proc_fd
 def test_dir_handle_closes_once_and_context_closes(gw: Gateway, tmp_path: Path) -> None:
     before = _open_fds()
     with gw.open_private_dir(tmp_path / "s") as d:
@@ -324,6 +331,7 @@ def test_dangling_symlink_is_not_created_through(
     assert not (tmp_path / "victim").exists()
 
 
+@needs_proc_fd
 def test_fifo_is_refused_without_blocking(
     gw: Gateway, state: gateway.DirHandle, tmp_path: Path
 ) -> None:
@@ -339,8 +347,9 @@ def test_fifo_for_writing_with_no_reader_fails_without_blocking(
     gw: Gateway, state: gateway.DirHandle, tmp_path: Path
 ) -> None:
     os.mkfifo(tmp_path / "state" / "f")
-    with pytest.raises(OSError):
+    with pytest.raises(UnsafePathError) as info:
         gw.open_file(state, "f", mode="a")
+    assert info.value.reason == "not_regular"
 
 
 def test_directory_in_place_of_a_file_is_refused(
@@ -352,16 +361,18 @@ def test_directory_in_place_of_a_file_is_refused(
     assert info.value.reason == "not_regular"
 
 
+@pytest.mark.parametrize("mode", ["r", "a", "rw"])
 def test_socket_in_place_of_a_file_is_refused(
-    gw: Gateway, state: gateway.DirHandle, tmp_path: Path
+    gw: Gateway, state: gateway.DirHandle, tmp_path: Path, mode: str
 ) -> None:
     import socket
 
     sock = socket.socket(socket.AF_UNIX)
     try:
         sock.bind(str(tmp_path / "state" / "f"))
-        with pytest.raises(OSError):  # the kernel refuses to open a socket node
-            gw.open_file(state, "f")
+        with pytest.raises(UnsafePathError) as info:
+            gw.open_file(state, "f", mode=mode)  # type: ignore[arg-type]
+        assert info.value.reason == "not_regular"
     finally:
         sock.close()
 
@@ -369,3 +380,121 @@ def test_socket_in_place_of_a_file_is_refused(
 def test_unknown_mode_is_refused(gw: Gateway, state: gateway.DirHandle) -> None:
     with pytest.raises(ValueError):
         gw.open_file(state, "f", mode="w")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("mode", [b"r", None, ["r"], 1, ("r",), {"r"}])
+def test_non_string_mode_is_a_value_error(
+    gw: Gateway, state: gateway.DirHandle, mode: object
+) -> None:
+    with pytest.raises(ValueError):
+        gw.open_file(state, "f", mode=mode)  # type: ignore[arg-type]
+
+
+def test_open_file_flags_include_noctty(
+    gw: Gateway, state: gateway.DirHandle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[int] = []
+    real = os.open
+
+    def spy(path: str, flags: int, *args: int, **kw: int) -> int:
+        seen.append(flags)
+        return real(path, flags, *args, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(gateway.os, "open", spy)
+    with gw.open_file(state, "f", create=True):
+        pass
+    assert seen[-1] & os.O_NOCTTY
+
+
+def test_open_file_returns_unbuffered_fileio_with_append_semantics(
+    gw: Gateway, state: gateway.DirHandle, tmp_path: Path
+) -> None:
+    import io
+
+    with gw.open_file(state, "f", mode="a", create=True) as f:
+        assert isinstance(f, io.FileIO)
+        f.write(b"x")
+    with gw.open_file(state, "f", mode="a") as f:
+        f.write(b"y")
+    assert (tmp_path / "state" / "f").read_bytes() == b"xy"
+
+
+# --- path validation and typed errors -------------------------------------------------------
+
+
+def test_dotdot_creates_nothing(gw: Gateway, tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        gw.open_private_dir(str(tmp_path / "newparent" / ".."))
+    assert not (tmp_path / "newparent").exists()
+
+
+@pytest.mark.parametrize("tail", ["a/.", "a/./b", "a/../b", "./a"])
+def test_dot_components_are_refused(gw: Gateway, tmp_path: Path, tail: str) -> None:
+    with pytest.raises(ValueError):
+        gw.open_private_dir(f"{tmp_path}/{tail}")
+    assert not (tmp_path / "a").exists()
+
+
+def test_symlink_with_trailing_dot_is_refused(gw: Gateway, tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    (tmp_path / "link").symlink_to(real)
+    with pytest.raises(ValueError):
+        gw.open_private_dir(f"{tmp_path}/link/.")
+
+
+def test_doubled_slashes_are_collapsed_in_the_shown_path(gw: Gateway, tmp_path: Path) -> None:
+    with gw.open_private_dir(f"{tmp_path}//a///b//") as d:
+        assert d.path == f"{tmp_path}/a/b"
+    assert _mode(tmp_path / "a" / "b") == 0o700
+
+
+def test_parent_that_is_a_regular_file_is_not_directory(gw: Gateway, tmp_path: Path) -> None:
+    (tmp_path / "file").write_text("x")
+    for target in (tmp_path / "file" / "state", tmp_path / "file" / "a" / "state"):
+        with pytest.raises(UnsafePathError) as info:
+            gw.open_private_dir(target)
+        assert info.value.reason == "not_directory"
+
+
+@pytest.mark.parametrize("flag", [stat.S_ISGID, stat.S_ISVTX])
+def test_setgid_or_sticky_dir_is_refused_for_mode(gw: Gateway, tmp_path: Path, flag: int) -> None:
+    target = tmp_path / "state"
+    target.mkdir()
+    target.chmod(0o700 | flag)
+    with pytest.raises(UnsafePathError) as info:
+        gw.open_private_dir(target)
+    assert info.value.reason == "mode"
+
+
+def test_bytes_path_gets_a_type_specific_message(gw: Gateway) -> None:
+    with pytest.raises(ValueError, match="bytes"):
+        gw.open_private_dir(b"/tmp/x")  # type: ignore[arg-type]
+
+
+def test_umask_survives_concurrent_directory_creation(
+    gw: Gateway, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+    import time
+
+    real = os.makedirs
+
+    def slow(*args: object, **kw: object) -> None:
+        time.sleep(0.1)
+        real(*args, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(gateway.os, "makedirs", slow)
+    old = os.umask(0o022)
+    try:
+        threads = [
+            threading.Thread(target=lambda i=i: gw.open_private_dir(tmp_path / f"d{i}").close())
+            for i in range(2)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert os.umask(0o022) == 0o022
+    finally:
+        os.umask(old)
