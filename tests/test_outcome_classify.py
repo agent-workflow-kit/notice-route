@@ -8,13 +8,16 @@ few rows) goes in, an ``Outcome`` comes out. Real timeouts are never waited for;
 from __future__ import annotations
 
 import json
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from notice_route.gateway import STDOUT_LIMIT, Gateway, RunResult
+from notice_route import gateway as gateway_module
+from notice_route.gateway import STDOUT_LIMIT, FakeClock, Gateway, RunResult
 from notice_route.notify import CallResult, call_notifier
 from notice_route.outcome import Outcome, classify
 from tests.decide_support import dest
@@ -96,6 +99,18 @@ def test_lost_is_unknown_killed() -> None:
     assert cl(CallResult("lost")).counted
 
 
+@pytest.mark.parametrize("kind", KINDS)
+def test_overflow_with_a_run_overflow_marker_is_output_overflow(kind: str) -> None:
+    for stream in ("stdout", "stderr"):
+        result = ran("overflow", None, signal=9, overflow=stream, stdout=flags(False, False))
+        assert shape(cl(result, kind)) == ("unknown", "output_overflow", None)
+
+
+def test_timeout_with_an_overflow_marker_is_still_killed() -> None:
+    result = ran("timeout", None, signal=9, overflow="stdout")
+    assert shape(cl(result)) == ("unknown", "killed", None)
+
+
 # --- rows 5 and 6: generic --------------------------------------------------------------------
 
 
@@ -157,6 +172,22 @@ def test_row7_exit0_with_an_error_envelope_is_sent() -> None:
     out = cl(ran(stdout=flags(False, False)))
     assert shape(out) == ("sent", None, None)
     assert out.notifier_outcome is None
+
+
+def test_exit22_on_a_generic_destination_is_a_failure_not_disabled() -> None:
+    out = cl(ran(returncode=22, stdout=b'{"outcome":"disabled"}'), "generic")
+    assert shape(out) == ("failed", "generic_failed", None)
+    assert out.notifier_outcome is None
+
+
+def test_exit0_on_a_generic_destination_with_garbage_stdout_is_sent() -> None:
+    out = cl(ran(stdout=b"\xff\x00 not json {"), "generic")
+    assert shape(out) == ("sent", None, None) and out.notifier_outcome is None
+
+
+def test_exit1_with_a_bad_error_code_is_unknown_even_when_unknown_outcome_is_false() -> None:
+    stdout = env("Bad-Code", retryable=False, unknown_outcome=False)
+    assert shape(cl(ran(returncode=1, stdout=stdout))) == ("unknown", "envelope_invalid", None)
 
 
 def test_row8_exit22_is_disabled_with_notifier_outcome() -> None:
@@ -398,7 +429,7 @@ def test_exited_without_a_return_code_is_not_trusted() -> None:
 
 
 def test_hostile_envelope_text_never_reaches_the_outcome() -> None:
-    hostile = "\x1b[31mSECRET-LOOKING\x00" + "x" * 100000
+    hostile = "\x1b[31mHOSTILE-TEXT\x00" + "x" * 100000
     stdout = json.dumps(
         {
             "error": {
@@ -521,5 +552,80 @@ def test_real_exec_failed(tmp_path: Path) -> None:
     assert shape(classify(call, kind="slack-notice", has_dedupe_key=False)) == (
         "failed",
         "exec_failed",
+        None,
+    )
+
+
+# --- real processes: a hang and a lost child -------------------------------------------------
+
+
+def _call(note: Notifier, gateway: Gateway) -> CallResult:
+    return call_notifier(
+        gateway,
+        dest(kind="slack-notice", cmd=tuple(note.cmd), timeout=1.0),
+        title="t",
+        message="m",
+        level="info",
+        link="",
+        dedupe_key=DIGEST,
+    )
+
+
+def test_real_hang_is_unknown_killed(
+    make_notifier: Callable[..., Notifier], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+    note = make_notifier(hang=True)
+    base = Path(note.cmd[0]).parent
+    base.chmod(0o755)
+    clock = FakeClock()
+    gateway = Gateway(
+        environ=lambda: {"PATH": str(base), "LANG": "C.UTF-8"},
+        exec_check_from=str(base),
+        clock=clock,
+    )
+    stop = threading.Event()
+
+    def tick() -> None:
+        while not stop.is_set():
+            clock.advance_monotonic(1.0)
+            time.sleep(0.01)
+
+    thread = threading.Thread(target=tick, daemon=True)
+    thread.start()
+    try:
+        call = _call(note, gateway)
+    finally:
+        stop.set()
+        thread.join(5)
+    assert shape(classify(call, kind="slack-notice", has_dedupe_key=True)) == (
+        "unknown",
+        "killed",
+        None,
+    )
+
+
+def test_real_lost_child_is_unknown_killed(
+    make_notifier: Callable[..., Notifier], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / ".config"))
+
+    def gone(*_a: object) -> None:
+        raise ChildProcessError
+
+    monkeypatch.setattr(gateway_module.os, "waitid", gone)
+    note = make_notifier(sleep=0.2)
+    base = Path(note.cmd[0]).parent
+    base.chmod(0o755)
+    gateway = Gateway(
+        environ=lambda: {"PATH": str(base), "LANG": "C.UTF-8"}, exec_check_from=str(base)
+    )
+    call = _call(note, gateway)
+    assert call.status == "lost"
+    assert shape(classify(call, kind="slack-notice", has_dedupe_key=True)) == (
+        "unknown",
+        "killed",
         None,
     )

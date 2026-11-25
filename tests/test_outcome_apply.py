@@ -23,7 +23,7 @@ from notice_route.store import Store, open_store
 
 NOW = 1_700_000_000
 HOUR = decide.hour_start(NOW)
-TOKEN = "tok-a"
+CLAIM = "claim-a"
 DIGEST = "b" * 64
 EVENT_DIGEST = "c" * 64
 
@@ -52,8 +52,9 @@ def make(
     attempts: int = 0,
     reason: str | None = None,
     level: str = "warn",
-    token: str = TOKEN,
+    token: str = CLAIM,
     destination: str = "d",
+    kind: str = "single",
 ) -> QueueRow:
     with store.write() as conn:
         did = q.insert_delivery(
@@ -91,7 +92,7 @@ def make(
         res = q.enqueue(
             conn,
             delivery_id=did,
-            kind="single",
+            kind=kind,  # type: ignore[arg-type]
             message=message,
             level=level,
             source="src",
@@ -112,12 +113,16 @@ def apply(store: Store, row: QueueRow, outcome: Outcome, **kw: object) -> Applie
         return apply_outcome(
             conn,
             row=row,
-            token=kw.pop("token", TOKEN),  # type: ignore[arg-type]
+            token=kw.pop("token", CLAIM),  # type: ignore[arg-type]
             outcome=outcome,
             lease=Lease(NOW, 20),
             retry_at=retry_at,
             **kw,  # type: ignore[arg-type]
         )
+
+
+def kind_of(store: Store) -> object:
+    return store.read("SELECT kind FROM queue")[0][0]
 
 
 def delivery(store: Store, did: int) -> tuple[object, ...]:
@@ -130,6 +135,15 @@ def delivery(store: Store, did: int) -> tuple[object, ...]:
 
 def n(store: Store, table: str) -> int:
     return cast(int, store.read(f"SELECT COUNT(*) FROM {table}")[0][0])
+
+
+def reclaim(store: Store, row: QueueRow) -> QueueRow:
+    """The row again, claimed by CLAIM as a later flush would hold it."""
+    with store.write() as conn:
+        conn.execute("UPDATE queue SET claimed_by = ? WHERE id = ?", (CLAIM, row.id))
+        again = q.get_row(conn, row.id)
+    assert again is not None
+    return again
 
 
 def rate(store: Store) -> int:
@@ -172,7 +186,7 @@ def test_failed_and_disabled_release_dedup(store: Store, outcome: Outcome) -> No
 
 
 def test_release_touches_only_its_own_delivery(store: Store) -> None:
-    other = make(store, destination="e", token="tok-b")
+    other = make(store, destination="e", token="claim-b")
     row = make(store)
     apply(store, row, Outcome("failed", "x"))
     assert n(store, "dedup") == 1
@@ -222,11 +236,15 @@ def test_retries_exhausted_ends_failed_and_releases(store: Store) -> None:
 def test_link_refused_rewrites_the_row(store: Store) -> None:
     row = make(store)
     res = apply(store, row, Outcome("queued_retry", "link_scheme", refusal="link_refused"))
-    assert (res.outcome, res.reason, res.deliver_after) == ("queued_retry", "link_refused", NOW)
+    assert (res.outcome, res.reason, res.deliver_after) == (
+        "queued_retry",
+        "link_refused",
+        NOW + 60,
+    )
     msg, link, due = store.read("SELECT message, link, deliver_after FROM queue")[0]
-    assert (msg, link, due) == ("hello\nhttps://x.example/a", None, NOW)
+    assert (msg, link, due) == ("hello\nhttps://x.example/a", None, NOW + 60)
     d = delivery(store, row.delivery_id)
-    assert d[:5] == ("queued_retry", "link_refused", "link_scheme", 1, NOW)
+    assert d[:5] == ("queued_retry", "link_refused", "link_scheme", 1, NOW + 60)
     assert d[5] == decide._sha16("hello\nhttps://x.example/a")
 
 
@@ -275,12 +293,75 @@ def test_refusal_retry_is_bounded_by_the_attempt_cap(store: Store) -> None:
     assert (res.outcome, res.code) == ("failed", "retries_exhausted")
 
 
+def test_a_second_refusal_at_the_attempt_cap_keeps_the_refusal_code(store: Store) -> None:
+    row = make(store, reason="link_refused", attempts=2)
+    res = apply(store, row, Outcome("queued_retry", "link_invalid", refusal="link_refused"))
+    assert (res.outcome, res.code) == ("failed", "link_invalid")
+    assert delivery(store, row.delivery_id)[:4] == ("failed", "link_refused", "link_invalid", 3)
+
+
+def test_a_link_refusal_without_a_link_at_the_attempt_cap_keeps_the_refusal_code(
+    store: Store,
+) -> None:
+    row = make(store, link=None, attempts=2)
+    res = apply(store, row, Outcome("queued_retry", "link_invalid", refusal="link_refused"))
+    assert (res.outcome, res.code) == ("failed", "link_invalid")
+
+
+def test_the_second_refusal_attempt_follows_the_schedule_like_any_retry(store: Store) -> None:
+    row = make(store, attempts=1)
+    res = apply(store, row, Outcome("queued_retry", "command_keyword", refusal="keyword_refused"))
+    assert (res.outcome, res.deliver_after) == ("queued_retry", NOW + 300)
+
+
 def test_a_non_refusal_retry_keeps_the_refused_reason_so_a_later_refusal_still_fails(
     store: Store,
 ) -> None:
     row = make(store, reason="link_refused", attempts=1)
     apply(store, row, Outcome("queued_retry", "network_error"))
     assert delivery(store, row.delivery_id)[1] == "link_refused"
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        Outcome("queued_retry", "network_error"),
+        Outcome("queued_retry", "link_invalid", refusal="link_refused"),
+        Outcome("queued_retry", "command_keyword", refusal="keyword_refused"),
+        Outcome("deferred", None, "env_missing", counted=False),
+    ],
+)
+def test_a_requeued_held_row_becomes_a_single_row(store: Store, outcome: Outcome) -> None:
+    row = make(store, kind="held")
+    assert kind_of(store) == "held"
+    assert apply(store, row, outcome).applied
+    assert kind_of(store) == "single"
+
+
+def test_row12_and_row18_retries_keep_their_codes(store: Store) -> None:
+    row = make(store)
+    res = apply(store, row, Outcome("queued_retry", "signal"))
+    assert (res.outcome, res.code) == ("queued_retry", "signal")
+    assert delivery(store, row.delivery_id)[2] == "signal"
+    row = make(store, destination="e", token="claim-b")
+    res = apply(store, row, Outcome("queued_retry", "upstream_error"), token="claim-b")
+    assert (res.outcome, res.code) == ("queued_retry", "upstream_error")
+
+
+def test_exec_failed_counts_an_attempt(store: Store) -> None:
+    row = make(store, attempts=1)
+    res = apply(store, row, Outcome("failed", "exec_failed"))
+    assert (res.outcome, res.attempts) == ("failed", 2)
+
+
+def test_a_64_character_code_and_reason_are_accepted(store: Store) -> None:
+    code = "c" * 64
+    row = make(store)
+    res = apply(store, row, Outcome("failed", code))
+    assert delivery(store, row.delivery_id)[2] == code and res.code == code
+    other = make(store, destination="e", token="claim-b")
+    res = apply(store, other, Outcome("deferred", None, "r" * 64, counted=False), token="claim-b")
+    assert delivery(store, other.delivery_id)[1] == "r" * 64
 
 
 # --- internal faults and env_missing ----------------------------------------------------------
@@ -291,7 +372,7 @@ def test_internal_fault_records_nothing(store: Store) -> None:
     res = apply(store, row, Outcome(None, counted=False), count_hour=HOUR)
     assert res.internal and not res.applied
     assert delivery(store, row.delivery_id)[:4] == ("sending", None, None, 0)
-    assert store.read("SELECT claimed_by FROM queue")[0][0] == TOKEN
+    assert store.read("SELECT claimed_by FROM queue")[0][0] == CLAIM
     assert rate(store) == 1
 
 
@@ -309,6 +390,24 @@ def test_env_missing_requeues_due_now_without_an_attempt_and_gives_the_count_bac
     assert n(store, "dedup") == 1
 
 
+def test_a_retry_after_a_deferral_clears_the_stale_code(store: Store) -> None:
+    row = make(store)
+    apply(store, row, Outcome("queued_retry", "network_error"))
+    again = reclaim(store, row)
+    apply(store, again, Outcome("deferred", None, "env_missing", counted=False))
+    assert delivery(store, row.delivery_id)[:3] == ("deferred", "env_missing", None)
+
+
+def test_env_missing_never_overwrites_a_stored_refusal_reason(store: Store) -> None:
+    row = make(store, reason="link_refused", attempts=1)
+    res = apply(store, row, Outcome("deferred", None, "env_missing", counted=False))
+    assert res.reason == "link_refused"
+    assert delivery(store, row.delivery_id)[:2] == ("deferred", "link_refused")
+    again = reclaim(store, row)
+    res = apply(store, again, Outcome("queued_retry", "link_invalid", refusal="link_refused"))
+    assert (res.outcome, res.code) == ("failed", "link_invalid")
+
+
 def test_env_missing_without_a_count_hour_gives_nothing_back(store: Store) -> None:
     row = make(store)
     apply(store, row, Outcome("deferred", None, "env_missing", counted=False))
@@ -324,6 +423,16 @@ def test_give_back_never_goes_below_zero(store: Store) -> None:
 
 
 # --- fencing ----------------------------------------------------------------------------------
+
+
+def test_a_stale_claimant_whose_delivery_was_trimmed_is_not_applied(store: Store) -> None:
+    row = make(store)
+    with store.write() as conn:
+        conn.execute("DELETE FROM queue")  # evicted, and its delivery trimmed since
+        conn.execute("DELETE FROM dedup")
+        conn.execute("DELETE FROM event_ids")
+        conn.execute("DELETE FROM deliveries")
+    assert not apply(store, row, Outcome("sent")).applied
 
 
 def test_a_stale_claimant_changes_nothing(store: Store) -> None:
@@ -371,7 +480,7 @@ def test_an_evicted_row_records_nothing_and_keeps_the_overflow_end(store: Store)
 def test_a_lapsed_claim_nobody_took_still_accepts_its_result(store: Store) -> None:
     row = make(store)
     with store.write() as conn:
-        q.release_claims(conn, TOKEN, Lease(NOW + 1000, 20))
+        q.release_claims(conn, CLAIM, Lease(NOW + 1000, 20))
     assert apply(store, row, Outcome("sent")).applied
 
 
@@ -410,6 +519,31 @@ def test_a_requeued_row_dropped_by_the_cap_ends_dropped_and_releases(store: Stor
     assert n(store, "dedup") == 0 and n(store, "event_ids") == 0
 
 
+def test_env_missing_give_back_survives_the_cap_eviction(store: Store) -> None:
+    row = make(store, level="info")
+    with store.write() as conn:
+        for _ in range(100):
+            did = q.insert_delivery(
+                conn, ts=NOW, source="s", level="error", outcome="deferred", destination="d"
+            )
+            q.enqueue(
+                conn,
+                delivery_id=did,
+                kind="single",
+                message="m",
+                level="error",
+                source="s",
+                deliver_after=NOW,
+                created_at=NOW,
+                lease=Lease(NOW, 20),
+            )
+    res = apply(
+        store, row, Outcome("deferred", None, "env_missing", counted=False), count_hour=HOUR
+    )
+    assert (res.outcome, res.code) == ("dropped", "overflow")
+    assert rate(store) == 0
+
+
 # --- atomicity --------------------------------------------------------------------------------
 
 
@@ -428,12 +562,12 @@ def test_a_failure_while_recording_rolls_everything_back(
             gw,
             send_worst_case_s=10,
             row=row,
-            token=TOKEN,
+            token=CLAIM,
             outcome=Outcome("failed", "x"),
             retry_at=retry_at,
         )
     assert delivery(store, row.delivery_id)[:4] == ("sending", None, None, 0)
-    assert store.read("SELECT claimed_by FROM queue")[0][0] == TOKEN
+    assert store.read("SELECT claimed_by FROM queue")[0][0] == CLAIM
     assert n(store, "dedup") == 1
 
 
@@ -449,7 +583,7 @@ def test_a_failing_schedule_rolls_back(store: Store, gw: Gateway) -> None:
             gw,
             send_worst_case_s=10,
             row=row,
-            token=TOKEN,
+            token=CLAIM,
             outcome=Outcome("queued_retry", "e"),
             retry_at=bad,
         )
@@ -463,7 +597,7 @@ def test_record_outcome_reads_the_clock_inside_the_transaction(store: Store, gw:
         gw,
         send_worst_case_s=10,
         row=row,
-        token=TOKEN,
+        token=CLAIM,
         outcome=Outcome("deferred", None, "env_missing", counted=False),
         retry_at=retry_at,
     )
@@ -475,9 +609,9 @@ def test_record_outcome_reads_the_clock_inside_the_transaction(store: Store, gw:
 
 def test_record_escaped_marks_unknown_and_keeps_the_claim(store: Store) -> None:
     row = make(store)
-    assert record_escaped(store, row=row, token=TOKEN)
+    assert record_escaped(store, row=row, token=CLAIM)
     assert delivery(store, row.delivery_id)[:4] == ("unknown", None, "killed", 1)
-    assert store.read("SELECT claimed_by FROM queue")[0][0] == TOKEN
+    assert store.read("SELECT claimed_by FROM queue")[0][0] == CLAIM
     assert n(store, "dedup") == 1 and n(store, "event_ids") == 1
 
 
@@ -485,5 +619,5 @@ def test_record_escaped_is_fenced(store: Store) -> None:
     row = make(store)
     with store.write() as conn:
         conn.execute("UPDATE queue SET claimed_by = 'other'")
-    assert not record_escaped(store, row=row, token=TOKEN)
+    assert not record_escaped(store, row=row, token=CLAIM)
     assert delivery(store, row.delivery_id)[0] == "sending"

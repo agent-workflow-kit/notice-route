@@ -27,9 +27,14 @@ Choices where the interface is silent (the narrower reading):
   ``killed``. ``not_started`` is an internal fault: nothing is recorded, the claim lapses and
   ``flush`` resends (no blind retry). ``env_missing`` found at call time requeues the row
   ``deferred``/``env_missing`` with no attempt counted.
-- A refusal retry (rows 13 and 14) is due now (the cure is in the row; nothing to wait for) but is
-  still bounded by the attempt cap of the retry schedule. A link refusal of a row that has no link
-  cannot be cured and ends ``failed``.
+- A refusal retry (rows 13 and 14) follows the retry schedule like any other retry (the interface
+  names no exception to it) and is bounded by its attempt cap. A second refusal and a link refusal
+  of a row that has no link (nothing can cure it) end ``failed`` with the refusal reason as code;
+  these checks come before the attempt cap, so the code is never ``retries_exhausted`` for them.
+- A requeued row is always a ``single`` row (a ``held`` row that is retried or deferred is not held
+  any more). ``env_missing`` never overwrites a stored refusal reason.
+- ``not_started`` records nothing, so the hourly count it took stays (nothing is known about whether
+  the call ran; the 24 h expiry and the cap bound it).
 - ``reason`` of a delivery is left as it was for outcomes that set none (a ``sent`` after
   ``quiet`` keeps ``quiet``), which also keeps "already link_refused" true on later calls.
 
@@ -265,12 +270,18 @@ def apply_outcome(
     """Record ``outcome`` for the claimed ``row`` inside a ``Store.write`` transaction.
 
     ``retry_at(attempts)`` is the retry schedule (#25): the ``deliver_after`` of a retry after
-    ``attempts`` calls, or None when the attempts are used up (the row then ends ``failed``,
-    code ``retries_exhausted``). ``count_hour`` is the UTC hour start in which the hourly count of
+    ``attempts`` calls (refusal retries included), or None when the attempts are used up (the row
+    then ends ``failed``, code ``retries_exhausted``, unless a second or uncurable refusal ended it
+    first with the refusal code). ``count_hour`` is the UTC hour start in which the hourly count of
     this call was taken; when given and no call was made (``env_missing``) the count is given
     back (a digest passes it for one of its rows only). Everything is fenced by ``token``."""
     if outcome.outcome is None:
         return Applied(False, None, None, None, None, 0, None, internal=True)
+    held = conn.execute(
+        "SELECT 1 FROM queue WHERE id = ? AND claimed_by = ?", (row.id, token)
+    ).fetchone()
+    if held is None:  # fence first: a stale claimant's delivery may be trimmed already
+        return _NOT_APPLIED
     state = conn.execute(
         "SELECT attempts, reason FROM deliveries WHERE id = ?", (row.delivery_id,)
     ).fetchone()
@@ -278,11 +289,6 @@ def apply_outcome(
         raise ValueError("the row's delivery does not exist")
     attempts = int(state[0]) + (1 if outcome.counted else 0)
     prior_reason = state[1]
-    held = conn.execute(
-        "SELECT 1 FROM queue WHERE id = ? AND claimed_by = ?", (row.id, token)
-    ).fetchone()
-    if held is None:
-        return _NOT_APPLIED
 
     message: str | None = None
     link: str | None = None
@@ -291,20 +297,24 @@ def apply_outcome(
     code = outcome.code
     name: str = outcome.outcome
     if name == "queued_retry":
-        later = retry_at(attempts)
-        if later is None:
-            name, code = "failed", "retries_exhausted"
-        elif outcome.refusal is not None:
-            if prior_reason in _REFUSED or (outcome.refusal == "link_refused" and not row.link):
-                name = "failed"  # a second refusal, or nothing to cure
-            else:
-                reason = outcome.refusal
-                message, link = _refused_row(row, outcome.refusal)
-                deliver_after = lease.now
+        if outcome.refusal is not None and (
+            prior_reason in _REFUSED or (outcome.refusal == "link_refused" and not row.link)
+        ):
+            name = "failed"  # a second refusal, or nothing to cure: the refusal reason is the code
         else:
-            deliver_after = later
+            later = retry_at(attempts)
+            if later is None:
+                name, code = "failed", "retries_exhausted"
+            else:
+                deliver_after = later
+                if outcome.refusal is not None:
+                    reason = outcome.refusal
+                    message, link = _refused_row(row, outcome.refusal)
     elif name == "deferred":
         deliver_after = lease.now
+        if prior_reason in _REFUSED:
+            reason = None  # keep the stored refusal: a later refusal must still end failed
+    given_back = name == "deferred" and count_hour is not None
 
     evicted: tuple[Evicted, ...] = ()
     if name in _TERMINAL:
@@ -314,8 +324,14 @@ def apply_outcome(
         assert deliver_after is not None
         if message is not None:
             conn.execute(
-                "UPDATE queue SET message = ?, link = ? WHERE id = ? AND claimed_by = ?",
+                "UPDATE queue SET kind = 'single', message = ?, link = ?"
+                " WHERE id = ? AND claimed_by = ?",
                 (message, link, row.id, token),
+            )
+        else:
+            conn.execute(
+                "UPDATE queue SET kind = 'single' WHERE id = ? AND claimed_by = ?",
+                (row.id, token),
             )
         change = requeue_row(conn, row.id, token, deliver_after, lease)
         if not change.applied:
@@ -345,7 +361,8 @@ def apply_outcome(
         if name in _RELEASING:
             dedup.release(conn, row.delivery_id)
             released = True
-    if name == "deferred" and count_hour is not None:
+    if given_back:  # decided before the eviction: the call was never made either way
+        assert count_hour is not None
         give_back(conn, destination=_destination(row), level=row.level, hour=count_hour)
     shown = reason if reason is not None else prior_reason
     return Applied(
