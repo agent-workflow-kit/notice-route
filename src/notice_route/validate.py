@@ -30,6 +30,8 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
+from decimal import Decimal
+from fractions import Fraction
 from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo
 
@@ -86,8 +88,14 @@ _ENV_FIXED = frozenset({"PATH", "LANG", "LC_ALL", "WSL_INTEROP", "WSL_DISTRO_NAM
 _FORBIDDEN_ARG = re.compile(r"(?:send|--stdin-json|--json|--actor|--dedupe-key)(?:=[\s\S]*)?")
 _CLOCK = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
 _DURATION = re.compile(r"([0-9]+(?:\.[0-9]+)?)(ms|s|m|h|d)?")
-_UNITS = {None: 1.0, "ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0, "d": _DAY}
-_DURATION_CHARS = 32
+_UNITS = {
+    None: Fraction(1),
+    "ms": Fraction(1, 1000),
+    "s": Fraction(1),
+    "m": Fraction(60),
+    "h": Fraction(3600),
+    "d": Fraction(86400),
+}
 
 _HOST = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*"
 _HOST_KEY = re.compile(r"(" + _HOST + r")(?::([0-9]{1,5}))?")
@@ -202,15 +210,16 @@ def _bad(path: Path) -> ConfigError:
     return ConfigError("config_invalid", ".".join(path))
 
 
-def _entry(name: str) -> str:
+def _entry(name: Any) -> str:
     """An entry name as it may appear in a key: plain names only (C-40)."""
-    return name if _NAME_SEGMENT.fullmatch(name) else "?"
+    return name if isinstance(name, str) and _NAME_SEGMENT.fullmatch(name) else "?"
 
 
-def _mapping(value: Any, path: Path) -> dict[str, Any]:
+def _mapping(value: Any, path: Path) -> dict[Any, Any]:
+    """A mapping; its keys are not known to be strings (a caller may hand in anything)."""
     if not isinstance(value, dict):
         raise _bad(path)
-    return cast("dict[str, Any]", value)
+    return cast("dict[Any, Any]", value)
 
 
 def _closed(value: Any, path: Path, allowed: frozenset[str]) -> dict[str, Any]:
@@ -235,7 +244,7 @@ def _integer(value: Any, path: Path, low: int, high: int) -> int:
 
 
 def _string(value: Any, path: Path, *, low: int = 1, high: int = MAX_ARG) -> str:
-    if not isinstance(value, str) or not low <= len(value) <= high:
+    if not isinstance(value, str) or not low <= len(value) <= high or "\x00" in value:
         raise _bad(path)
     return value
 
@@ -263,23 +272,35 @@ def _duration(value: Any, path: Path, low: float, high: float, *, long: bool = F
     is inclusive. Nothing about the value reaches the error."""
     if isinstance(value, bool):
         raise _bad(path)
-    if isinstance(value, (int, float)):
-        seconds = float(value)
-    elif isinstance(value, str) and len(value) <= _DURATION_CHARS:
+    exact: Fraction
+    if isinstance(value, int):
+        exact = Fraction(value)
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            raise _bad(path)
+        exact = Fraction(value)
+    elif isinstance(value, str):
         found = _DURATION.fullmatch(value)
         if found is None or (found.group(2) in ("h", "d") and not long):
             raise _bad(path)
-        seconds = float(found.group(1)) * _UNITS[found.group(2)]
+        exact = Fraction(Decimal(found.group(1))) * _UNITS[found.group(2)]
     else:
         raise _bad(path)
-    if not math.isfinite(seconds) or not low <= seconds <= high:
+    # The range is checked on the exact value, so a string a hair outside it is refused; the
+    # float is made only once the value is known to be in range.
+    if not Fraction(low) <= exact <= Fraction(high):
         raise _bad(path)
-    return seconds
+    return float(exact)
 
 
 def _absolute(value: Any, path: Path, high: int = MAX_ARG) -> str:
     """An absolute path: a leading ``/`` and at least one more character."""
-    if not isinstance(value, str) or not 2 <= len(value) <= high or value[0] != "/":
+    if (
+        not isinstance(value, str)
+        or not 2 <= len(value) <= high
+        or value[0] != "/"
+        or "\x00" in value
+    ):
         raise _bad(path)
     return value
 
@@ -313,9 +334,9 @@ _DESTINATION_KEYS = frozenset(
 _WINDOW_KEYS = frozenset({"timezone", "days", "start", "end"})
 
 
-def _destination(name: str, body: Any, windows: dict[str, QuietWindow]) -> Destination:
+def _destination(name: Any, body: Any, windows: dict[str, QuietWindow]) -> Destination:
     path: Path = ("destinations", _entry(name))
-    if not _DESTINATION_NAME.fullmatch(name):
+    if not isinstance(name, str) or not _DESTINATION_NAME.fullmatch(name):
         raise _bad(path)
     node = _closed(body, path, _DESTINATION_KEYS)
 
@@ -367,9 +388,11 @@ def _clock(value: Any, path: Path) -> int:
     return int(text[:2]) * 60 + int(text[3:])
 
 
-def _window(name: str, body: Any, gateway: Gateway) -> QuietWindow:
+def _window(name: Any, body: Any, gateway: Gateway) -> QuietWindow:
     path: Path = ("quiet_hours", _entry(name))
-    if not _DESTINATION_NAME.fullmatch(name):  # a window name follows the destination grammar
+    if not isinstance(name, str) or not _DESTINATION_NAME.fullmatch(
+        name
+    ):  # a window name follows the destination grammar
         raise _bad(path)
     node = _closed(body, path, _WINDOW_KEYS)
 
@@ -415,7 +438,7 @@ def _links(value: Any) -> Links:
     hosts: dict[str, Literal["github", "gitlab"]] = {}
     for name, forge in _mapping(node.get("hosts", {}), ("links", "hosts")).items():
         path: Path = ("links", "hosts", _entry(name))
-        found = _HOST_KEY.fullmatch(name) if len(name) <= 259 else None
+        found = _HOST_KEY.fullmatch(name) if isinstance(name, str) and len(name) <= 259 else None
         if found is None or not _port_ok(found.group(2)):
             raise _bad(path)
         if not isinstance(forge, str) or forge not in ("github", "gitlab"):
@@ -424,7 +447,7 @@ def _links(value: Any) -> Links:
     tickets: dict[str, str] = {}
     for site, base in _mapping(node.get("tickets", {}), ("links", "tickets")).items():
         path = ("links", "tickets", _entry(site))
-        if not _SITE_NAME.fullmatch(site):
+        if not isinstance(site, str) or not _SITE_NAME.fullmatch(site):
             raise _bad(path)
         url = _literal_url(base, path)
         if not url.endswith("/"):
@@ -474,10 +497,10 @@ def _match(value: Any, path: Path) -> Match:
             raise _bad(where_path)
         built: list[tuple[str, WhereValue]] = []
         for key, item in pairs.items():
-            if not _WHERE_KEY.fullmatch(key):
+            if not isinstance(key, str) or not _WHERE_KEY.fullmatch(key):
                 raise _bad(where_path)
             if isinstance(item, str):
-                if len(item) > MAX_WHERE_VALUE:
+                if len(item) > MAX_WHERE_VALUE or "\x00" in item:
                     raise _bad(where_path)
             elif not isinstance(item, (bool, int)):  # a float, a list, a map or a null
                 raise _bad(where_path)

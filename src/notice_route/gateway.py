@@ -646,15 +646,16 @@ class Gateway:
 
         ``key`` must match ``[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+){0,2}`` and be at most 64
         characters, so it cannot leave the directory; ``localtime``, ``posixrules`` and
-        ``Factory`` (any case) are refused. The file is read here, at most 256 KiB, a regular
-        file (symlinks are followed: the database links its aliases), and parsed from memory,
-        so the environment's search path plays no part. Any failure is one :class:`ZoneError`.
+        ``Factory`` (any case, as the last path segment) are refused. The file is read here, at most
+        256 KiB, a regular file (symlinks are followed: the database links its aliases), and
+        parsed from memory, so the environment's search path plays no part. Any failure is one
+        :class:`ZoneError`.
         """
         if (
             not isinstance(key, str)  # pyright: ignore[reportUnnecessaryIsInstance]
             or len(key) > 64
             or not _ZONE_KEY.fullmatch(key)
-            or key.lower() in _ZONE_REFUSED
+            or key.rsplit("/", 1)[-1].lower() in _ZONE_REFUSED
         ):
             raise ZoneError("not a usable time zone name")
         for base in self.tz_dirs:
@@ -663,14 +664,17 @@ class Gateway:
             except OSError:
                 continue
             try:
-                if not stat.S_ISREG(os.fstat(fd).st_mode):
-                    raise ZoneError("not a regular file")
-                file = os.fdopen(fd, "rb")
-            except BaseException:
-                os.close(fd)
-                raise
-            with file:
-                data = file.read(_ZONE_MAX_BYTES + 1)
+                try:
+                    if not stat.S_ISREG(os.fstat(fd).st_mode):
+                        raise ZoneError("not a regular file")
+                    file = os.fdopen(fd, "rb")
+                except BaseException:
+                    os.close(fd)
+                    raise
+                with file:
+                    data = file.read(_ZONE_MAX_BYTES + 1)
+            except OSError:
+                raise ZoneError("unreadable zone file") from None
             if len(data) > _ZONE_MAX_BYTES:
                 raise ZoneError("zone file too large")
             try:

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import zoneinfo
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,8 @@ ROOT = Path(__file__).resolve().parent.parent
 CANARY = "leak-canary-value"
 
 _HAVE_ZONES = any((Path(d) / "America" / "New_York").is_file() for d in SYSTEM_TZ_DIRS)
+if not _HAVE_ZONES and os.environ.get("CI"):
+    pytest.fail("CI needs a system time zone database", pytrace=False)
 pytestmark = pytest.mark.skipif(not _HAVE_ZONES, reason="no system time zone database")
 
 
@@ -768,6 +771,52 @@ bad_each(
 )
 
 
+# R1/R6/R7/R8 (review round 1)
+bad("hook-cmd-nul", {"hooks.post-fail.0.cmd": "a\x00b"}, "hooks.post-fail.0.cmd")
+bad("cmd-arg-nul", {"destinations.chat.cmd": ["/bin/x", "a\x00"]}, "destinations.chat.cmd")
+bad("cmd-first-nul", {"destinations.chat.cmd": ["/bin/x\x00y"]}, "destinations.chat.cmd")
+bad("cron-env-file-nul", {"cron.env_file": "/a\x00b"}, "cron.env_file")
+bad("where-value-nul", {"rules.0.match.where": {"a": "x\x00"}}, "rules.0.match.where")
+bad("wildcard-nul", {"rules.0.match.source": "a\x00"}, "rules.0.match.source")
+bad("env-4097", {"destinations.chat.env": [f"E{i}" for i in range(4097)]}, "destinations.chat.env")
+bad("passthrough-link-pr-token", {"rules.2.link": "{{pr_url}}"}, "rules.2.link")
+bad("passthrough-link-ticket-token", {"rules.2.link": "{{ticket_url}}"}, "rules.2.link")
+bad("huge-int-duration", {"lock_wait": 10**400}, "lock_wait", False)
+bad("huge-int-retention", {"retention.history": 10**400}, "retention.history", False)
+bad("nan-duration", {"lock_wait": float("nan")}, "lock_wait", False)
+bad("inf-duration", {"lock_wait": float("inf")}, "lock_wait", False)
+bad(
+    "retention-just-below-1d",
+    {"retention.history": "23.99999999999999999999h"},
+    "retention.history",
+    False,
+)
+bad(
+    "timeout-just-below-1s",
+    {"destinations.chat.timeout": "0.9999999999999999999s"},
+    "destinations.chat.timeout",
+    False,
+)
+bad(
+    "timeout-just-above-120s",
+    {"destinations.chat.timeout": "120.0000000000000001s"},
+    "destinations.chat.timeout",
+    False,
+)
+bad(
+    "dedup-just-above-24h",
+    {"rules.0.dedup_window": "86400.0000000000000001s"},
+    "rules.0.dedup_window",
+    False,
+)
+bad(
+    "hook-timeout-just-above-1h",
+    {"hooks.post-fail.0.timeout": "3600.0000000000000001s"},
+    "hooks.post-fail.0.timeout",
+    False,
+)
+
+
 @pytest.mark.parametrize(("edits", "key"), [(e, k) for _, e, k, _ in BAD], ids=[n for n, *_ in BAD])
 def test_each_invalid_rule_is_config_invalid_with_its_key(edits: dict[str, Any], key: str) -> None:
     assert rejected(build(edits)).key == key
@@ -839,6 +888,10 @@ OK: list[tuple[str, dict[str, Any]]] = [
     ("default-dedup-24h", {"defaults.dedup_window": "24h"}),
     ("retention-1d", {"retention.history": "1d", "retention.event_ids": "24h"}),
     ("retention-big", {"retention.history": "3650d"}),
+    ("timeout-long-digits", {"destinations.chat.timeout": "1." + "0" * 40 + "s"}),
+    ("timeout-huge-digit-string", {"destinations.chat.timeout": "0" * 6000 + "5s"}),
+    ("dedup-exact-24h", {"rules.0.dedup_window": "86400.0000000000000000s"}),
+    ("retention-exact-1d", {"retention.history": "24.0000000000000000000000000000000000000h"}),
     ("hook-bounds", {"hooks.post-fail.0.timeout": "1s"}),
     ("hook-minimal", {"hooks.post-fail": [{"cmd": "x"}]}),
     ("no-hooks", {"hooks": {}}),
@@ -1028,3 +1081,49 @@ def test_an_unquoted_clock_time_is_a_string_for_the_strict_loader(home: Path) ->
     path.chmod(0o600)
     config = load_valid_config(Gateway(passwd_home=lambda: str(home)))
     assert config is not None and config.quiet_hours["n"].start == 22 * 60
+
+
+# --- review round 1 ----------------------------------------------------------------------------
+
+
+def _utc_source() -> bytes:
+    return next(Path(d) / "UTC" for d in SYSTEM_TZ_DIRS if (Path(d) / "UTC").is_file()).read_bytes()
+
+
+@pytest.mark.parametrize(
+    "key", ["posix/Factory", "right/Factory", "posix/localtime", "right/posixrules"]
+)
+def test_a_refused_zone_name_is_refused_under_a_prefix_too(tmp_path: Path, key: str) -> None:
+    zones = tmp_path / "zones"
+    for prefix in ("posix", "right"):
+        (zones / prefix).mkdir(parents=True)
+        for name in ("Factory", "localtime", "posixrules"):
+            (zones / prefix / name).write_bytes(_utc_source())
+    cfg = build({"quiet_hours.night.timezone": key})
+    with pytest.raises(ConfigError) as info:
+        validate_config(cfg, Gateway(tz_dirs=(str(zones),)))
+    assert info.value.key == "quiet_hours.night.timezone"
+
+
+def _non_str_keys() -> list[tuple[dict[str, Any], str]]:
+    dest = {"kind": "generic", "cmd": ["/bin/x"]}
+    return [
+        ({"destinations": {1: dest}}, "destinations.?"),
+        (
+            {"quiet_hours": {1: {"timezone": "UTC", "start": "01:00", "end": "02:00"}}},
+            "quiet_hours.?",
+        ),
+        ({"links": {"hosts": {1: "github"}}}, "links.hosts.?"),
+        ({"links": {"tickets": {1: "https://t.example.com/"}}}, "links.tickets.?"),
+        ({"rules.0.match.where": {1: "x"}}, "rules.0.match.where"),
+        ({"destinations.chat": {1: 1}}, "destinations.chat.?"),
+        ({"rules.0": {1: 1}}, "rules.0.?"),
+        ({"retention": {None: 1}}, "retention.?"),
+    ]
+
+
+@pytest.mark.parametrize(("edits", "key"), _non_str_keys())
+def test_a_mapping_key_that_is_not_a_string_is_config_invalid(
+    edits: dict[str, Any], key: str
+) -> None:
+    assert rejected(build(edits)).key == key
