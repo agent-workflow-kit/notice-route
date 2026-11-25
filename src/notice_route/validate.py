@@ -86,7 +86,7 @@ _RULE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 _SITE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 _ENV_FIXED = frozenset({"PATH", "LANG", "LC_ALL", "WSL_INTEROP", "WSL_DISTRO_NAME"})
-_FORBIDDEN_ARG = re.compile(r"(?:send|--stdin-json|--json|--actor|--dedupe-key)(?:=[\s\S]*)?")
+_FORBIDDEN_ARG = re.compile(r"send|(?:--stdin-json|--json|--actor|--dedupe-key)(?:=[\s\S]*)?")
 _CLOCK = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
 _DURATION = re.compile(r"([0-9]+(?:\.[0-9]+)?)(ms|s|m|h|d)?")
 _UNITS = {
