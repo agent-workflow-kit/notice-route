@@ -433,7 +433,7 @@ def test_a_backwards_step_gives_the_same_answer_for_the_same_instant() -> None:
     assert (in_window(window, clock.wall()), window_end(window, clock.wall())) == before
 
 
-# ---- window_end -----------------------------------------------------------------------------------
+# ---- window_end ----------------------------------------------------------------------------
 
 
 def test_window_end_is_the_first_whole_minute_outside() -> None:
@@ -550,7 +550,7 @@ def test_a_malformed_window_is_refused(bad: dict[str, Any]) -> None:
         window_end(window, 0)
 
 
-# ---- the property test: every minute of a year against an independent reference -------------------
+# ---- the property test: every minute of a year against an independent reference -------------
 
 _YEAR_START = utc("2026-01-01T00:00")
 _YEAR_MINUTES = 365 * 24 * 60
