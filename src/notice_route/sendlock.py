@@ -30,7 +30,7 @@ Rules (interface: Calling the notifiers, Files):
 On ``acquired`` False the pipeline records :data:`notice_route.outcome.LOCK_BUSY` for the row
 (requeue 60 s later, no attempt, hourly count given back with ``count_hour``).
 ``send.py`` (#22) wraps its :func:`~notice_route.notify.call_notifier` call with this.
-TODO(#23): ``flush`` does the same for each row it sends (and for a digest).
+``flush`` (#23) does the same for each row it sends; :func:`flush_lock` is its own lock.
 TODO(#29): ``validate --probe`` calls a notifier under the same lock.
 """
 
@@ -44,7 +44,7 @@ from typing import Literal
 from .gateway import DirHandle, Gateway, UnsafePathError
 from .validate import _DESTINATION_NAME, KINDS  # the one grammar of destination names
 
-__all__ = ["LOCKS_DIR", "SHARED_LOCK_NAME", "Held", "lock_name", "send_lock"]
+__all__ = ["LOCKS_DIR", "SHARED_LOCK_NAME", "Held", "flush_lock", "lock_name", "send_lock"]
 
 LOCKS_DIR = "locks"
 SHARED_LOCK_NAME = "_wsl"
@@ -74,7 +74,24 @@ def send_lock(
         raise ValueError("the destination name is not a valid destination name")
     if kind not in KINDS:
         raise ValueError("the destination kind is unknown")
-    file_name = f"{lock_name(destination, kind)}.lock"
+    with _flock(gateway, state, f"{lock_name(destination, kind)}.lock", lock_wait) as held:
+        yield held
+
+
+@contextmanager
+def flush_lock(gateway: Gateway, state: DirHandle, destination: str) -> Iterator[Held]:
+    """Take the flush lock of ``destination`` (``locks/<name>.flush``) without waiting (#23): one
+    ``flush`` per destination at a time. ``acquired`` False with ``busy_reason`` ``timeout`` means
+    another flusher holds it; ``unsafe`` and ``error`` mean the lock cannot be used. The kernel
+    releases it when the holder dies."""
+    if not isinstance(destination, str) or not _DESTINATION_NAME.fullmatch(destination):
+        raise ValueError("the destination name is not a valid destination name")
+    with _flock(gateway, state, f"{destination}.flush", 0) as held:
+        yield held
+
+
+@contextmanager
+def _flock(gateway: Gateway, state: DirHandle, file_name: str, wait: float) -> Iterator[Held]:
     locks: DirHandle | None = None
     file = None
     held = False
@@ -82,7 +99,7 @@ def send_lock(
         try:
             locks = gateway.open_private_subdir(state, LOCKS_DIR)
             file = gateway.open_file(locks, file_name, mode="a", create=True)
-            held = gateway.try_lock(file, lock_wait)
+            held = gateway.try_lock(file, wait)
             result = Held(True) if held else Held(False, "timeout")
         except UnsafePathError:
             result = Held(False, "unsafe")
