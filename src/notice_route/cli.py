@@ -12,9 +12,12 @@ DESCRIPTION = "Routes notifications to channel tools by level, source, labels an
 
 
 def build_parser() -> argparse.ArgumentParser:
+    # todo(#22): argparse usage errors print plain text; under --json they must emit the
+    # {"error": {"code": "usage", ...}} envelope with exit 2 (interface.md, error envelope).
     parser = argparse.ArgumentParser(
         prog=PROG,
         description=DESCRIPTION,
+        allow_abbrev=False,
     )
     parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")
     parser.add_argument("--json", action="store_true", help="machine-readable JSON output")
