@@ -20,7 +20,7 @@ from notice_route.config import (
 )
 from notice_route.gateway import Gateway
 
-SECRET = "hunter2-secret-value"
+CANARY = "leak-canary-value"
 
 
 class Env:
@@ -807,21 +807,21 @@ def test_long_scalar_and_wide_map_within_the_limit_load(env: Env) -> None:
 
 def test_error_never_carries_file_content(env: Env) -> None:
     for text in (
-        f"a: &x {SECRET}\n",
-        f"a: {SECRET}\na: 2\n",
-        f"a: [{SECRET}\n",
-        f"{SECRET}: 1\n{SECRET}: 2\n",
-        f"- {SECRET}\n",
-        f"a: !!{SECRET} 1\n",
+        f"a: &x {CANARY}\n",
+        f"a: {CANARY}\na: 2\n",
+        f"a: [{CANARY}\n",
+        f"{CANARY}: 1\n{CANARY}: 2\n",
+        f"- {CANARY}\n",
+        f"a: !!{CANARY} 1\n",
     ):
         env.main(text)
         with pytest.raises(ConfigError) as info:
             env.load()
         err = info.value
-        assert SECRET not in str(err) and SECRET not in repr(err)
-        assert SECRET not in err.key
+        assert CANARY not in str(err) and CANARY not in repr(err)
+        assert CANARY not in err.key
         assert err.__cause__ is None and err.__context__ is None
-        assert err.args == ("invalid configuration",) or SECRET not in repr(err.args)
+        assert err.args == ("invalid configuration",) or CANARY not in repr(err.args)
 
 
 # --- merge ---------------------------------------------------------------------------------
@@ -937,10 +937,10 @@ def test_disjoint_keys_of_one_nested_map_merge(env: Env) -> None:
 
 
 def test_odd_key_names_are_never_echoed_in_the_key(env: Env) -> None:
-    env.main(f"'{SECRET} x': 1\n")
-    env.write("config.d/10-a.yaml", f"'{SECRET} x': 2\n")
+    env.main(f"'{CANARY} x': 1\n")
+    env.write("config.d/10-a.yaml", f"'{CANARY} x': 2\n")
     err = invalid(env, "?")
-    assert SECRET not in err.key
+    assert CANARY not in err.key
 
 
 @pytest.mark.parametrize(
