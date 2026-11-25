@@ -62,6 +62,8 @@ from .queue import Evicted, Lease, QueueRow, complete_row, requeue_row
 from .store import Store
 
 __all__ = [
+    "LOCK_BUSY",
+    "LOCK_BUSY_RETRY_S",
     "MESSAGE_CHARS",
     "Applied",
     "Outcome",
@@ -107,6 +109,13 @@ class Outcome:
     @property
     def internal(self) -> bool:
         return self.outcome is None
+
+
+LOCK_BUSY_RETRY_S = 60
+LOCK_BUSY = Outcome("queued_retry", None, "lock_busy", counted=False)
+"""A call never made because the send lock was not free within ``lock_wait`` (#21): the row goes
+back ``queued_retry``/``lock_busy`` with code null, no attempt counted, its hourly count given back
+(when the caller passes ``count_hour``) and ``deliver_after`` 60 seconds later."""
 
 
 def _out(
@@ -297,7 +306,11 @@ def apply_outcome(
     reason = outcome.reason
     code = outcome.code
     name: str = outcome.outcome
-    if name == "queued_retry":
+    if name == "queued_retry" and outcome.reason == "lock_busy":
+        deliver_after = lease.now + LOCK_BUSY_RETRY_S  # no attempt, so no schedule step or cap
+        if prior_reason in _REFUSED:
+            reason = None  # keep the stored refusal: a later refusal must still end failed
+    elif name == "queued_retry":
         if outcome.refusal is not None and (
             prior_reason in _REFUSED or (outcome.refusal == "link_refused" and not row.link)
         ):
@@ -315,7 +328,7 @@ def apply_outcome(
         deliver_after = lease.now
         if prior_reason in _REFUSED:
             reason = None  # keep the stored refusal: a later refusal must still end failed
-    given_back = name == "deferred" and count_hour is not None
+    given_back = (name == "deferred" or outcome.reason == "lock_busy") and count_hour is not None
 
     evicted: tuple[Evicted, ...] = ()
     if name in _TERMINAL:

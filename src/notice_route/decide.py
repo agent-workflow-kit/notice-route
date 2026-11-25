@@ -44,7 +44,8 @@ deterministic. Every value reaches SQL as a bound parameter and every statement 
 
 Seams (owned by later issues):
 The notifier call (``notify.py``) and the recording of its outcome (``outcome.py``: ``attempts``
-and ``give_back`` for a call never made) exist; TODO(#21) ``lock_busy``;
+and ``give_back`` for a call never made) exist,
+and so does ``lock_busy`` (:data:`notice_route.outcome.LOCK_BUSY`);
 TODO(#22) the pipeline that renders, calls :func:`decide_and_record`, prints and logs;
 TODO(#23) ``flush`` claims a due row with :func:`claim_call` (single rows) or :func:`count_call`
 (a digest); TODO(#26) ``prune`` deletes ``rate`` rows of past hours older than 2 days;
