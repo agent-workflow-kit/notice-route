@@ -433,11 +433,11 @@ def test_hostile_envelope_text_never_reaches_the_outcome() -> None:
 
 
 @pytest.fixture
-def real(
-    make_notifier: Callable[..., Notifier], tmp_path: Path
-) -> Callable[..., Outcome]:
+def real(make_notifier: Callable[..., Notifier], tmp_path: Path) -> Callable[..., Outcome]:
     def run(kind: str = "slack-notice", key: bool = True, **behavior: Any) -> Outcome:
-        note = make_notifier(tool="ha-notice" if kind == "ha-notice" else "slack-notice", **behavior)
+        note = make_notifier(
+            tool="ha-notice" if kind == "ha-notice" else "slack-notice", **behavior
+        )
         base = Path(note.cmd[0]).parent
         base.chmod(0o755)
         gateway = Gateway(

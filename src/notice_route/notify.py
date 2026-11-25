@@ -37,7 +37,7 @@ Choices where the interface is silent (the narrower reading):
   ``cmd[0]`` check (``exec_failed``), then the spawn.
 - A spawn failure (``spawn_failed``) is ``exec_failed``: the command cannot be started.
 
-TODO(#20): classify :class:`CallResult` into outcomes and codes (the table of Retries and outcomes).
+Classification of a :class:`CallResult` lives in :mod:`notice_route.outcome` (#20).
 TODO(#21): take the send lock before :func:`call_notifier` and release it after.
 TODO(#22): the send pipeline builds the arguments from the ``sending`` row of ``decide``.
 TODO(#22): any exception that escapes :func:`call_notifier` (it raises only for faults outside the

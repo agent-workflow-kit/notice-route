@@ -194,9 +194,7 @@ def classify(result: CallResult, *, kind: str, has_dedupe_key: bool) -> Outcome:
     return _out("failed", "deployment_fault")  # row 19
 
 
-def _classify_envelope(
-    rc: int, env: _Envelope | None, kind: str, has_dedupe_key: bool
-) -> Outcome:
+def _classify_envelope(rc: int, env: _Envelope | None, kind: str, has_dedupe_key: bool) -> Outcome:
     if env is None:  # row 9
         return _out("failed" if rc == 20 else "unknown", "envelope_invalid")
     if rc == 20:  # rows 13 to 15
@@ -273,7 +271,6 @@ def apply_outcome(
     back (a digest passes it for one of its rows only). Everything is fenced by ``token``."""
     if outcome.outcome is None:
         return Applied(False, None, None, None, None, 0, None, internal=True)
-    final = outcome
     state = conn.execute(
         "SELECT attempts, reason FROM deliveries WHERE id = ?", (row.delivery_id,)
     ).fetchone()
@@ -327,9 +324,7 @@ def apply_outcome(
     released = False
     if any(e.delivery_id == row.delivery_id for e in evicted):
         # the cap dropped the row just requeued: its delivery is already dropped/overflow
-        conn.execute(
-            "UPDATE deliveries SET attempts = ? WHERE id = ?", (attempts, row.delivery_id)
-        )
+        conn.execute("UPDATE deliveries SET attempts = ? WHERE id = ?", (attempts, row.delivery_id))
         name, code, reason, deliver_after = "dropped", "overflow", "overflow", None
         released = True
     else:
@@ -410,4 +405,3 @@ def record_escaped(store: Store, *, row: QueueRow, token: str) -> bool:
             (row.delivery_id, row.id, token),
         )
         return cur.rowcount == 1
-
