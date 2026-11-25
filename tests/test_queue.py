@@ -275,6 +275,14 @@ def test_a_lone_surrogate_is_refused_not_stored(store: Store) -> None:
     assert n_queue(store) == 0
 
 
+def test_a_lone_surrogate_claim_token_is_refused_by_the_guard_not_stored(store: Store) -> None:
+    with pytest.raises(ValueError) as exc:
+        with store.write() as conn:
+            add(conn, kind="single", token="\ud800")
+    assert type(exc.value) is ValueError  # the _token guard, not sqlite's UnicodeEncodeError
+    assert n_queue(store) == 0
+
+
 def test_an_error_after_eviction_rolls_the_eviction_back(store: Store) -> None:
     with store.write() as conn:
         for _ in range(100):
@@ -615,6 +623,12 @@ def test_release_and_requeue_evict_only_the_over_cap_destination(store: Store) -
         assert [e.queue_id for e in rel.evicted] == [low_full]
         assert all(e.destination == "full" for e in rel.evicted)
         assert q.unclaimed_count(conn, "ok", lease()) == 100  # untouched: at the cap, not over it
+        assert q.unclaimed_count(conn, "full", lease()) == 100
+        # the low-level row the cap would pick on "ok" if it were wrongly applied there survives
+        assert conn.execute(
+            "SELECT COUNT(*) FROM queue q JOIN deliveries d ON d.id = q.delivery_id"
+            " WHERE d.destination = 'ok' AND d.level = 'info'"
+        ).fetchone() == (1,)
     with store.write() as conn:
         for _ in range(100):
             add(conn, "full2", level="warn")
@@ -659,8 +673,9 @@ def test_row_and_delivery_ids_and_limit_are_validated(store: Store, bad: object)
 
 def test_an_unencodable_token_is_a_value_error(store: Store) -> None:
     with store.write() as conn:
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError) as exc:
             q.complete_row(conn, 1, "\ud800")
+    assert type(exc.value) is ValueError  # the _token guard, not a raw UnicodeEncodeError
 
 
 def test_eviction_clears_deliver_after_of_the_dropped_delivery(store: Store) -> None:
