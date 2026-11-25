@@ -856,10 +856,16 @@ class Gateway:
     @staticmethod
     def _check_side_file(handle: DirHandle, name: str) -> bool:
         """Whether the SQLite side file ``name`` exists; refuse one that is not a plain private
-        file of the user (checked with ``lstat``, never followed)."""
+        file of the user (checked with ``lstat``, never followed). A file with no links left is
+        one a sibling is deleting and counts as absent."""
         try:
             info = os.stat(name, dir_fd=handle.fd, follow_symlinks=False)
         except FileNotFoundError:
+            return False
+        if info.st_nlink == 0:
+            # A sibling is deleting it: the kernel drops the link count before it drops the name,
+            # so ``lstat`` can still find a file with no links left. It has no name once the
+            # unlink ends, so it is absent (#63); more than one link is still refused below.
             return False
         shown = handle.path.rstrip("/") + "/" + name
         if stat.S_ISLNK(info.st_mode):

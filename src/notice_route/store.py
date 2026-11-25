@@ -256,12 +256,6 @@ def _open(
         raise ValueError("busy_timeout must be in (0, 60] seconds")
     try:
         files = gateway.prepare_state_db(create=not readonly)
-    # todo(#22): tests/test_queue.py::test_concurrent_enqueuers_at_the_cap_lose_no_row_and_keep_
-    # exactly_100 saw this branch once (Python 3.13, 8 processes opening a new state directory
-    # together). It did not reproduce in 70+ later runs (40 rounds of 8 concurrent openers and 30
-    # reruns of the test). The cause is unknown; the reason is dropped here (``from None``), so the
-    # next sighting should log the UnsafePathError reason and path before it is raised. Deferred:
-    # no reproduction, no clearly correct fix, and the #22 pipeline owns the send-side retry.
     except (UnsafePathError, ValueError):
         raise StoreError("unsafe") from None
     except (PermissionError, FileNotFoundError):
