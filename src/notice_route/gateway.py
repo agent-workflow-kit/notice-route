@@ -19,6 +19,7 @@ import os
 import pwd
 import re
 import secrets
+import select
 import selectors
 import signal
 import stat
@@ -40,6 +41,8 @@ __all__ = [
     "FINAL_READ",
     "Gateway",
     "HomeError",
+    "InputFileError",
+    "InputRead",
     "POLL_INTERVAL",
     "RunResult",
     "SYSTEM_TZ_DIRS",
@@ -60,6 +63,7 @@ TERM_GRACE = 5.0
 FINAL_READ = 1.0
 POLL_INTERVAL = 0.05
 _POLL_SLICE = 0.02
+_INPUT_SLICE = 0.1
 _CHUNK = 65536
 # The system time zone database, in search order. ``PYTHONTZPATH`` and ``zoneinfo.TZPATH`` are
 # never consulted: the config selects a zone by name and must not reach other files.
@@ -217,6 +221,28 @@ class ZoneError(Exception):
     """A time zone cannot be loaded from the system database (the message never names it)."""
 
 
+class InputFileError(Exception):
+    """A ``--file`` path cannot be used: ``unreadable`` (cannot be opened or read) or
+    ``not_regular`` (a directory, FIFO, device or socket). The message never names the path."""
+
+    def __init__(self, reason: Literal["unreadable", "not_regular"]) -> None:
+        super().__init__(f"input file is {reason.replace('_', ' ')}")
+        self.reason = reason
+
+
+@dataclass(frozen=True)
+class InputRead:
+    """Bytes read from an input and how the read ended.
+
+    ``ok``: end of input. ``too_large``: more than the limit (``data`` holds the first
+    ``limit`` bytes). ``timeout``: the deadline passed first. ``unreadable``: stdin is closed or
+    cannot be read (``data`` is empty).
+    """
+
+    data: bytes
+    status: Literal["ok", "too_large", "timeout", "unreadable"]
+
+
 class LimitExceededError(Exception):
     """A file or a directory listing is larger than the caller's limit (never truncated)."""
 
@@ -265,6 +291,10 @@ def _component(name: str) -> str:
     if not isinstance(name, str) or name in ("", ".", "..") or "/" in name or "\x00" in name:
         raise ValueError("name must be one plain path component")
     return name
+
+
+def _system_environ() -> Mapping[str, str]:
+    return os.environ
 
 
 def _passwd_home() -> str:
@@ -316,6 +346,8 @@ class Gateway:
     tokens: TokenSource = field(default_factory=SystemTokens)
     passwd_home: Callable[[], str] = _passwd_home
     tz_dirs: tuple[str, ...] = SYSTEM_TZ_DIRS
+    stdin_fd: int = 0
+    environ: Callable[[], Mapping[str, str]] = _system_environ
 
     def wall(self) -> float:
         return self.clock.wall()
@@ -682,6 +714,104 @@ class Gateway:
             except Exception:  # any parse failure is one outcome; its text is not kept
                 raise ZoneError("not a time zone file") from None
         raise ZoneError("unknown time zone")
+
+    def env_present(self, name: str) -> bool:
+        """Whether ``name`` is in the environment, even with an empty value."""
+        return name in self.environ()
+
+    def stdin_is_tty(self) -> bool:
+        try:
+            return os.isatty(self.stdin_fd)
+        except (OSError, ValueError, OverflowError):
+            return False
+
+    def read_stdin(self, limit: int, deadline: float) -> InputRead:
+        """Read standard input to end of input, at most ``limit`` bytes, until ``deadline``
+        (an absolute :meth:`monotonic` value).
+
+        The deadline is checked before every read, so a stalled or slow writer cannot hold the
+        caller past it, partial data included. A closed or unreadable descriptor (a directory,
+        write-only, an I/O error) is ``unreadable``; the error text is never kept. One byte past
+        ``limit`` ends the read as ``too_large`` without waiting for the writer.
+        """
+        fd = self.stdin_fd
+        poller = select.poll()
+        registered = False
+        try:
+            poller.register(fd, select.POLLIN)
+            registered = True
+        except (OSError, ValueError, OverflowError):
+            pass
+        if not registered:
+            return InputRead(b"", "unreadable")
+        data = bytearray()
+        while True:
+            left = deadline - self.clock.monotonic()
+            if left <= 0:
+                return InputRead(bytes(data), "timeout")
+            events = poller.poll(max(1, math.ceil(min(_INPUT_SLICE, left) * 1000)))
+            if not events:
+                continue
+            if events[0][1] & select.POLLNVAL:
+                return InputRead(b"", "unreadable")
+            failed = False
+            chunk = b""
+            try:
+                chunk = os.read(fd, min(_CHUNK, limit + 1 - len(data)))
+            except BlockingIOError:
+                continue
+            except OSError:
+                failed = True
+            if failed:  # outside the handler: no context carries the OS text
+                return InputRead(b"", "unreadable")
+            if not chunk:
+                return InputRead(bytes(data), "ok")
+            data += chunk
+            if len(data) > limit:
+                return InputRead(bytes(data[:limit]), "too_large")
+
+    def read_input_file(self, path: str, limit: int) -> InputRead:
+        """Read the ``--file`` ``path``, at most ``limit`` bytes, with no deadline.
+
+        Symlinks are followed (the interface says a symlink to a regular file is fine). The file
+        is opened ``O_NONBLOCK`` (a FIFO never blocks the open) and ``O_NOCTTY`` and checked on
+        the descriptor to be a regular file before any byte is read, so a FIFO, directory,
+        device or socket is :class:`InputFileError` ``not_regular``. Any open or read failure is
+        ``unreadable``. Neither error names the path.
+        """
+        fd = -1
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOCTTY)
+        except (OSError, ValueError):
+            pass
+        if fd < 0:  # outside the handler: no context carries the path
+            raise InputFileError("unreadable")
+        try:
+            return self._read_regular(fd, limit)
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _read_regular(fd: int, limit: int) -> InputRead:
+        failed = False
+        regular = False
+        data = bytearray()
+        try:
+            regular = stat.S_ISREG(os.fstat(fd).st_mode)
+            while regular and len(data) <= limit:
+                chunk = os.read(fd, min(_CHUNK, limit + 1 - len(data)))
+                if not chunk:
+                    break
+                data += chunk
+        except OSError:
+            failed = True
+        if failed:
+            raise InputFileError("unreadable")
+        if not regular:
+            raise InputFileError("not_regular")
+        if len(data) > limit:
+            return InputRead(bytes(data[:limit]), "too_large")
+        return InputRead(bytes(data), "ok")
 
     @staticmethod
     def _live(handle: DirHandle) -> None:
