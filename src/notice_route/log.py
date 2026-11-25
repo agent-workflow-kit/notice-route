@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from . import __version__
@@ -42,6 +42,7 @@ __all__ = [
     "timestamp",
 ]
 
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 LOG_NAME = "log.jsonl"
 LOCK_NAME = "log.lock"
 MAX_BYTES = 10 * 1024 * 1024
@@ -81,7 +82,7 @@ def sha16(text: str) -> str:
 
 def timestamp(wall: float) -> str:
     """UTC with millisecond precision: ``YYYY-MM-DDTHH:MM:SS.mmmZ``."""
-    stamp = datetime.fromtimestamp(wall, UTC)
+    stamp = _EPOCH + timedelta(seconds=wall)
     return stamp.strftime("%Y-%m-%dT%H:%M:%S.") + f"{stamp.microsecond // 1000:03d}Z"
 
 
