@@ -26,7 +26,8 @@ Choices where the interface is silent (the narrower reading):
 - ``lost`` (the child ran, its fate is unknown, the group was killed) is ``unknown``, code
   ``killed``. ``not_started`` is an internal fault: nothing is recorded, the claim lapses and
   ``flush`` resends (no blind retry). ``env_missing`` found at call time requeues the row
-  ``deferred``/``env_missing`` with no attempt counted.
+  ``deferred``/``env_missing`` with no attempt counted; a stored refusal reason
+  (``link_refused``/``keyword_refused``) is kept, so a later refusal still ends ``failed``.
 - A refusal retry (rows 13 and 14) follows the retry schedule like any other retry (the interface
   names no exception to it) and is bounded by its attempt cap. A second refusal and a link refusal
   of a row that has no link (nothing can cure it) end ``failed`` with the refusal reason as code;
