@@ -377,8 +377,18 @@ def _run_send(args: argparse.Namespace, gateway: Gateway) -> int:
         finally:
             trap.armed = False
         # The trap stays installed (a signal only sets a flag) until the output is written, so a
-        # late signal never kills the process before the document is printed.
-        _send_output(args, gateway, result)
+        # late signal never kills the process before the document is printed. During the output
+        # a signal ends the process at once (128+N): the result is final and a reader that
+        # stopped reading must not hold the process until SIGKILL.
+        trap.armed = True
+        try:
+            _send_output(args, gateway, result)
+        except Interrupted as exc:
+            gateway.discard_stdout()
+            gateway.discard_stderr()
+            return 128 + exc.signum
+        finally:
+            trap.armed = False
     return result.exit_code
 
 

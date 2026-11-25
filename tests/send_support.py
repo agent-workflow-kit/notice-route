@@ -166,14 +166,18 @@ class Rig:
         return code, doc, err
 
     def spawn(
-        self, *argv: str, stdin: bytes | None = b"", env: dict[str, str] | None = None
+        self,
+        *argv: str,
+        stdin: bytes | None = b"",
+        env: dict[str, str] | None = None,
+        stdout: int = subprocess.PIPE,
     ) -> subprocess.Popen[bytes]:
         """The real ``main`` in a child process with the private home (a pipe on stdin that the
         caller closes or writes)."""
         proc = subprocess.Popen(
             [sys.executable, "-I", "-c", SCRIPT, str(self.home), str(self.tmp_path), *argv],
             stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
+            stdout=stdout,
             stderr=subprocess.PIPE,
             env=scrubbed_env(self.home, env),
             cwd="/",

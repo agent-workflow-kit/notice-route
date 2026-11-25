@@ -101,7 +101,9 @@ class SendOptions:
 @dataclass(frozen=True)
 class SurfaceEvent:
     """A ``failed`` or ``unknown`` end, given to the surfacing seam inside the recording
-    transaction (TODO(#27): it inserts the ``surfaced`` row and marks the delivery)."""
+    transaction (TODO(#27): it inserts the ``surfaced`` row and marks the delivery). It may be
+    run again after a rolled-back failure (the recording is retried once), so it writes only
+    through the given connection (a rollback undoes it) and has no external effect."""
 
     delivery_id: int
     destination: str
@@ -484,6 +486,12 @@ class _Skipped:
     """A signal came before any call started: this row's call was not made."""
 
 
+@dataclass(frozen=True)
+class _NotRun:
+    """Something failed before the call started (the send lock itself): nothing was sent, no
+    attempt counts, and the command ends 1 (internal)."""
+
+
 class _Gate:
     """Shared by the call threads: the first call to start closes the gate for signals. A thread
     that gets the lock after a signal and before any call started must not start one (the
@@ -511,13 +519,15 @@ def _call(
     dedupe: str,
     seams: Seams,
     gate: _Gate,
-) -> _Called | _Busy | _Escaped | _Skipped:
+) -> _Called | _Busy | _Escaped | _Skipped | _NotRun:
+    call_started = False
     try:
         with send_lock(gateway, state, dest.name, dest.kind, lock_wait) as held:
             if not held.acquired:
                 return _Busy()
             if not gate.begin():
                 return _Skipped()
+            call_started = True
             result = seams.call(
                 gateway,
                 dest,
@@ -529,7 +539,8 @@ def _call(
             )
         return _Called(result)
     except BaseException:  # the text of an exception is never kept; SystemExit included
-        return _Escaped()
+        # an exception from the lock before any call started is no escaped call: no attempt
+        return _Escaped() if call_started else _NotRun()
 
 
 def _call_all(
@@ -606,7 +617,7 @@ def _record(
     dest: Destination,
     row: QueueRow,
     token: str,
-    what: _Called | _Busy | _Escaped | _Skipped,
+    what: _Called | _Busy | _Escaped | _Skipped | _NotRun,
     count_hour: int | None,
     entries: dict[str, dict[str, Any]],
     result: SendResult,
@@ -626,7 +637,7 @@ def _record(
 
 
 def _fallback_entry(
-    dest: Destination, what: _Called | _Busy | _Escaped | _Skipped, gateway: Gateway
+    dest: Destination, what: _Called | _Busy | _Escaped | _Skipped | _NotRun, gateway: Gateway
 ) -> dict[str, Any]:
     if isinstance(what, (_Called, _Busy)):
         try:
@@ -655,7 +666,7 @@ def _record_one(
     dest: Destination,
     row: QueueRow,
     token: str,
-    what: _Called | _Busy | _Escaped | _Skipped,
+    what: _Called | _Busy | _Escaped | _Skipped | _NotRun,
     count_hour: int | None,
     entries: dict[str, dict[str, Any]],
     result: SendResult,
@@ -665,6 +676,14 @@ def _record_one(
             _release_row(store, gateway, worst, token)
         except StoreError:
             pass  # the claim lapses by itself
+        return
+    if isinstance(what, _NotRun):  # nothing was sent: give the row back, no attempt, exit 1
+        try:
+            _release_row(store, gateway, worst, token)
+        except StoreError:
+            pass  # the claim lapses by itself
+        result.error = ("internal", "a notifier call could not be started")
+        result.exit_code = 1
         return
     if isinstance(what, _Escaped):
         try:
@@ -686,6 +705,8 @@ def _record_one(
     )
 
     def write() -> Applied:
+        # may run twice (see _with_retry): the whole transaction rolls back on a failure, so
+        # ``seams.surface`` must write only through ``conn`` and have no external effect
         with store.write() as conn:
             lease = Lease.at(gateway.wall(), worst)
             applied = apply_outcome(

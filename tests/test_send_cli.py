@@ -374,11 +374,12 @@ LATE_SIGNAL_SCRIPT = (
     "import os, signal, sys\n"
     "from notice_route import cli\n"
     "from notice_route.gateway import Gateway\n"
-    "real = cli._json\n"
-    "def late(document):\n"
-    "    os.kill(os.getpid(), signal.SIGTERM)\n"
-    "    real(document)\n"
-    "cli._json = late\n"
+    "real = cli.run_send\n"
+    "def late(*a, **k):\n"
+    "    result = real(*a, **k)\n"
+    "    os.kill(os.getpid(), signal.SIGTERM)\n"  # after the result is known, before the output
+    "    return result\n"
+    "cli.run_send = late\n"
     "home, tmp = sys.argv[1], sys.argv[2]\n"
     "sys.exit(cli.main(sys.argv[3:], Gateway(passwd_home=lambda: home, exec_check_from=tmp)))\n"
 )

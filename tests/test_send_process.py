@@ -3,6 +3,7 @@ signals, parallel and killed senders, deadlines, and the injectable seams."""
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import signal
@@ -23,6 +24,7 @@ from notice_route.store import StoreError, open_store
 from notice_route.validate import load_valid_config
 from tests.send_support import NOW, Rig, RigClock
 
+_F_SETPIPE_SZ = 1031  # Linux: fcntl.F_SETPIPE_SZ is not in every Python
 _HAVE_ZONES = any((Path(d) / "America" / "New_York").is_file() for d in SYSTEM_TZ_DIRS)
 if not _HAVE_ZONES and os.environ.get("CI"):
     pytest.fail("CI needs a system time zone database", pytrace=False)
@@ -315,6 +317,25 @@ def test_a_call_that_was_not_started_is_an_internal_error_and_records_nothing(
     assert rig.log_lines() == []
 
 
+def test_an_error_from_the_send_lock_before_any_call_is_internal_and_counts_no_attempt(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*_a: object, **_k: object) -> None:
+        raise OSError("LOCKTEXT")
+
+    monkeypatch.setattr(send, "send_lock", broken)
+    n = rig.notifier()
+    rig.configure({"chat": {"notifier": n}})
+    code, out, err = rig.run("send", "--message", "hi", "--source", "s", "--json")
+    assert code == 1 and json.loads(out)["error"]["code"] == "internal"
+    assert "LOCKTEXT" not in out + err
+    assert n.events("invoke") == []
+    assert rig.query("SELECT outcome, attempts FROM deliveries") == [("sending", 0)]
+    ((_, expires),) = rig.query("SELECT claimed_by, claim_expires FROM queue")
+    assert expires <= NOW  # released, not left claimed
+    assert rig.log_lines() == []
+
+
 def test_the_surfacing_seam_runs_inside_the_recording_transaction(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -533,6 +554,44 @@ def test_a_signal_while_reading_input_exits_128_plus_n_and_writes_nothing(
     out, err = proc.communicate(timeout=10)
     assert (proc.returncode, out, err) == (128 + signal.SIGTERM, b"", b"")
     assert not (home / ".local").exists()
+
+
+def test_a_signal_while_the_output_is_blocked_ends_the_process(rig: Rig) -> None:
+    rig.configure({"chat": {"notifier": rig.notifier()}})
+    read_end, write_end = os.pipe()
+    try:
+        fcntl.fcntl(write_end, _F_SETPIPE_SZ, 4096)
+        os.set_blocking(write_end, False)
+        try:
+            while True:  # a reader that never reads: the pipe is full before the child starts
+                os.write(write_end, b"x" * 512)
+        except BlockingIOError:
+            pass
+        os.set_blocking(write_end, True)
+        proc = rig.spawn(
+            "send", "--stdin-json", "--json", "--source", "s",
+            stdin=b'{"message": "hi"}', stdout=write_end,
+        )  # fmt: skip
+        # the call and its recording take a moment; the document then blocks on the full pipe
+        deadline = time.monotonic() + 30
+        sent: list[tuple[Any, ...]] = []
+        while time.monotonic() < deadline and not sent:
+            try:
+                sent = rig.query("SELECT 1 FROM deliveries WHERE outcome = 'sent'")
+            except sqlite3.Error:
+                pass
+            time.sleep(0.05)
+        assert sent
+        time.sleep(0.5)
+        assert proc.poll() is None  # blocked in the write
+        started = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=10)
+        assert proc.returncode == 128 + signal.SIGTERM
+        assert time.monotonic() - started < 5
+    finally:
+        os.close(read_end)
+        os.close(write_end)
 
 
 def test_a_signal_after_the_call_started_still_reports_the_result(rig: Rig) -> None:
