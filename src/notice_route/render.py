@@ -27,8 +27,8 @@ Choices where the interface is silent (the narrower reading):
 - A message with nothing but newlines counts as empty and takes the fallback.
 - ``text_excluded`` is true exactly when ``excluded`` is not empty.
 
-TODO(#12): link building computes ``pr_url``, ``ticket_url`` and the rendered link; this module
-takes the two derived URLs as arguments and renders no link.
+Link building is ``links.py`` (#12); this module takes the two derived URLs as arguments and
+renders no link.
 TODO(#22): the send pipeline calls :func:`render` after :func:`~notice_route.match.decide`.
 """
 
@@ -254,7 +254,7 @@ def render(
 
     A rule without ``message`` is a pass-through rule: the notice's own title and message,
     sanitized and cut like a rendered template, never read as a template. ``pr_url`` and
-    ``ticket_url`` are the derived links (built by #12), empty when there is none."""
+    ``ticket_url`` are the derived links (built by ``links.py``), empty when there is none."""
     run = _Run(rule, n, level, pr_url, ticket_url)
     if rule.message is None:
         notice = n.shape == "notice"
