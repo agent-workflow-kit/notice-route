@@ -92,7 +92,6 @@ def test_pythontzpath_and_the_module_search_path_are_ignored(
         "right/Factory",
         "posix/localtime",
         "right/posixrules",
-        "a/b/FACTORY",
     ],
 )
 def test_bad_keys_are_refused_before_any_file_is_touched(zones: Path, key: str) -> None:
@@ -103,6 +102,13 @@ def test_bad_keys_are_refused_before_any_file_is_touched(zones: Path, key: str) 
             (zones / prefix / name).write_bytes(_utc_bytes())
     with pytest.raises(ZoneError):
         Gateway(tz_dirs=(str(zones),)).load_zone(key)
+
+
+def test_a_nested_factory_zone_is_refused_even_though_the_file_exists(zones: Path) -> None:
+    (zones / "a" / "b").mkdir(parents=True)
+    (zones / "a" / "b" / "FACTORY").write_bytes(_utc_bytes())
+    with pytest.raises(ZoneError):
+        Gateway(tz_dirs=(str(zones),)).load_zone("a/b/FACTORY")
 
 
 def test_unknown_zone_is_refused(zones: Path) -> None:
