@@ -43,13 +43,13 @@ from __future__ import annotations
 
 import math
 import sqlite3
-import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
 from . import log as logmod
+from .calling import Busy, Called, Escaped, Gate, NotRun, Skipped, call_row
 from .decide import (  # pyright: ignore[reportPrivateUsage]
     DestinationDecision,
     Notice,
@@ -69,18 +69,20 @@ from .payload import Notification
 from .queue import Lease, QueueRow, insert_delivery, release_claims
 from .render import render
 from .report import worst_case_s
-from .sendlock import send_lock
 from .store import SEND_BUSY_S, Store, StoreError, open_store
 from .validate import Config, Destination
 
 __all__ = [
+    "RECORD_RETRY_PAUSE_S",
     "ADVISORY_FLUSH_AGE_S",
     "Seams",
     "SendOptions",
     "SendResult",
     "SurfaceEvent",
     "interim_retry_schedule",
+    "record_result",
     "run_send",
+    "with_retry",
 ]
 
 ADVISORY_FLUSH_AGE_S = 300
@@ -405,7 +407,7 @@ def _routed(
     if any(d.decision == "defer" and d.queue_id is not None for d in decisions):
         _advisory(store, gateway, result)
     if sending:
-        gate = _Gate(trap)
+        gate = Gate(trap, strict=False)
         _call_all(
             gateway, config, store, state, ctx, notice, sending, entries, result, worst, seams, gate
         )
@@ -466,83 +468,6 @@ def _advisory(store: Store, gateway: Gateway, result: SendResult) -> None:
         result.advisories.append("the last flush skipped a destination (env_missing)")
 
 
-@dataclass(frozen=True)
-class _Called:
-    result: CallResult
-
-
-@dataclass(frozen=True)
-class _Busy:
-    pass
-
-
-@dataclass(frozen=True)
-class _Escaped:
-    pass
-
-
-@dataclass(frozen=True)
-class _Skipped:
-    """A signal came before any call started: this row's call was not made."""
-
-
-@dataclass(frozen=True)
-class _NotRun:
-    """Something failed before the call started (the send lock itself): nothing was sent, no
-    attempt counts, and the command ends 1 (internal)."""
-
-
-class _Gate:
-    """Shared by the call threads: the first call to start closes the gate for signals. A thread
-    that gets the lock after a signal and before any call started must not start one (the
-    command then ends 128+N: nothing was sent)."""
-
-    def __init__(self, trap: SignalTrap) -> None:
-        self._trap = trap
-        self._lock = threading.Lock()
-        self.started = False
-
-    def begin(self) -> bool:
-        with self._lock:
-            if not self.started and self._trap.received is not None:
-                return False
-            self.started = True
-            return True
-
-
-def _call(
-    gateway: Gateway,
-    dest: Destination,
-    row: QueueRow,
-    state: DirHandle,
-    lock_wait: float,
-    dedupe: str,
-    seams: Seams,
-    gate: _Gate,
-) -> _Called | _Busy | _Escaped | _Skipped | _NotRun:
-    call_started = False
-    try:
-        with send_lock(gateway, state, dest.name, dest.kind, lock_wait) as held:
-            if not held.acquired:
-                return _Busy()
-            if not gate.begin():
-                return _Skipped()
-            call_started = True
-            result = seams.call(
-                gateway,
-                dest,
-                title=row.title or "",
-                message=row.message,
-                level=row.level,
-                link=row.link or "",
-                dedupe_key=dedupe,
-            )
-        return _Called(result)
-    except BaseException:  # the text of an exception is never kept; SystemExit included
-        # an exception from the lock before any call started is no escaped call: no attempt
-        return _Escaped() if call_started else _NotRun()
-
-
 def _call_all(
     gateway: Gateway,
     config: Config,
@@ -555,7 +480,7 @@ def _call_all(
     result: SendResult,
     worst: float,
     seams: Seams,
-    gate: _Gate,
+    gate: Gate,
 ) -> None:
     decided_at = sending[0].decided_at
     decided_hour = None if decided_at is None else hour_start(decided_at)
@@ -584,7 +509,15 @@ def _call_all(
     with ThreadPoolExecutor(max_workers=len(queued)) as pool:
         futures = {
             pool.submit(
-                _call, gateway, dest, row, state, config.lock_wait, notice.dedupe, seams, gate
+                call_row,
+                gateway,
+                dest,
+                row,
+                state,
+                config.lock_wait,
+                notice.dedupe,
+                seams.call,
+                gate,
             ): name
             for name, (dest, row, _token) in queued.items()
         }
@@ -617,7 +550,7 @@ def _record(
     dest: Destination,
     row: QueueRow,
     token: str,
-    what: _Called | _Busy | _Escaped | _Skipped | _NotRun,
+    what: Called | Busy | Escaped | Skipped | NotRun,
     count_hour: int | None,
     entries: dict[str, dict[str, Any]],
     result: SendResult,
@@ -637,13 +570,13 @@ def _record(
 
 
 def _fallback_entry(
-    dest: Destination, what: _Called | _Busy | _Escaped | _Skipped | _NotRun, gateway: Gateway
+    dest: Destination, what: Called | Busy | Escaped | Skipped | NotRun, gateway: Gateway
 ) -> dict[str, Any]:
-    if isinstance(what, (_Called, _Busy)):
+    if isinstance(what, (Called, Busy)):
         try:
             oc = (
                 LOCK_BUSY
-                if isinstance(what, _Busy)
+                if isinstance(what, Busy)
                 else classify(what.result, kind=dest.kind, has_dedupe_key=True)
             )
             return _unapplied_entry(dest.name, oc, gateway)
@@ -666,18 +599,18 @@ def _record_one(
     dest: Destination,
     row: QueueRow,
     token: str,
-    what: _Called | _Busy | _Escaped | _Skipped | _NotRun,
+    what: Called | Busy | Escaped | Skipped | NotRun,
     count_hour: int | None,
     entries: dict[str, dict[str, Any]],
     result: SendResult,
 ) -> None:
-    if isinstance(what, _Skipped):  # no call was made: give the row back, the command is 128+N
+    if isinstance(what, Skipped):  # no call was made: give the row back, the command is 128+N
         try:
             _release_row(store, gateway, worst, token)
         except StoreError:
             pass  # the claim lapses by itself
         return
-    if isinstance(what, _NotRun):  # nothing was sent: give the row back, no attempt, exit 1
+    if isinstance(what, NotRun):  # nothing was sent: give the row back, no attempt, exit 1
         try:
             _release_row(store, gateway, worst, token)
         except StoreError:
@@ -685,9 +618,9 @@ def _record_one(
         result.error = ("internal", "a notifier call could not be started")
         result.exit_code = 1
         return
-    if isinstance(what, _Escaped):
+    if isinstance(what, Escaped):
         try:
-            held = _with_retry(gateway, row, lambda: record_escaped(store, row=row, token=token))
+            held = with_retry(gateway, row, lambda: record_escaped(store, row=row, token=token))
         except StoreError:
             held = None
         entry = _entry(dest.name, "unknown", code="killed", attempts=1)
@@ -700,9 +633,45 @@ def _record_one(
         return
     outcome: Outcome = (
         LOCK_BUSY
-        if isinstance(what, _Busy)
+        if isinstance(what, Busy)
         else classify(what.result, kind=dest.kind, has_dedupe_key=True)
     )
+
+    try:
+        applied = record_result(store, gateway, seams, worst, dest, row, token, outcome, count_hour)
+    except StoreError:
+        _unrecorded(result)
+        entry = _unapplied_entry(dest.name, outcome, gateway)
+        entries[dest.name] = entry
+        if outcome.outcome is not None:
+            ctx.log(entry)
+        return
+    if applied.internal:
+        result.error = ("internal", "a notifier call could not be started")
+        result.exit_code = 1
+        return
+    if not applied.applied:
+        result.warnings.append("a result was logged only: the claim was lost")
+        entry = _unapplied_entry(dest.name, outcome, gateway)
+    else:
+        entry = _applied_entry(dest.name, applied)
+    entries[dest.name] = entry
+    ctx.log(entry)
+
+
+def record_result(
+    store: Store,
+    gateway: Gateway,
+    seams: Seams,
+    worst: float,
+    dest: Destination,
+    row: QueueRow,
+    token: str,
+    outcome: Outcome,
+    count_hour: int | None,
+) -> Applied:
+    """Record one classified result in a transaction of its own, with the surfacing seam inside it
+    (shared with ``flush``). Retried once after a busy database (:func:`with_retry`)."""
 
     def write() -> Applied:
         # may run twice (see _with_retry): the whole transaction rolls back on a failure, so
@@ -735,29 +704,10 @@ def _record_one(
                 )
             return applied
 
-    try:
-        applied = _with_retry(gateway, row, write)
-    except StoreError:
-        _unrecorded(result)
-        entry = _unapplied_entry(dest.name, outcome, gateway)
-        entries[dest.name] = entry
-        if outcome.outcome is not None:
-            ctx.log(entry)
-        return
-    if applied.internal:
-        result.error = ("internal", "a notifier call could not be started")
-        result.exit_code = 1
-        return
-    if not applied.applied:
-        result.warnings.append("a result was logged only: the claim was lost")
-        entry = _unapplied_entry(dest.name, outcome, gateway)
-    else:
-        entry = _applied_entry(dest.name, applied)
-    entries[dest.name] = entry
-    ctx.log(entry)
+    return with_retry(gateway, row, write)
 
 
-def _with_retry[T](gateway: Gateway, row: QueueRow, write: Callable[[], T]) -> T:
+def with_retry[T](gateway: Gateway, row: QueueRow, write: Callable[[], T]) -> T:
     """Run a recording once more after a short pause when the database was unusable (busy), if
     the claim has life left for it: the pause is bounded by the claim's remaining life."""
     try:

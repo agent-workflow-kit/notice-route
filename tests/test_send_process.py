@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from notice_route import cli, send
+from notice_route import calling, cli, send
 from notice_route.gateway import SYSTEM_TZ_DIRS, Gateway
 from notice_route.notify import CallResult
 from notice_route.queue import Lease, claim_due
@@ -323,7 +323,7 @@ def test_an_error_from_the_send_lock_before_any_call_is_internal_and_counts_no_a
     def broken(*_a: object, **_k: object) -> None:
         raise OSError("LOCKTEXT")
 
-    monkeypatch.setattr(send, "send_lock", broken)
+    monkeypatch.setattr(calling, "send_lock", broken)
     n = rig.notifier()
     rig.configure({"chat": {"notifier": n}})
     code, out, err = rig.run("send", "--message", "hi", "--source", "s", "--json")

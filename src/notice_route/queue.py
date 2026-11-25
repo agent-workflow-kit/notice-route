@@ -35,7 +35,7 @@ gets the evicted rows back and inserts the ``surfaced`` row in the same transact
 Public helpers over the one lease predicate (``_UNCLAIMED``), for ``flush`` (#23) and ``prune``
 (#26): :func:`due_rows`, :func:`claim_row`, :func:`count_due`, :func:`expire_unclaimed`,
 :func:`drop_unclaimed` and :func:`postpone_unclaimed`. No caller needs its own copy of the
-predicate. ``release_claims`` takes one token (``flush`` claims one row per call, each with its own).
+predicate. ``release_claims`` takes one token (``flush`` claims one row per call).
 TODO(#26): ``prune`` expires unclaimed queue rows through :func:`expire_unclaimed`.
 The outcome of a sent, failed or retried row is written to its ``deliveries`` row in the
 transaction that calls :func:`complete_row` or :func:`requeue_row`
