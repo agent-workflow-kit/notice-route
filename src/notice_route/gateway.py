@@ -307,6 +307,7 @@ class _Supervisor:
         self.pipes: list[_Pipe] = []  # still open
         self.all_pipes: list[_Pipe] = []
         self.reaped = False
+        self.foreign_reap = False
         self.first_over: Literal["stdout", "stderr"] | None = None
 
     # The group id is this process's pid. It cannot be reused while the leader is unreaped
@@ -324,6 +325,7 @@ class _Supervisor:
             return os.waitid(os.P_PID, self.pgid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
         except ChildProcessError:
             self.reaped = True  # someone else reaped it: the group id may be reused, never signal
+            self.foreign_reap = True
             return True
 
     def _close_stdin(self) -> None:
@@ -387,6 +389,8 @@ class _Supervisor:
             finally:
                 self._release()
             raise
+        if self.foreign_reap:
+            raise RuntimeError("child was reaped by someone else; status unknown")
         if self.proc.returncode is None:
             raise RuntimeError(f"could not reap child pid {self.pgid}")
         return result
@@ -408,9 +412,9 @@ class _Supervisor:
             finally:
                 try:
                     self.proc.wait(timeout=5)
+                    self.reaped = True
                 except subprocess.TimeoutExpired:
-                    return
-                self.reaped = True
+                    pass  # no return in a finally: an in-flight exception must keep propagating
 
     def _loop(self) -> RunResult:
         proc = self.proc

@@ -19,6 +19,7 @@ import tracemalloc
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
@@ -690,9 +691,33 @@ def test_a_leader_reaped_by_someone_else_is_never_signaled(
 
     monkeypatch.setattr(gw_mod.os, "waitid", gone)
     code = "import time; time.sleep(0.2)"
-    result = Gateway().run([sys.executable, "-I", "-c", code], env=scrubbed_env(home), timeout=15)
-    assert result.status == "exited"
+    with pytest.raises(RuntimeError, match="reaped by someone else; status unknown"):
+        Gateway().run([sys.executable, "-I", "-c", code], env=scrubbed_env(home), timeout=15)
     assert sent == []
+
+
+def test_an_inflight_error_survives_a_release_whose_reap_times_out(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    made = _spy_popen(monkeypatch)
+    real_wait = subprocess.Popen.wait
+    real_selector = gw_mod.selectors.DefaultSelector
+
+    class Broken(real_selector):
+        def unregister(self, fileobj: object) -> NoReturn:
+            raise OSError("unregister boom")
+
+    def never(self: subprocess.Popen[bytes], timeout: float | None = None) -> int:
+        raise subprocess.TimeoutExpired("x", timeout or 0)
+
+    monkeypatch.setattr(gw_mod.selectors, "DefaultSelector", Broken)
+    with monkeypatch.context() as m:
+        m.setattr(subprocess.Popen, "wait", never)
+        with pytest.raises(OSError, match="unregister boom"):
+            Gateway(clock=_ExplodingClock(after=0.3)).run(
+                SLEEPER, env=scrubbed_env(home), timeout=100, stdin=b"x" * 1_000_000
+            )
+    real_wait(made[0], timeout=5)  # reap it for real
 
 
 def test_a_same_group_background_writer_is_killed_and_its_output_dropped(home: Path) -> None:
