@@ -314,12 +314,18 @@ def _refused(exc: PayloadError | UsageError, *, as_json: bool) -> int:
 def main(argv: Sequence[str] | None = None, gateway: Gateway | None = None) -> int:
     gateway = Gateway() if gateway is None else gateway
     try:
-        code = _main(argv, gateway)
+        pending: SystemExit | None = None
+        try:
+            code = _main(argv, gateway)
+        except SystemExit as exit_:  # --help / --version: argparse prints, then exits
+            pending, code = exit_, 0
         if sys.stdout is not None:
             try:
                 sys.stdout.flush()
             except OSError:
                 raise _OutputClosed from None
+        if pending is not None:
+            raise pending
         return code
     except _OutputClosed:
         gateway.discard_stdout()
@@ -334,11 +340,11 @@ def _main(argv: Sequence[str] | None, gateway: Gateway | None) -> int:
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
-        if args.command is not None and args.verbose and args.quiet:
-            parser.error("--verbose and --quiet cannot be combined")
     except _ArgvError:
         given = sys.argv[1:] if argv is None else argv
         return _refused(UsageError("argv"), as_json="--json" in given)
+    if args.command is not None and args.verbose and args.quiet:
+        return _refused(UsageError("verbose_quiet"), as_json=args.json)
     if args.command is None:
         parser.print_help(sys.stderr)
         return EXIT_USAGE

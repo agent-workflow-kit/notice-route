@@ -614,7 +614,9 @@ def test_usage_errors_under_json_print_the_envelope(
 
 def test_verbose_with_quiet_is_a_fixed_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["rules", "--verbose", "--quiet"]) == 2
-    assert capsys.readouterr().err == USAGE_LINE
+    assert (
+        capsys.readouterr().err == "notice-route: usage: --verbose and --quiet cannot be combined\n"
+    )
 
 
 def test_config_error_carries_no_config_value(inv: Invoker, home: Path, tmp_path: Path) -> None:
@@ -981,6 +983,28 @@ def test_a_full_standard_output_keeps_the_intended_exit_code(home: Path, tmp_pat
     with open("/dev/full", "wb") as full:
         result = subprocess.run(
             [sys.executable, "-c", script, str(home)],
+            stdin=subprocess.DEVNULL,
+            stdout=full,
+            stderr=subprocess.PIPE,
+            env=env,
+            cwd=tmp_path,
+            timeout=60,
+            check=False,
+        )
+    assert result.returncode == 1
+    assert result.stderr == b"notice-route: internal: cannot write to standard output\n"
+
+
+@pytest.mark.skipif(not os.path.exists("/dev/full"), reason="no /dev/full")
+@pytest.mark.parametrize("flag", ["--version", "--help"])
+def test_help_and_version_on_a_full_standard_output_exit_one(
+    flag: str, home: Path, tmp_path: Path
+) -> None:
+    script = f"import sys\nfrom notice_route.cli import main\nsys.exit(main([{flag!r}]))\n"
+    env = {"HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config"), "PATH": os.defpath}
+    with open("/dev/full", "wb") as full:
+        result = subprocess.run(
+            [sys.executable, "-c", script],
             stdin=subprocess.DEVNULL,
             stdout=full,
             stderr=subprocess.PIPE,

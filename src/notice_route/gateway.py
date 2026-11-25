@@ -902,6 +902,8 @@ class Gateway:
     def discard_stdout(self) -> None:
         """After a failed write to standard output, point the process's own descriptor 1 at the
         null device so the buffered text cannot fail again at interpreter exit (exit code 120).
+        This redirects descriptor 1 for the rest of the process, so it is only called after a
+        failed stdout write.
         Does nothing when ``sys.stdout`` is not the process's own stream (a test's capture)."""
         stream = sys.stdout
         if stream is None or stream is not sys.__stdout__:

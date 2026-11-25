@@ -183,6 +183,7 @@ USAGE_MESSAGES = {
     "input_file": "the --file path cannot be used",
     "argv": "the command line cannot be used",
     "config": "--config is not accepted by this command",
+    "verbose_quiet": "--verbose and --quiet cannot be combined",
 }
 # The pointers a refusal may carry: fixed strings, never built from the input.
 POINTERS = frozenset(
@@ -222,7 +223,9 @@ class PayloadError(Exception):
         }
 
 
-UsageReason = Literal["flags", "labels", "terminal", "input_file", "argv", "config"]
+UsageReason = Literal[
+    "flags", "labels", "terminal", "input_file", "argv", "config", "verbose_quiet"
+]
 
 
 class UsageError(Exception):
