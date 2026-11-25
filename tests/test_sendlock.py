@@ -547,7 +547,7 @@ def test_eight_processes_contending_never_overlap_and_none_waits_past_lock_wait(
 ) -> None:
     log = tmp_path / "eight.txt"
     wait = 1.0
-    procs = [spawn("d", "generic", wait, "0.3", log=log) for _ in range(8)]
+    procs = [spawn("d", "generic", wait, "0.5", log=log) for _ in range(8)]
     for proc in procs:
         assert proc.wait(timeout=30) == 0
     entries = [line.split() for line in log.read_text().splitlines()]
@@ -561,6 +561,7 @@ def test_eight_processes_contending_never_overlap_and_none_waits_past_lock_wait(
         else:
             spans.setdefault(pid, []).append(float(value))
     assert len(spans) + len(busy_waits) == 8  # every process logged its result
+    assert busy_waits, "no contention occurred"
     assert len(spans) >= 2, "too few processes got the lock"
     for waited in busy_waits:
         assert waited >= wait - 0.2  # a busy process waited about lock_wait (loose lower bound)
