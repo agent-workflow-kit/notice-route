@@ -119,7 +119,7 @@ Still to verify (live tests in the plan, with conservative defaults until then):
 | `config.py` | strict YAML load, drop-ins, ownership check |
 | `validate.py` | validation of the merged config into typed objects (C-42) |
 | `payload.py` | strict JSON reader, shape discrimination, labels |
-| `rules.py` | matching and the first-match decision |
+| `match.py` | matching and the first-match decision |
 | `render.py` | templates, derived link fields, untrusted-text handling, the one sanitizing routine |
 | `window.py` | quiet-hour membership and window ends (pure functions) |
 | `decide.py` | the per-destination decision order and the dedup and rate statements |

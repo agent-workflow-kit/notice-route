@@ -262,9 +262,10 @@ class Notification:
     ``direct``. A notice carries ``title``, ``message``, ``level`` and ``link`` (``None`` when
     absent); a hook payload carries ``hook``, ``event_id`` and ``object_id`` (an ``int``, never a
     bool, or a plain ``str``, else ``None``), ``repo`` (a string or ``None``) and its whole
-    ``payload``, which the rules and templates read (TODO(#10), TODO(#11): ``reads_third_party``
-    and ``tainted`` are read from it there). ``labels`` are the distinct ``(key, value)`` pairs in
-    first-seen order, the payload's before the flags'; ``labels_ignored`` counts what was dropped.
+    ``payload``, which the rules and templates read (``match.reads_third_party`` and
+    ``match.tainted`` derive the two provenance flags from it; TODO(#11): templates use them).
+    ``labels`` are the distinct ``(key, value)`` pairs in first-seen order, the payload's before
+    the flags'; ``labels_ignored`` counts what was dropped.
     """
 
     shape: Literal["hook", "notice"]

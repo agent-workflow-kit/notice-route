@@ -22,7 +22,7 @@ This plan implements [interface.md](interface.md) and [design.md](design.md). It
 | `config.py` | 1 | strict YAML load, drop-ins, ownership check |
 | `validate.py` | 1 | validation of the merged config into typed objects |
 | `payload.py` | 1 | strict JSON reader, shape discrimination, labels |
-| `rules.py` | 2 | matching and the first-match decision |
+| `match.py` | 2 | matching and the first-match decision |
 | `render.py` | 2 | templates, derived link fields, plain and text values, sanitizing |
 | `window.py` | 3 | quiet-hour membership and window ends (pure functions) |
 | `store.py` | 3 | SQLite access, migrations, bound parameters |
