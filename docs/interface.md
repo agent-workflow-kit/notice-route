@@ -294,7 +294,7 @@ Surfacing: the transaction that records a surfaced outcome (`failed`, `unknown`,
 
 Failure alerts: the router routes the `post-fail` payload through its rules as a hook payload of source `notice-route` and hook `post-fail`, like any notification (decisions (1) to (6) and (9) of [`send`](#send), without the redelivery check), except that a destination that would be sent now gets an unclaimed `single` row due now, which the same `flush` delivers. That delivery claims and counts like any call, so the hourly cap and an unset credential apply there: an alert over the cap waits for the next UTC hour. A surfaced row whose failing notification has source `notice-route` (an alert's failure, cap, overflow or expiry) runs the hooks but routes no further alert. An alert about the only destination its rule names cannot arrive; it is in `history` and the hook. `send` refuses an input whose source is `notice-route` (exit 20, `source_mismatch`).
 
-`send` refuses with exit 20 and reason `hook_recursion` whenever `NOTICE_ROUTE_HOOK` is present in its own environment. Any process started from a `post-fail` hook, including a producer whose own hook calls `send`, is refused with `hook_recursion`.
+`send` and `flush` refuse with exit 20 and reason `hook_recursion` whenever `NOTICE_ROUTE_HOOK` is present in their own environment (`flush` checks it before it reads the config). Any process started from a `post-fail` hook, including a producer whose own hook calls `send`, is refused with `hook_recursion`.
 
 ## Calling from automation
 

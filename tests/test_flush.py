@@ -4,12 +4,20 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from notice_route import calling, cli
 from notice_route.gateway import SYSTEM_TZ_DIRS
+from notice_route.notify import call_notifier
+from notice_route.queue import Lease, claim_row
+from notice_route.send import Seams
+from notice_route.store import open_store
 from tests.flush_support import dest, flush, seed
 from tests.send_support import MORNING, NOW, Rig, log_errors
 
@@ -334,3 +342,403 @@ def test_the_hourly_cap_leaves_a_row_with_its_attempts_intact(rig: Rig) -> None:
     assert rig.query("SELECT COUNT(*) FROM queue WHERE claimed_by IS NULL") == [(1,)]
     code, doc, _ = flush(rig)  # still capped: nothing more, no change
     assert dest(doc)["sent"] == 0 and len(n.events("invoke")) == 2
+
+
+# --- locks -------------------------------------------------------------------------------------
+
+
+def hold(rig: Rig, name: str) -> Any:
+    """Take ``locks/<name>`` as another process would; the caller closes the file."""
+    gw = rig.gateway()
+    with gw.open_state_dir() as state, gw.open_private_subdir(state, "locks") as locks:
+        file = gw.open_file(locks, name, mode="a", create=True)
+    assert gw.try_lock(file, 0)
+    return file
+
+
+def test_a_busy_send_lock_requeues_the_row_and_stops_the_destination(rig: Rig) -> None:
+    other = rig.notifier("other")
+    n = rig.notifier()
+    rig.configure({"chat": {"notifier": n}, "other": {"notifier": other}}, lock_wait="1s")
+    seed(rig, message="one")
+    seed(rig, message="two")
+    seed(rig, "other")
+    held = hold(rig, "chat.lock")
+    try:
+        code, doc, _ = flush(rig)
+    finally:
+        held.close()
+    d = dest(doc)
+    assert (code, d["queued_retry"], d["failed"]) == (0, 1, 0)
+    assert dest(doc, "other")["sent"] == 1 and n.events("invoke") == []
+    assert rig.query(
+        "SELECT outcome, reason, attempts, deliver_after FROM deliveries"
+        " WHERE destination = 'chat' ORDER BY id"
+    ) == [("queued_retry", "lock_busy", 0, NOW + 60), ("deferred", None, 0, NOW)]
+    assert rig.query("SELECT count FROM rate WHERE destination = 'chat'") == [(0,)]
+    assert rig.query("SELECT deliver_after FROM queue ORDER BY id") == [(NOW + 60,), (NOW,)]
+
+
+def test_a_second_flusher_on_a_destination_exits_already_running(rig: Rig) -> None:
+    n = one(rig)
+    seed(rig)
+    held = hold(rig, "chat.flush")
+    try:
+        code, doc, err = flush(rig)
+    finally:
+        held.close()
+    assert (code, dest(doc)["state"], dest(doc)["due_single"], err) == (0, "already_running", 0, "")
+    assert n.events("invoke") == [] and rig.query("SELECT COUNT(*) FROM queue") == [(1,)]
+    code, doc, _ = flush(rig)  # the lock is free again
+    assert dest(doc)["sent"] == 1
+
+
+def test_an_unusable_flush_lock_leaves_the_destination_untouched_with_a_warning(rig: Rig) -> None:
+    n = one(rig)
+    seed(rig)
+    locks = rig.state / "locks"
+    locks.mkdir(parents=True, exist_ok=True)
+    locks.chmod(0o755)  # not private: unusable
+    code, doc, err = flush(rig)
+    assert (code, dest(doc)["state"]) == (0, "already_running")
+    assert "flush lock of chat cannot be used" in err and n.events("invoke") == []
+
+
+def test_a_running_flush_makes_another_one_wait_for_nothing(rig: Rig) -> None:
+    n = one(rig, sleep=1.5)
+    t = real_now()
+    seed(rig, now=t, deliver_after=t)
+    proc = rig.spawn("flush", "--json")
+    n.wait_for("invoke", timeout=30)
+    code, doc, _ = flush(rig)  # the first holds the flush lock during its call
+    assert (code, dest(doc)["state"]) == (0, "already_running")
+    out, err = proc.communicate(timeout=30)
+    assert proc.returncode in (0, 22) and len(n.events("invoke")) == 1
+
+
+# --- processes ---------------------------------------------------------------------------------
+
+
+def real_now() -> int:
+    return int(time.time())
+
+
+def test_two_flushers_on_one_destination_with_40_due_rows_send_each_row_once(rig: Rig) -> None:
+    n = rig.notifier()
+    rig.configure({"chat": {"notifier": n, "max_per_hour": 0}})
+    t = real_now()
+    for i in range(40):
+        seed(rig, message=f"row{i:02}", now=t, deliver_after=t)
+    procs = [rig.spawn("flush", "--json") for _ in range(2)]
+    results = [p.communicate(timeout=120) for p in procs]
+    assert all(p.returncode == 0 for p in procs), results
+    sent = [json.loads(i)["message"] for i in invoked(n)]
+    assert sorted(sent) == [f"row{i:02}" for i in range(40)]
+    assert rig.query("SELECT COUNT(*) FROM queue") == [(0,)]
+    assert rig.query("SELECT COUNT(*) FROM deliveries WHERE outcome = 'sent'") == [(40,)]
+
+
+def test_a_flusher_killed_mid_call_leaves_a_claimed_row_that_lapses_and_is_resent_once(
+    rig: Rig,
+) -> None:
+    n = rig.notifier(hang=True, max_seconds=60)
+    rig.configure({"chat": {"notifier": n}})
+    t = real_now()
+    seed(rig, now=t, deliver_after=t)
+    proc = rig.spawn("flush", "--json")
+    n.wait_for("invoke", timeout=30)
+    proc.kill()  # the exact handle this test started
+    proc.communicate(timeout=10)
+    n.kill_tracked()
+    ((owner, expires),) = rig.query("SELECT claimed_by, claim_expires FROM queue")
+    assert owner is not None and expires > t
+    n.set()
+    later = rig.spawn("flush", "--json")  # the kernel freed the flush lock; the claim is alive
+    out, _ = later.communicate(timeout=30)
+    assert json.loads(out)["destinations"][0]["sent"] == 0
+    conn = sqlite3.connect(rig.state / "state.db")
+    conn.execute("UPDATE queue SET claim_expires = ?", (t - 1,))
+    conn.commit()
+    conn.close()
+    again = rig.spawn("flush", "--json")
+    out, _ = again.communicate(timeout=30)
+    assert json.loads(out)["destinations"][0]["sent"] == 1
+    last = rig.spawn("flush", "--json")
+    last.communicate(timeout=30)
+    assert rig.query("SELECT outcome FROM deliveries") == [("sent",)]
+    assert len(n.events("invoke")) == 2  # the killed call and the resend: at least once
+
+
+def test_a_sigterm_during_a_call_lets_it_finish_makes_no_more_calls_and_exits_with_the_result(
+    rig: Rig,
+) -> None:
+    n = one(rig, sleep=1.0)
+    t = real_now()
+    for i in range(3):
+        seed(rig, message=f"m{i}", now=t, deliver_after=t)
+    proc = rig.spawn("flush", "--json")
+    n.wait_for("invoke", timeout=30)
+    proc.send_signal(signal.SIGTERM)
+    out, err = proc.communicate(timeout=30)
+    assert proc.returncode == 0, err
+    assert json.loads(out)["destinations"][0]["sent"] == 1
+    assert len(n.events("invoke")) == 1
+    assert rig.query("SELECT COUNT(*), COUNT(claimed_by) FROM queue") == [(2, 0)]
+
+
+def test_a_sigterm_before_any_call_releases_the_claim_and_exits_128_plus_n(rig: Rig) -> None:
+    n = rig.notifier()
+    rig.configure({"chat": {"notifier": n}}, lock_wait="2s")
+    t = real_now()
+    seed(rig, now=t, deliver_after=t)
+    held = hold(rig, "chat.lock")
+    try:
+        proc = rig.spawn("flush", "--json")
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not rig.query(
+            "SELECT 1 FROM queue WHERE claimed_by IS NOT NULL"
+        ):
+            time.sleep(0.02)
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=30)
+    finally:
+        held.close()
+    assert proc.returncode == 128 + signal.SIGTERM and out == b""
+    assert n.events("invoke") == []
+    ((claimed, expires),) = rig.query("SELECT claimed_by, claim_expires FROM queue")
+    assert claimed is None or expires <= t + 5  # released or requeued: due again at once or soon
+    assert rig.query("SELECT count FROM rate") == [(0,)]
+
+
+# --- faults ------------------------------------------------------------------------------------
+
+
+def use_seams(monkeypatch: pytest.MonkeyPatch, seams: Seams) -> None:
+    real = cli.run_flush
+    monkeypatch.setattr(cli, "run_flush", lambda *a, **k: real(*a, **{**k, "seams": seams}))
+
+
+def test_a_result_after_a_takeover_is_fenced_and_goes_to_the_log_only(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    n = one(rig)
+    _, row_id = seed(rig)
+
+    def takeover(*args: Any, **kwargs: Any) -> Any:
+        with open_store(rig.gateway()) as store, store.write() as conn:
+            conn.execute("UPDATE queue SET claim_expires = ?", (NOW - 1,))
+            assert claim_row(conn, row_id, Lease(NOW, 50), "other-claimant") is not None
+        return call_notifier(*args, **kwargs)
+
+    use_seams(monkeypatch, Seams(call=takeover))
+    code, doc, err = flush(rig)
+    assert (code, dest(doc)["sent"]) == (0, 1)
+    assert "claim was lost" in err
+    assert rig.query("SELECT claimed_by FROM queue") == [("other-claimant",)]
+    assert rig.query("SELECT outcome, attempts FROM deliveries") == [("deferred", 0)]
+    assert len(n.events("invoke")) == 1 and any(x["outcome"] == "sent" for x in rig.log_lines())
+
+
+def test_an_exception_from_a_call_is_unknown_leaves_the_row_claimed_and_stops(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    one(rig)
+    seed(rig, message="one")
+    seed(rig, message="two")
+
+    def boom(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("BOOM-TEXT")
+
+    use_seams(monkeypatch, Seams(call=boom))
+    code, doc, err = flush(rig)
+    assert (code, dest(doc)["unknown"]) == (12, 1)
+    assert rig.query("SELECT outcome, code, attempts FROM deliveries ORDER BY id") == [
+        ("unknown", "killed", 1), ("deferred", None, 0),
+    ]  # fmt: skip
+    assert rig.query("SELECT COUNT(claimed_by) FROM queue") == [(1,)]
+    assert "BOOM-TEXT" not in err + json.dumps(doc) + rig.state_text()
+
+
+def test_a_row_that_keeps_escaping_ends_failed_without_another_call(rig: Rig) -> None:
+    n = one(rig)
+    seed(rig, attempts=5, outcome="unknown", token="old", claim_expires=NOW - 1)
+    code, doc, _ = flush(rig)
+    assert (code, dest(doc)["failed"]) == (12, 1) and n.events("invoke") == []
+    assert rig.query("SELECT outcome, code FROM deliveries") == [("failed", "retries_exhausted")]
+    assert rig.query("SELECT COUNT(*) FROM queue") == [(0,)]
+    assert rig.query("SELECT count FROM rate") == [(0,)]
+
+
+def test_a_lapsed_claim_with_attempts_left_is_resent(rig: Rig) -> None:
+    n = one(rig)
+    seed(rig, attempts=2, outcome="unknown", token="old", claim_expires=NOW - 1)
+    code, doc, _ = flush(rig)
+    assert (code, dest(doc)["sent"], len(n.events("invoke"))) == (0, 1, 1)
+    assert rig.query("SELECT attempts, outcome FROM deliveries") == [(3, "sent")]
+
+
+def test_a_failing_surfacing_seam_is_exit_1_and_the_claim_is_left_to_lapse(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    one(rig, error={"code": "credential_invalid"})
+    seed(rig)
+
+    def broken(*_a: Any, **_k: Any) -> None:
+        raise ValueError("SEAM-TEXT")
+
+    use_seams(monkeypatch, Seams(surface=broken))
+    code, out, err = rig.run("flush", "--json")
+    assert code == 1 and json.loads(out)["error"]["code"] == "internal"
+    assert "SEAM-TEXT" not in out + err
+    assert rig.query("SELECT outcome FROM deliveries") == [("deferred",)]
+    assert rig.query("SELECT COUNT(claimed_by) FROM queue") == [(1,)]
+
+
+def test_an_error_from_the_send_lock_before_a_call_releases_the_row_and_is_exit_1(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    one(rig)
+    seed(rig)
+
+    def broken(*_a: Any, **_k: Any) -> None:
+        raise OSError("LOCK-TEXT")
+
+    monkeypatch.setattr(calling, "send_lock", broken)
+    code, out, err = rig.run("flush", "--json")
+    assert code == 1 and "LOCK-TEXT" not in out + err
+    assert rig.query("SELECT outcome, attempts FROM deliveries") == [("deferred", 0)]
+    assert rig.query("SELECT count FROM rate") == [(0,)]
+    ((_, expires),) = rig.query("SELECT claimed_by, claim_expires FROM queue")
+    assert expires <= NOW
+
+
+# --- heartbeat, dry run, usage -----------------------------------------------------------------
+
+
+def test_the_heartbeat_age_shown_by_validate_follows_flush_last(rig: Rig) -> None:
+    one(rig)
+    flush(rig)
+    code, out, _ = rig.run("validate", "--json")
+    assert json.loads(out)["flush_age_s"] == 0
+    rig.clock.jump_wall(120)
+    flush(rig, "--destination", "chat")  # not a full run: no heartbeat
+    flush(rig, "--dry-run")
+    assert json.loads(rig.run("validate", "--json")[1])["flush_age_s"] == 120
+    flush(rig)
+    assert json.loads(rig.run("validate", "--json")[1])["flush_age_s"] == 0
+
+
+def test_dry_run_lists_what_is_due_and_changes_nothing(rig: Rig) -> None:
+    n = one(rig)
+    seed(rig)
+    seed(rig, kind="held")
+    seed(rig, created_at=NOW - 2 * DAY)
+    before = (rig.state / "state.db").read_bytes()
+    wal = (
+        (rig.state / "state.db-wal").read_bytes() if (rig.state / "state.db-wal").exists() else b""
+    )
+    code, doc, _ = flush(rig, "--dry-run")
+    d = dest(doc)
+    assert (code, doc["dry_run"], d["state"], d["due_single"], d["due_held"]) == (
+        0,
+        True,
+        "done",
+        2,
+        1,
+    )
+    assert (d["sent"], d["expired"], d["dropped"]) == (0, 0, 0)
+    assert n.events("invoke") == [] and not (rig.state / "locks").exists()
+    assert (rig.state / "state.db").read_bytes() == before
+    after = (
+        (rig.state / "state.db-wal").read_bytes() if (rig.state / "state.db-wal").exists() else b""
+    )
+    assert after == wal and rig.query("SELECT COUNT(*) FROM queue") == [(3,)]
+    assert rig.log_lines() == []
+
+
+def test_dry_run_without_a_database_creates_none(rig: Rig) -> None:
+    one(rig)
+    code, doc, _ = flush(rig, "--dry-run")
+    assert (code, dest(doc)["state"]) == (22, "nothing_due")
+    assert not rig.state.exists() or not (rig.state / "state.db").exists()
+
+
+def test_dry_run_of_a_quiet_destination_with_only_postponable_rows_is_quiet(rig: Rig) -> None:
+    quiet_config(rig)
+    seed(rig, level="warn")
+    assert dest(flush(rig, "--dry-run")[1])["state"] == "quiet"
+    seed(rig, level="info")
+    assert dest(flush(rig, "--dry-run")[1])["state"] == "done"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["flush", "--config", "x.yaml"],
+        ["flush", "--actor", "nobody"],
+        ["flush", "--decision-id", "a", "--decision-id", "b"],
+        ["flush", "--dest", "chat"],
+        ["flush", "--verbose", "--quiet"],
+        ["flush", "--bogus"],
+    ],
+)
+def test_flush_usage_errors_are_exit_2_and_touch_nothing(rig: Rig, argv: list[str]) -> None:
+    n = one(rig)
+    seed(rig)
+    code, out, err = rig.run(*argv, "--json")
+    assert code == 2 and json.loads(out)["error"]["code"] == "usage"
+    assert n.events("invoke") == [] and "bogus" not in out + err
+
+
+def test_flush_is_refused_inside_a_hook(rig: Rig) -> None:
+    n = one(rig)
+    seed(rig)
+    code, out, _ = rig.run("flush", "--json", env={"NOTICE_ROUTE_HOOK": "1"})
+    assert code == 20 and json.loads(out)["error"]["reason"] == "hook_recursion"
+    assert n.events("invoke") == [] and rig.query("SELECT COUNT(*) FROM queue") == [(1,)]
+
+
+# --- wall clock --------------------------------------------------------------------------------
+
+
+def test_a_wall_clock_that_steps_neither_loses_nor_repeats_a_row(rig: Rig) -> None:
+    n = one(rig)
+    seed(rig, deliver_after=NOW + 30)
+    assert dest(flush(rig)[1])["sent"] == 0
+    rig.clock.jump_wall(60)
+    assert dest(flush(rig)[1])["sent"] == 1
+    rig.clock.jump_wall(-3600)  # backward: the row is gone, nothing is sent again
+    assert dest(flush(rig)[1])["sent"] == 0
+    rig.clock.jump_wall(2 * 3600)
+    assert dest(flush(rig)[1])["sent"] == 0 and len(n.events("invoke")) == 1
+
+
+# --- hostile text ------------------------------------------------------------------------------
+
+
+CANARY = "HOSTILE-7f3a91"
+
+
+def test_hostile_row_text_and_notifier_output_never_reach_stdout_stderr_or_the_log(
+    rig: Rig,
+) -> None:
+    n = one(
+        rig,
+        stdout=f'{{"outcome":"sent","x":"{CANARY}\\u001b[31m"}}',
+        stderr=f"{CANARY}\x1b]0;x\x07",
+    )
+    seed(rig, message=f'{CANARY}\x1b[31m‮\n{{"a":1}}\u0000', title=f"{CANARY}\x1b[2J")
+    code, out, err = rig.run("flush", "--json")
+    doc = json.loads(out)
+    assert code == 0 and dest(doc)["sent"] == 1
+    assert CANARY not in out + err and "\x1b" not in out + err
+    assert CANARY not in json.dumps(rig.log_lines())
+    assert all(log_errors(x) == [] for x in rig.log_lines())
+    assert len(n.events("invoke")) == 1
+
+
+def test_hostile_error_output_from_a_notifier_is_not_echoed(rig: Rig) -> None:
+    one(rig, error={"code": "rate_limited", "message": CANARY, "details": {"x": CANARY}})
+    seed(rig)
+    code, out, err = rig.run("flush")
+    assert code == 0 and CANARY not in out + err + json.dumps(rig.log_lines())
