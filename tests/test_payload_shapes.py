@@ -212,7 +212,13 @@ def test_bad_level(level: object) -> None:
 
 @pytest.mark.parametrize(
     "link",
-    ["http://example.org", "https://example.org/a?b=c#d", "https://" + "x" * 1016],
+    [
+        "http://example.org",
+        "https://example.org/a?b=c#d",
+        "https://" + "x" * 1016,
+        "http://",
+        "https://",
+    ],
 )
 def test_good_links(link: str) -> None:
     assert classify({"message": "m", "link": link}, source=None, labels=()).link == link
@@ -230,8 +236,7 @@ def test_good_links(link: str) -> None:
         "https://example.org/\n",
         "https://example.org/é",
         "https://example.org/\x7f",
-        "https://",
-        "http://",
+        "https:// ",
         "https://" + "x" * 1017,
         None,
         5,

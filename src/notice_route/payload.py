@@ -251,7 +251,7 @@ _SOURCE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 _HOOK = re.compile(r"[a-z][a-z0-9_-]{0,63}")
 _LABEL = re.compile(r"([a-z0-9][a-z0-9_.-]{0,63})=([A-Za-z0-9._:/#@+=,-]{0,256})")
 _PLAIN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/#-]{0,255}")
-_LINK = re.compile(r"https?://[\x21-\x7e]+")
+_LINK = re.compile(r"https?://[\x21-\x7e]*")
 
 
 @dataclass(frozen=True)
