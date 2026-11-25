@@ -106,6 +106,13 @@ def test_lease_refuses_a_bad_worst_case(worst: object) -> None:
         Lease.at(NOW, worst)  # type: ignore[arg-type]
 
 
+def test_lease_refuses_huge_ints_as_value_errors() -> None:
+    with pytest.raises(ValueError):
+        Lease.at(10**400, 10)
+    with pytest.raises(ValueError):
+        Lease.at(NOW, 10**400)
+
+
 def test_lease_constructor_refuses_oddities() -> None:
     for now, length in ((True, 5), (2**63, 5), (NOW, 0), (NOW, 2**40), (NOW, True)):
         with pytest.raises(ValueError):
@@ -189,6 +196,11 @@ def test_enqueue_with_a_claim_token_is_born_claimed_and_not_counted(store: Store
         {"claim_token": ""},
         {"claim_token": "x" * 129},
         {"delivery_id": 10**9},
+        {"message": 5},
+        {"title": 5},
+        {"link": b"x"},
+        {"source": None},
+        {"source": 7},
     ],
 )
 def test_enqueue_refuses_bad_arguments_and_writes_nothing(
@@ -257,7 +269,7 @@ def test_an_oversized_value_fails_and_rolls_the_whole_transaction_back(store: St
 
 
 def test_a_lone_surrogate_is_refused_not_stored(store: Store) -> None:
-    with pytest.raises(UnicodeEncodeError):
+    with pytest.raises(ValueError):
         with store.write() as conn:
             add(conn, message="\ud800")
     assert n_queue(store) == 0
@@ -412,13 +424,13 @@ def test_an_evicted_rows_delivery_is_no_longer_protected_from_trimming(store: St
 # --- claims and leases -----------------------------------------------------------------------
 
 
-def test_claim_due_takes_only_due_unclaimed_rows_of_the_destination_oldest_first(
+def test_claim_due_takes_only_due_unclaimed_rows_of_the_destination_oldest_row_id_first(
     store: Store,
 ) -> None:
     with store.write() as conn:
         late = add(conn, deliver_after=NOW + 1)[1].row_id
-        b = add(conn, deliver_after=NOW - 5)[1].row_id
-        a = add(conn, deliver_after=NOW - 10)[1].row_id
+        a = add(conn, deliver_after=NOW - 5)[1].row_id
+        b = add(conn, deliver_after=NOW - 10)[1].row_id
         other = add(conn, "other")[1].row_id
         live = add(conn, deliver_after=NOW - 20, token="x")[1].row_id
     with store.write() as conn:
@@ -589,6 +601,80 @@ def test_release_applies_the_cap_to_the_rows_it_gives_back(store: Store) -> None
         rel = q.release_claims(conn, "me", lease())
     assert [e.queue_id for e in rel.evicted] == [low]
     assert n_queue(store) == 100
+
+
+def test_release_and_requeue_evict_only_the_over_cap_destination(store: Store) -> None:
+    with store.write() as conn:
+        for _ in range(100):
+            add(conn, "full", level="warn")
+        for _ in range(99):
+            add(conn, "ok", level="warn")
+        low_full = add(conn, "full", kind="single", token="me", level="info")[1].row_id
+        add(conn, "ok", kind="single", token="me", level="info")
+        rel = q.release_claims(conn, "me", lease())
+        assert [e.queue_id for e in rel.evicted] == [low_full]
+        assert all(e.destination == "full" for e in rel.evicted)
+        assert q.unclaimed_count(conn, "ok", lease()) == 100  # untouched: at the cap, not over it
+    with store.write() as conn:
+        for _ in range(100):
+            add(conn, "full2", level="warn")
+        add(conn, "ok2", level="warn")
+        a = add(conn, "full2", kind="single", token="t", level="info")[1].row_id
+        b = add(conn, "ok2", kind="single", token="u", level="info")[1].row_id
+        assert q.requeue_row(conn, a, "t", NOW, lease()).evicted[0].queue_id == a
+        res = q.requeue_row(conn, b, "u", NOW, lease())
+        assert res.applied and res.evicted == ()
+        assert q.get_row(conn, b) is not None
+
+
+def test_requeue_refuses_a_delivery_without_a_destination_and_rolls_back(store: Store) -> None:
+    with store.write() as conn:
+        row = add(conn, kind="single", token="t")[1].row_id
+    with pytest.raises(ValueError):
+        with store.write() as conn:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute("UPDATE deliveries SET destination = NULL")
+            q.requeue_row(conn, row, "t", NOW + 60, lease())
+    got = q.get_row(store.conn, row)
+    assert got is not None and got.claimed_by == "t"
+
+
+@pytest.mark.parametrize("bad", [True, 1.5, "1", 2**63, -(2**63) - 1])
+def test_row_and_delivery_ids_and_limit_are_validated(store: Store, bad: object) -> None:
+    with store.write() as conn:
+        for call in (
+            lambda: q.get_row(conn, bad),  # type: ignore[arg-type]
+            lambda: q.complete_row(conn, bad, "t"),  # type: ignore[arg-type]
+            lambda: q.requeue_row(conn, bad, "t", NOW, lease()),  # type: ignore[arg-type]
+            lambda: q.claim_due(conn, "d", lease(), "t", limit=bad),  # type: ignore[arg-type]
+        ):
+            with pytest.raises(ValueError):
+                call()
+        with pytest.raises(ValueError):
+            q.enqueue(
+                conn, delivery_id=bad, kind="held", message="m", level="info",  # type: ignore[arg-type]
+                source="s", deliver_after=NOW, created_at=NOW, lease=lease(),
+            )  # fmt: skip
+
+
+def test_an_unencodable_token_is_a_value_error(store: Store) -> None:
+    with store.write() as conn:
+        with pytest.raises(ValueError):
+            q.complete_row(conn, 1, "\ud800")
+
+
+def test_eviction_clears_deliver_after_of_the_dropped_delivery(store: Store) -> None:
+    with store.write() as conn:
+        for _ in range(100):
+            add(conn, level="warn")
+        did = delivery(conn, level="info")
+        conn.execute("UPDATE deliveries SET deliver_after = ? WHERE id = ?", (NOW + 5, did))
+        q.enqueue(
+            conn, delivery_id=did, kind="held", message="m", level="info", source="s",
+            deliver_after=NOW + 5, created_at=NOW, lease=lease(),
+        )  # fmt: skip
+    assert delivery_state(store, did) == ("dropped", "overflow", "overflow")
+    assert store.read("SELECT deliver_after FROM deliveries WHERE id = ?", (did,)) == [(None,)]
 
 
 # --- quiet windows ---------------------------------------------------------------------------

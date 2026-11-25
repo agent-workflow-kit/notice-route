@@ -32,6 +32,12 @@ TODO(#17): a dedup or event-id record of an evicted delivery is deleted with it 
 ``event_ids`` rows by ``delivery_id``); the statements do not exist yet.
 TODO(#27): an ``overflow`` eviction is surfaced once per destination per UTC hour (the caller
 gets the evicted rows back and inserts the ``surfaced`` row in the same transaction).
+TODO(#23): flush step 4 and the prune of #26 (expire unclaimed rows 24 hours old or more, never a
+row with an unexpired claim) and the digest and step-5 helpers must reuse this module's lease
+predicate (``_UNCLAIMED``) through a public helper, never a second copy of it. Also:
+release_claims takes one token, so a caller holding several needs one release per token or one
+per-process token.
+TODO(#26): ``prune`` expires unclaimed queue rows through that same public helper.
 TODO(#20): the outcome of a sent, failed or retried row is written to its ``deliveries`` row in the
 transaction that calls :func:`complete_row` or :func:`requeue_row` (only when it returns applied).
 """
@@ -87,16 +93,39 @@ def _int(value: object, what: str) -> int:
     return value
 
 
+def _id(value: object, what: str) -> int:
+    """A row or delivery id: an int (never a bool) within int64, else a ``ValueError``."""
+    if type(value) is not int or not -(1 << 63) <= value < (1 << 63):
+        raise ValueError(f"{what} must be an integer within int64")
+    return value
+
+
+def _text(value: object, what: str) -> str | None:
+    """A text column: ``str`` or ``None``; anything else is a ``ValueError``."""
+    if value is not None and not isinstance(value, str):
+        raise ValueError(f"{what} must be a string or None")
+    return value
+
+
 def _token(value: object) -> str:
     if not isinstance(value, str) or not 1 <= len(value) <= _MAX_TOKEN:
         raise ValueError("claim token must be a string of 1 to 128 characters")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError("claim token must be encodable as UTF-8") from None
     return value
 
 
 @dataclass(frozen=True)
 class Lease:
     """The clock's reading and the longest lease: ``now`` is UTC epoch seconds (floored),
-    ``length`` is :data:`LEASE_FACTOR` times ``send_worst_case_s`` rounded up."""
+    ``length`` is :data:`LEASE_FACTOR` times ``send_worst_case_s`` rounded up.
+
+    Build the lease inside the :meth:`Store.write` block, after the write lock is held: a lease
+    built before the lock can carry an earlier ``now`` than a concurrent claimant's and read its
+    live claim as lapsed (a duplicate send, never a lost row). The predicate adds no skew slack:
+    a lease is never longer than its length even if the clock moved."""
 
     now: int
     length: int
@@ -113,7 +142,11 @@ class Lease:
         for what, value in (("wall", wall), ("send_worst_case_s", send_worst_case_s)):
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 raise ValueError(f"{what} must be a number")
-            if not math.isfinite(value):
+            try:
+                finite = math.isfinite(value)
+            except OverflowError:
+                finite = False
+            if not finite:
                 raise ValueError(f"{what} must be finite")
         if not 0 < send_worst_case_s <= _MAX_WORST_CASE_S:
             raise ValueError("send_worst_case_s must be positive and at most 2**20")
@@ -205,7 +238,7 @@ _SELECT_DUE = (
     + _FROM
     + " WHERE d.destination = ? AND q.deliver_after <= ? AND "
     + _UNCLAIMED
-    + " AND (? IS NULL OR q.kind = ?) ORDER BY q.deliver_after, q.id LIMIT ?"
+    + " AND (? IS NULL OR q.kind = ?) ORDER BY q.id LIMIT ?"
 )
 _COUNT_UNCLAIMED = "SELECT COUNT(*)" + _FROM + " WHERE d.destination = ? AND " + _UNCLAIMED
 _SELECT_VICTIMS = (
@@ -224,7 +257,9 @@ def _row(values: tuple[object, ...]) -> QueueRow:
 
 
 def get_row(conn: _Conn, row_id: int) -> QueueRow | None:
-    found = conn.execute("SELECT " + _COLUMNS + _FROM + " WHERE q.id = ?", (row_id,)).fetchone()
+    found = conn.execute(
+        "SELECT " + _COLUMNS + _FROM + " WHERE q.id = ?", (_id(row_id, "row_id"),)
+    ).fetchone()
     return None if found is None else _row(found)
 
 
@@ -309,7 +344,8 @@ def enforce_cap(
 ) -> tuple[Evicted, ...]:
     """Drop the oldest rows of the lowest level among ``destination``'s unclaimed rows until at
     most ``cap`` remain; each victim's queue row is deleted (its text goes with it) and its
-    ``deliveries`` row set to ``dropped``, reason ``overflow``, code ``overflow``. Returns the
+    ``deliveries`` row set to ``dropped``, reason ``overflow``, code ``overflow`` and
+    ``deliver_after`` cleared. Returns the
     victims in the order dropped."""
     if type(cap) is not int or cap < 0:
         raise ValueError("cap must be a non-negative integer")
@@ -323,8 +359,8 @@ def enforce_cap(
     for queue_id, delivery_id, kind, level in victims:
         conn.execute("DELETE FROM queue WHERE id = ?", (queue_id,))
         conn.execute(
-            "UPDATE deliveries SET outcome = 'dropped', reason = 'overflow', code = 'overflow'"
-            " WHERE id = ?",
+            "UPDATE deliveries SET outcome = 'dropped', reason = 'overflow', code = 'overflow',"
+            " deliver_after = NULL WHERE id = ?",
             (delivery_id,),
         )
         evicted.append(Evicted(queue_id, delivery_id, destination, kind, level))
@@ -333,7 +369,7 @@ def enforce_cap(
 
 def _destination_of(conn: _Conn, delivery_id: int) -> str:
     sql = "SELECT destination FROM deliveries WHERE id = ?"
-    found = conn.execute(sql, (delivery_id,)).fetchone()
+    found = conn.execute(sql, (_id(delivery_id, "delivery_id"),)).fetchone()
     if found is None or not isinstance(found[0], str):
         raise ValueError("delivery_id must name a deliveries row with a destination")
     return found[0]
@@ -372,6 +408,12 @@ def enqueue(
         raise ValueError("level must be one of info, warn, action, error")
     _int(deliver_after, "deliver_after")
     _int(created_at, "created_at")
+    for what, value in (("title", title), ("message", message), ("link", link), ("source", source)):
+        _text(value, what)
+    if message is None or source is None:
+        raise ValueError("message and source must be strings")
+    _text(rule, "rule")
+    _text(dedupe, "dedupe")
     destination = _destination_of(conn, delivery_id)
     token = None if claim_token is None else _token(claim_token)
     cur = conn.execute(
@@ -417,8 +459,8 @@ def claim_due(
     _token(token)
     if kind is not None and kind not in _KINDS:
         raise ValueError("kind must be held or single")
-    if limit is not None and (type(limit) is not int or limit < 1):
-        raise ValueError("limit must be a positive integer")
+    if limit is not None and (type(limit) is not int or not 1 <= limit < (1 << 63)):
+        raise ValueError("limit must be a positive integer within int64")
     ids = conn.execute(
         _SELECT_DUE,
         (
@@ -449,7 +491,9 @@ def claim_due(
 def complete_row(conn: _Conn, row_id: int, token: str) -> bool:
     """Delete the row after its result was recorded; ``False`` (nothing changed) unless it is
     still claimed by ``token``: a claimant whose lease lapsed and was taken over is fenced."""
-    cur = conn.execute("DELETE FROM queue WHERE id = ? AND claimed_by = ?", (row_id, _token(token)))
+    cur = conn.execute(
+        "DELETE FROM queue WHERE id = ? AND claimed_by = ?", (_id(row_id, "row_id"), _token(token))
+    )
     return cur.rowcount == 1
 
 
@@ -466,12 +510,15 @@ def requeue_row(
     window is still quiet), then apply the cap. Only the current claimant can; else ``applied``
     is false."""
     _int(deliver_after, "deliver_after")
+    _id(row_id, "row_id")
     destination = conn.execute(
         "SELECT d.destination" + _FROM + " WHERE q.id = ? AND q.claimed_by = ?",
         (row_id, _token(token)),
     ).fetchone()
     if destination is None:
         return Change(False)
+    if not isinstance(destination[0], str):
+        raise ValueError("delivery_id must name a deliveries row with a destination")
     conn.execute(
         "UPDATE queue SET claimed_by = NULL, claim_expires = NULL, deliver_after = ?"
         " WHERE id = ? AND claimed_by = ?",
@@ -482,8 +529,10 @@ def requeue_row(
 
 def release_claims(conn: _Conn, token: str, lease: Lease, *, cap: int = QUEUE_CAP) -> Released:
     """A signal ended the claimant before its calls: set ``claim_expires`` of every row claimed by
-    ``token`` to now (never later than it was), then apply the cap to each destination that got
-    unclaimed rows back."""
+    ``token`` to now (never later than it was), keeping ``claimed_by`` so the claimant can still
+    record a result, then apply the cap to each destination that got unclaimed rows back.
+    ``count`` is the rows still carrying ``token`` after the call (including rows whose claim had
+    already lapsed), not only those whose expiry changed."""
     _token(token)
     destinations = [
         r[0]
