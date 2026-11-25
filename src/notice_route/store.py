@@ -170,6 +170,15 @@ class Store:
             except sqlite3.Error:
                 pass
 
+    def read(self, sql: str, params: tuple[object, ...] = ()) -> list[tuple[object, ...]]:
+        """Run a read-only statement with bound ``params`` and return all rows. A failure that
+        means the database cannot be used (corrupt page, busy, ...) is a :class:`StoreError`,
+        as for :meth:`write`; a bad statement is ``internal``."""
+        try:
+            return self.conn.execute(sql, params).fetchall()
+        except sqlite3.Error as exc:
+            raise _fail(exc) from None
+
     def check_integrity(self) -> None:
         """Run SQLite's ``quick_check``; raise ``StoreError("corrupt")`` unless it says ``ok``."""
         try:
@@ -221,7 +230,11 @@ def _open(
     readonly: bool,
     migrations: tuple[Migration, ...],
 ) -> Store | None:
-    if not (isinstance(busy_timeout, (int, float)) and 0 < busy_timeout <= 60):
+    if not (
+        isinstance(busy_timeout, (int, float))
+        and not isinstance(busy_timeout, bool)
+        and 0 < busy_timeout <= 60
+    ):
         raise ValueError("busy_timeout must be in (0, 60] seconds")
     try:
         files = gateway.prepare_state_db(create=not readonly)
@@ -235,12 +248,17 @@ def _open(
         if readonly:
             return None
         raise StoreError("internal")
+    deadline = gateway.monotonic() + busy_timeout
     conn = _connect(files, busy_timeout, readonly)
     try:
         _harden(conn)
-        _identify_and_migrate(gateway, conn, migrations, busy_timeout, readonly)
+        absent = _identify_and_migrate(gateway, conn, migrations, deadline, readonly)
+        if absent:
+            conn.close()
+            return None
         _check_tables(conn)
         conn.execute("PRAGMA query_only=ON")
+        conn.execute(f"PRAGMA busy_timeout={round(busy_timeout * 1000)}")
     except sqlite3.Error as exc:
         conn.close()
         raise _fail(exc) from None
@@ -327,26 +345,40 @@ def _identify_and_migrate(
     gateway: Gateway,
     conn: sqlite3.Connection,
     migrations: tuple[Migration, ...],
-    busy_timeout: float,
+    deadline: float,
     readonly: bool,
-) -> None:
+) -> bool:
+    """Returns ``True`` only for a read-only open of a file that is not yet a database (empty:
+    ``prepare_state_db`` creates the file before the first migration, and a crash can leave it)."""
     target = len(migrations)
+    _set_busy(gateway, conn, deadline)
     state = _validate_identity(*_identity(conn), target)
     if readonly:
-        if state != "current":
-            raise StoreError("older" if state == "older" else "foreign")
-        return
-    _ensure_wal(gateway, conn, busy_timeout)
+        if state == "fresh":
+            return True
+        if state == "older":
+            raise StoreError("older")
+        return False
+    _ensure_wal(gateway, conn, deadline)
     if state == "current":
-        return
+        return False
+    _set_busy(gateway, conn, deadline)
     _migrate(conn, migrations)
+    return False
 
 
-def _ensure_wal(gateway: Gateway, conn: sqlite3.Connection, busy_timeout: float) -> None:
+def _set_busy(gateway: Gateway, conn: sqlite3.Connection, deadline: float) -> None:
+    """Let the next stage wait only for what is left of the open's one deadline."""
+    left = deadline - gateway.monotonic()
+    if left <= 0:
+        raise StoreError("busy")
+    conn.execute(f"PRAGMA busy_timeout={max(1, int(left * 1000))}")
+
+
+def _ensure_wal(gateway: Gateway, conn: sqlite3.Connection, deadline: float) -> None:
     """Switch to WAL. The switch needs the file to itself for an instant and SQLite may report
-    ``busy`` without waiting, so retry until the busy timeout has passed (two processes creating
+    ``busy`` without waiting, so retry until the open's deadline has passed (two processes creating
     the database at once)."""
-    deadline = gateway.monotonic() + busy_timeout
     while True:
         try:
             if str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
@@ -359,6 +391,7 @@ def _ensure_wal(gateway: Gateway, conn: sqlite3.Connection, busy_timeout: float)
             if _classify(exc) != "busy" or gateway.monotonic() >= deadline:
                 raise
             gateway.clock.sleep(0.01)
+            _set_busy(gateway, conn, deadline)
 
 
 def _migrate(conn: sqlite3.Connection, migrations: tuple[Migration, ...]) -> None:
@@ -422,12 +455,12 @@ _ELIGIBLE = (
     " AND NOT EXISTS (SELECT 1 FROM surfaced s WHERE s.delivery_id = d.id AND s.processed = 0)"
 )
 _OLDEST_DROPPED = (
-    "SELECT d.id FROM deliveries d WHERE d.outcome = 'dropped' AND "
+    "SELECT d.id FROM deliveries d WHERE d.id IS NOT ? AND d.outcome = 'dropped' AND "
     + _ELIGIBLE
     + " ORDER BY d.id LIMIT ?"
 )
 _OLDEST_OTHER = (
-    "SELECT d.id FROM deliveries d WHERE d.outcome <> 'dropped' AND "
+    "SELECT d.id FROM deliveries d WHERE d.id IS NOT ? AND d.outcome <> 'dropped' AND "
     + _ELIGIBLE
     + " ORDER BY d.id LIMIT ?"
 )
@@ -444,32 +477,43 @@ def _excess(conn: sqlite3.Connection, table: str, cap: int, batch: int) -> int:
 
 
 def trim_deliveries(
-    conn: sqlite3.Connection, *, cap: int = DELIVERIES_CAP, batch: int = EVICT_BATCH
+    conn: sqlite3.Connection,
+    *,
+    cap: int = DELIVERIES_CAP,
+    batch: int = EVICT_BATCH,
+    keep_id: int | None = None,
 ) -> int:
     """Call inside the write transaction that inserted a ``deliveries`` row: delete the oldest
     rows beyond ``cap``, at most ``batch``, ``dropped`` rows first, never a row that has a queue
     row or an unprocessed ``surfaced`` row (the table may then stay above the cap). Returns the
-    number of rows deleted. TODO(#16): call it from the decision transaction."""
+    number of rows deleted. ``keep_id`` (the row the caller just inserted) is never deleted.
+    TODO(#16): call it from the decision transaction."""
     want = _excess(conn, "deliveries", cap, batch)
     if want == 0:
         return 0
-    ids = [r[0] for r in conn.execute(_OLDEST_DROPPED, (want,))]
+    ids = [r[0] for r in conn.execute(_OLDEST_DROPPED, (keep_id, want))]
     if len(ids) < want:
-        ids += [r[0] for r in conn.execute(_OLDEST_OTHER, (want - len(ids),))]
+        ids += [r[0] for r in conn.execute(_OLDEST_OTHER, (keep_id, want - len(ids)))]
     conn.executemany("DELETE FROM deliveries WHERE id = ?", [(i,) for i in ids])
     return len(ids)
 
 
 def trim_event_ids(
-    conn: sqlite3.Connection, *, cap: int = EVENT_IDS_CAP, batch: int = EVICT_BATCH
+    conn: sqlite3.Connection,
+    *,
+    cap: int = EVENT_IDS_CAP,
+    batch: int = EVICT_BATCH,
+    keep_id: int | None = None,
 ) -> int:
-    """As :func:`trim_deliveries` for ``event_ids`` (nothing protects an event id row).
+    """As :func:`trim_deliveries` for ``event_ids`` (nothing protects an event id row
+    but ``keep_id``, the row the caller just inserted).
     TODO(#17): call it where an event id is recorded."""
     want = _excess(conn, "event_ids", cap, batch)
     if want == 0:
         return 0
     cur = conn.execute(
-        "DELETE FROM event_ids WHERE id IN (SELECT id FROM event_ids ORDER BY id LIMIT ?)",
-        (want,),
+        "DELETE FROM event_ids WHERE id IN"
+        " (SELECT id FROM event_ids WHERE id IS NOT ? ORDER BY id LIMIT ?)",
+        (keep_id, want),
     )
     return cur.rowcount

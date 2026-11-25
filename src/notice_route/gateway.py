@@ -901,9 +901,15 @@ class Gateway:
             options = "?mode=ro&immutable=1" if immutable else "?mode=ro"
             conn = sqlite3.connect(uri + options, uri=True, timeout=5.0)
             try:
-                if conn.execute("PRAGMA application_id").fetchone()[0] != APPLICATION_ID:
+                app = conn.execute("PRAGMA application_id").fetchone()[0]
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+                if version == 0 and app in (0, APPLICATION_ID):
+                    objects = conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0]
+                    if objects == 0:  # created, never migrated: no database yet
+                        return StateView()
+                if app != APPLICATION_ID:
                     raise StateError("state.db is not ours")
-                if conn.execute("PRAGMA user_version").fetchone()[0] > SCHEMA_VERSION:
+                if version > SCHEMA_VERSION:
                     raise StateError("state.db is newer")
                 meta = {
                     str(k): v

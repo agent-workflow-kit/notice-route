@@ -783,3 +783,185 @@ def test_a_crash_in_the_middle_of_a_migration_leaves_a_usable_database(
     with open_store(gw, migrations=V2) as store:  # and a later run migrates it
         assert store is not None
         assert store.conn.execute("SELECT extra FROM deliveries").fetchone()[0] == 7
+
+
+# --- review round 1 (R1, R2, R4, R5, R6, R7) -----------------------------------------------
+
+
+def _queue_row(conn: sqlite3.Connection, delivery_id: int) -> None:
+    conn.execute(
+        "INSERT INTO queue (delivery_id, kind, message, level, source, deliver_after,"
+        " created_at) VALUES (?, 'held', 'm', 'info', 's', 1, 1)",
+        (delivery_id,),
+    )
+
+
+def test_trim_keeps_the_row_the_caller_just_inserted_when_it_is_the_only_dropped_one(
+    gw: Gateway,
+) -> None:
+    with open_store(gw) as store:
+        assert store is not None
+        old = add_delivery(store, "sent")
+        with store.write() as conn:
+            _queue_row(conn, old)
+        new = add_delivery(store, "dropped")
+        with store.write() as conn:
+            assert trim_deliveries(conn, cap=0, keep_id=new) == 0
+        assert {r[0] for r in store.conn.execute("SELECT id FROM deliveries")} == {old, new}
+
+
+def test_trim_keeps_the_new_sent_row_when_every_older_row_is_protected(gw: Gateway) -> None:
+    with open_store(gw) as store:
+        assert store is not None
+        olds = _fill(store, 3)
+        with store.write() as conn:
+            for i in olds:
+                _queue_row(conn, i)
+        new = add_delivery(store, "sent")
+        with store.write() as conn:
+            assert trim_deliveries(conn, cap=0, keep_id=new) == 0
+        assert store.conn.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0] == 4
+
+
+def test_trim_event_ids_keeps_the_given_row(gw: Gateway) -> None:
+    with open_store(gw) as store:
+        assert store is not None
+        with store.write() as conn:
+            for i in range(3):
+                conn.execute(
+                    "INSERT INTO event_ids (destination, source, event_id, repeat_digest, seen_at)"
+                    " VALUES ('d', 's', ?, 'x', 1)",
+                    (str(i),),
+                )
+            newest = conn.execute("SELECT MAX(id) FROM event_ids").fetchone()[0]
+            assert trim_event_ids(conn, cap=0, keep_id=newest) == 2
+        assert [r[0] for r in store.conn.execute("SELECT id FROM event_ids")] == [newest]
+
+
+def test_protected_non_dropped_rows_survive_a_cap_of_zero(gw: Gateway) -> None:
+    with open_store(gw) as store:
+        assert store is not None
+        queued = add_delivery(store, "sent")
+        pending = add_delivery(store, "sent")
+        free = add_delivery(store, "sent")
+        with store.write() as conn:
+            _queue_row(conn, queued)
+            conn.execute(
+                "INSERT INTO surfaced (destination, code, period, delivery_id, processed)"
+                " VALUES ('d', 'failed', '2023-11-14', ?, 0)",
+                (pending,),
+            )
+            assert trim_deliveries(conn, cap=0) == 1
+        left = {r[0] for r in store.conn.execute("SELECT id FROM deliveries")}
+        assert left == {queued, pending} and free not in left
+
+
+def _zero_byte_db(state: Path, db: Path) -> None:
+    state.mkdir(parents=True, mode=0o700)
+    db.touch(mode=0o600)
+    assert db.stat().st_size == 0
+
+
+def test_a_zero_byte_database_is_absent_for_open_readonly(
+    gw: Gateway, state: Path, db: Path
+) -> None:
+    _zero_byte_db(state, db)
+    assert open_readonly(gw) is None
+    assert db.stat().st_size == 0
+
+
+def test_a_zero_byte_database_is_an_empty_view_for_read_state(
+    gw: Gateway, state: Path, db: Path
+) -> None:
+    _zero_byte_db(state, db)
+    view = gw.read_state()
+    assert view.exists is False and view.queue_by_destination == {}
+
+
+def test_a_database_with_our_application_id_and_nothing_else_is_absent(
+    gw: Gateway, state: Path, db: Path
+) -> None:
+    _zero_byte_db(state, db)
+    c = raw(db)
+    c.execute(f"PRAGMA application_id={APPLICATION_ID}")
+    c.close()
+    assert open_readonly(gw) is None
+    assert gw.read_state().exists is False
+
+
+def test_read_state_reads_an_older_database(gw: Gateway, monkeypatch: pytest.MonkeyPatch) -> None:
+    from notice_route import gateway as gateway_module
+
+    with open_store(gw) as store:
+        assert store is not None
+        d = add_delivery(store, "sent", "dest")
+        with store.write() as conn:
+            _queue_row(conn, d)
+            conn.execute(
+                "INSERT INTO surfaced (destination, code, period, delivery_id, processed)"
+                " VALUES ('dest', 'failed', ?, ?, 0)",
+                (time.strftime("%Y-%m-%d", time.gmtime(gw.wall())), d),
+            )
+    monkeypatch.setattr(gateway_module, "SCHEMA_VERSION", 2)
+    view = gw.read_state()
+    assert view.exists is True
+    assert view.surfaced_today == {"dest": ("failed",)}
+    assert view.queue_by_destination == {"dest": 1}
+
+
+def test_read_returns_rows_and_takes_bound_parameters(gw: Gateway) -> None:
+    with open_store(gw) as store:
+        assert store is not None
+        i = add_delivery(store)
+        assert store.read("SELECT id FROM deliveries WHERE id = ?", (i,)) == [(i,)]
+
+
+def test_a_read_of_a_trashed_page_is_a_store_error(gw: Gateway, db: Path) -> None:
+    with open_store(gw) as store:
+        assert store is not None
+        for _ in range(300):
+            add_delivery(store)
+    c = raw(db)
+    c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    c.close()
+    data = bytearray(db.read_bytes())
+    for i in range(4096 * 2, len(data), 97):
+        data[i] ^= 0xFF
+    db.write_bytes(bytes(data))
+    with open_store(gw) as store:
+        assert store is not None
+        with pytest.raises(StoreError) as err:
+            store.read("SELECT * FROM deliveries")
+    assert err.value.reason == "corrupt"
+    _assert_fixed(err.value)
+
+
+def test_busy_timeout_rejects_a_bool(gw: Gateway) -> None:
+    with pytest.raises(ValueError):
+        open_store(gw, busy_timeout=True)  # type: ignore[arg-type]
+
+
+class _SlowClock(FakeClock):
+    """Every look at the monotonic clock costs ``step`` seconds, like slow stages would."""
+
+    def __init__(self, step: float) -> None:
+        super().__init__()
+        self.step = step
+
+    def monotonic(self) -> float:
+        self.advance_monotonic(self.step)
+        return super().monotonic()
+
+
+def test_the_open_path_shares_one_deadline(home: Path) -> None:
+    gw = Gateway(passwd_home=lambda: str(home), clock=_SlowClock(0.3))
+    with pytest.raises(StoreError) as err:
+        open_store(gw, busy_timeout=0.5)
+    assert err.value.reason == "busy"
+
+
+def test_a_normal_open_leaves_the_full_busy_timeout_set(home: Path) -> None:
+    gw = Gateway(passwd_home=lambda: str(home), clock=_SlowClock(0.001))
+    with open_store(gw, busy_timeout=0.5) as store:
+        assert store is not None
+        assert pragma(store.conn, "busy_timeout") == 500
