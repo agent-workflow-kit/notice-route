@@ -183,6 +183,7 @@ class Rig:
             assert proc.stdin is not None
             proc.stdin.write(stdin)
             proc.stdin.close()
+            proc.stdin = None  # communicate() would flush a closed file
         return proc
 
     def finish(self) -> None:
