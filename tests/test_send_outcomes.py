@@ -5,40 +5,21 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from notice_route.gateway import SYSTEM_TZ_DIRS
-from tests.fakes import Notifier
 from tests.send_support import MORNING, NOW, Rig
 
 _HAVE_ZONES = any((Path(d) / "America" / "New_York").is_file() for d in SYSTEM_TZ_DIRS)
 if not _HAVE_ZONES and os.environ.get("CI"):
     pytest.fail("CI needs a system time zone database", pytrace=False)
-pytestmark = pytest.mark.skipif(not _HAVE_ZONES, reason="no system time zone database")
-
-
-@pytest.fixture(autouse=True)
-def private_environment(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
-    monkeypatch.setenv("XDG_STATE_HOME", str(home / ".local" / "state"))
-    monkeypatch.delenv("NOTICE_ROUTE_HOOK", raising=False)
-
-
-@pytest.fixture
-def rig(
-    home: Path,
-    tmp_path: Path,
-    make_notifier: Callable[..., Notifier],
-    capsys: pytest.CaptureFixture[str],
-) -> Iterator[Rig]:
-    r = Rig(home, tmp_path, make_notifier, capsys)
-    yield r
-    r.finish()
+pytestmark = [
+    pytest.mark.skipif(not _HAVE_ZONES, reason="no system time zone database"),
+    pytest.mark.usefixtures("send_environment"),
+]
 
 
 def only(doc: dict[str, Any]) -> dict[str, Any]:

@@ -5,26 +5,12 @@ from __future__ import annotations
 import json
 import threading
 from pathlib import Path
-from typing import Any
-
-from jsonschema import Draft202012Validator
-from referencing import Registry, Resource
 
 from notice_route import log
 from notice_route.gateway import FakeClock, Gateway
+from tests.send_support import log_errors
 
 ROOT = Path(__file__).resolve().parent.parent
-
-
-def log_errors(instance: Any) -> list[str]:
-    registry: Registry[Any] = Registry()
-    for path in (ROOT / "schemas").rglob("*.json"):
-        doc = json.loads(path.read_text())
-        registry = registry.with_resource(doc["$id"], Resource.from_contents(doc))
-    schema = json.loads((ROOT / "schemas" / "log.json").read_text())
-    return [
-        e.message for e in Draft202012Validator(schema, registry=registry).iter_errors(instance)
-    ]
 
 
 def gw(home: Path) -> Gateway:

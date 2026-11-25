@@ -212,3 +212,21 @@ class Rig:
         for p in sorted(self.state.glob("log*")) + sorted(self.state.glob("state.db*")):
             out += p.read_bytes().decode("latin-1")
         return out
+
+
+_ROOT = Path(__file__).resolve().parent.parent
+
+
+def log_errors(instance: Any) -> list[str]:
+    """Validate a log record against schemas/log.json."""
+    from jsonschema import Draft202012Validator
+    from referencing import Registry, Resource
+
+    registry: Registry[Any] = Registry()
+    for path in (_ROOT / "schemas").rglob("*.json"):
+        doc = json.loads(path.read_text())
+        registry = registry.with_resource(doc["$id"], Resource.from_contents(doc))
+    schema = json.loads((_ROOT / "schemas" / "log.json").read_text())
+    return [
+        e.message for e in Draft202012Validator(schema, registry=registry).iter_errors(instance)
+    ]
