@@ -131,7 +131,7 @@
             ],
             "pattern": "^[a-z_]{1,32}(?![\\s\\S])",
             "x-untrusted": true,
-            "description": "Untrusted. The notifier's own outcome for exit 0 or 22, or null. A notifier's own exit 22 is outcome disabled with a non-null notifier_outcome (exit 0 of send)."
+            "description": "Untrusted. The notifier's own outcome for exit 0 or 22, or null. A notifier's own exit 22 is outcome disabled, with notifier_outcome non-null when the notifier's stdout is a valid {outcome} and null otherwise (exit 0 of send)."
           }
         },
         "additionalProperties": false,

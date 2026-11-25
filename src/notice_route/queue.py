@@ -38,8 +38,9 @@ predicate (``_UNCLAIMED``) through a public helper, never a second copy of it. A
 release_claims takes one token, so a caller holding several needs one release per token or one
 per-process token.
 TODO(#26): ``prune`` expires unclaimed queue rows through that same public helper.
-TODO(#20): the outcome of a sent, failed or retried row is written to its ``deliveries`` row in the
-transaction that calls :func:`complete_row` or :func:`requeue_row` (only when it returns applied).
+The outcome of a sent, failed or retried row is written to its ``deliveries`` row in the
+transaction that calls :func:`complete_row` or :func:`requeue_row`
+(:mod:`notice_route.outcome`, #20).
 """
 
 from __future__ import annotations
