@@ -94,7 +94,8 @@
             "oneOf": [
               {
                 "type": "string",
-                "maxLength": 1024
+                "maxLength": 1024,
+                "pattern": "^[^\\x00]*(?![\\s\\S])"
               },
               {
                 "type": "integer"
@@ -154,7 +155,7 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 256,
-      "pattern": "^[^*]*\\*?(?![\\s\\S])",
+      "pattern": "^[^*\\x00]*\\*?(?![\\s\\S])",
       "description": "An exact value of 1 to 256 characters, or a value ending in one * (prefix match; a lone * matches any present value). A * is allowed only as the last character (** or an inner * is config_invalid); matching is case-sensitive."
     }
   },
@@ -183,12 +184,14 @@
               {
                 "type": "string",
                 "pattern": "^/[^\\x00]+(?![\\s\\S])",
-                "description": "An absolute path (load error otherwise). At each call the router resolves it with realpath (following symlinks); the resolved file and every directory of the resolved path must be owned by the user or root and not group- or world-writable, and the file must have no setuid or setgid bit (else exec_failed). The resolved path is executed."
+                "description": "An absolute path (load error otherwise). At each call the router resolves it with realpath (following symlinks); the resolved file and every directory of the resolved path must be owned by the user or root and not group- or world-writable, and the file must have no setuid or setgid bit (else exec_failed). The resolved path is executed.",
+                "maxLength": 4096
               }
             ],
             "items": {
               "type": "string",
-              "maxLength": 4096
+              "maxLength": 4096,
+              "pattern": "^[^\\x00]*(?![\\s\\S])"
             },
             "not": {
               "contains": {
@@ -237,7 +240,8 @@
             },
             "uniqueItems": true,
             "default": [],
-            "description": "The only variables passed to the notifier besides the fixed set (PATH, LANG, LC_ALL, WSL_INTEROP, WSL_DISTRO_NAME), which may not be named. The names are trusted configuration. An unset or empty variable counts as unset: send queues the notification for flush, and flush does not call the destination."
+            "description": "The only variables passed to the notifier besides the fixed set (PATH, LANG, LC_ALL, WSL_INTEROP, WSL_DISTRO_NAME), which may not be named. The names are trusted configuration. An unset or empty variable counts as unset: send queues the notification for flush, and flush does not call the destination.",
+            "maxItems": 4096
           },
           "enabled": {
             "type": "boolean",
@@ -497,6 +501,27 @@
                       }
                     }
                   ]
+                },
+                {
+                  "if": {
+                    "not": {
+                      "required": [
+                        "message"
+                      ]
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "link": {
+                        "not": {
+                          "enum": [
+                            "{{pr_url}}",
+                            "{{ticket_url}}"
+                          ]
+                        }
+                      }
+                    }
+                  }
                 }
               ]
             }
@@ -551,7 +576,9 @@
               "cmd": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Run via sh -c in its own process group; JSON payload on stdin."
+                "description": "Run via sh -c in its own process group; JSON payload on stdin.",
+                "maxLength": 4096,
+                "pattern": "^[^\\x00]+(?![\\s\\S])"
               },
               "timeout": {
                 "$ref": "#/$defs/duration",

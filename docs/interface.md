@@ -75,7 +75,7 @@ A destination is a named channel and the command that reaches it:
 | `floor` | level | `info` | The lowest level delivered here. |
 | `quiet` | name of a `quiet_hours` window | none | The window in which this destination is quiet. |
 | `max_per_hour` | integer 0 to 3600 | 30 | The hourly cap (see [Rate limit](#rate-limit)); 0 means no cap. |
-| `env` | list of variable names | `[]` | The only variables passed to the notifier besides the fixed set (see [Calling the notifiers](#calling-the-notifiers)). |
+| `env` | list of variable names | `[]` | The only variables passed to the notifier besides the fixed set (see [Calling the notifiers](#calling-the-notifiers)); at most 4096 entries. |
 | `enabled` | boolean | true | When false, the destination is skipped with outcome `disabled`. |
 
 A destination name is `[a-z0-9][a-z0-9_-]{0,31}`. At most 32 destinations. `generic` assumes only the call shape: the command accepts `send --stdin-json --json --actor <actor> [--dedupe-key=<hex>]` and reads the notification JSON on stdin; it treats exit 0 as sent and every other exit, 22 included, as `failed` (code `generic_failed`), surfaced and never retried. A third-party notifier works as `generic` if it accepts those words and reads the notification JSON from stdin; otherwise a small wrapper script accepts those words, ignores what it does not need and does the adaptation. The router ships no adapter code.
@@ -282,7 +282,7 @@ Never used: 10, 11, 13, 21. A signal after the first notifier call started is ha
 
 ## Hooks
 
-One hook, `post-fail`, configured under `hooks` in the router's config as in design guide section 8. An entry has exactly `cmd`, `timeout` and `async`.
+One hook, `post-fail`, configured under `hooks` in the router's config as in design guide section 8. An entry has exactly `cmd` (a string of 1 to 4096 characters), `timeout` (1s to 1h, default 30s) and `async`.
 
 | Hook | When it fires | Can veto |
 |---|---|---|

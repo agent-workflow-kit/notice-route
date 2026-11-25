@@ -3,9 +3,9 @@
 ``load_config(gateway, config_path)`` finds the config only from the home in the password
 database (never ``HOME`` or ``XDG_*``), reads ``config.yaml`` and ``config.d/*.yaml`` beside it
 through the gateway, parses each file with the strict loader below and returns the merged raw
-mapping. Validation of destinations, quiet windows, links, rules and defaults is #7's: this
-module checks only what loading needs (file safety, YAML, the shape of the merged sections and
-that no name or key is defined twice).
+mapping. Validation of destinations, quiet windows, links, rules and defaults is
+``validate.py``'s: this module checks only what loading needs (file safety, YAML, the shape
+of the merged sections and that no name or key is defined twice).
 
 Rules kept here (docs/interface.md, Config and Files):
 
@@ -288,12 +288,12 @@ def _merge(dst: dict[str, Any], src: dict[str, Any], path: tuple[str, ...]) -> N
 
 
 def _check_rule_names(rules: Any) -> None:
-    """A rule name defined twice (also within one file) is refused. Rule shape is #7's."""
+    """A rule name defined twice (also within one file) is refused. Rule shape is validate.py's."""
     seen: set[str] = set()
     for index, rule in enumerate(rules):
         name = rule.get("name") if isinstance(rule, dict) else None
         if not isinstance(name, str):
-            continue  # TODO(#7): a rule without a string name is refused by the validator
+            continue  # a rule without a string name is refused by validate.py
         if name in seen:
             raise ConfigError("config_invalid", f"rules.{index}.name")
         seen.add(name)
