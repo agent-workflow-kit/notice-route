@@ -40,7 +40,7 @@ Choices where the interface is silent (the narrower reading):
 TODO(#20): classify :class:`CallResult` into outcomes and codes (the table of Retries and outcomes).
 TODO(#21): take the send lock before :func:`call_notifier` and release it after.
 TODO(#22): the send pipeline builds the arguments from the ``sending`` row of ``decide``.
-todo(#22): any exception that escapes :func:`call_notifier` (it raises only for faults outside the
+TODO(#22): any exception that escapes :func:`call_notifier` (it raises only for faults outside the
 child's own fate, after the gateway has killed the group) is ``unknown``: the pipeline keeps the
 row claimed and never retries it as ``not_started``.
 """
