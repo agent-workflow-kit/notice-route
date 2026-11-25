@@ -253,8 +253,9 @@ def _passwd_home() -> str:
 
 def _open_checked_dir(path: str, dir_fd: int | None, shown: str) -> DirHandle:
     """Create ``path`` (0700, umask 077) when absent, open it without following a symlink, and
-    refuse it unless it is a directory owned by the effective user with no group/world access
-    and no setgid or sticky bit."""
+    refuse it unless it is a directory owned by the effective user with no group/world access.
+    Setgid and sticky bits grant nothing on such a directory (a child of a setgid parent
+    inherits setgid) and are tolerated."""
     with _umask_077():
         try:
             os.mkdir(path, 0o700, dir_fd=dir_fd)
@@ -276,7 +277,7 @@ def _open_checked_dir(path: str, dir_fd: int | None, shown: str) -> DirHandle:
             raise UnsafePathError("not_directory", shown)
         if info.st_uid != os.geteuid():
             raise UnsafePathError("owner", shown)
-        if info.st_mode & 0o7077:  # group/world access, setgid or sticky
+        if info.st_mode & 0o077:  # any group/world access
             raise UnsafePathError("mode", shown)
     except BaseException:
         os.close(fd)
@@ -412,7 +413,7 @@ class Gateway:
         The last component is opened with ``O_NOFOLLOW``; the directory is refused
         (:class:`UnsafePathError`, never repaired) when it is a symlink or not a directory, is
         not owned by the effective user (``owner``) or has any group or world access
-        (``mode``; setgid and sticky count). The caller closes the handle.
+        (``mode``; setgid and sticky bits are tolerated). The caller closes the handle.
 
         Trust assumption: parents that already exist are neither checked nor protected from
         symlinks; they are followed as the operating system resolves them, so the user's home

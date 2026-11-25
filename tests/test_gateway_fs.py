@@ -458,10 +458,27 @@ def test_parent_that_is_a_regular_file_is_not_directory(gw: Gateway, tmp_path: P
 
 
 @pytest.mark.parametrize("flag", [stat.S_ISGID, stat.S_ISVTX])
-def test_setgid_or_sticky_dir_is_refused_for_mode(gw: Gateway, tmp_path: Path, flag: int) -> None:
+def test_setgid_or_sticky_private_dir_is_accepted(gw: Gateway, tmp_path: Path, flag: int) -> None:
     target = tmp_path / "state"
     target.mkdir()
     target.chmod(0o700 | flag)
+    with gw.open_private_dir(target) as d:
+        assert d.path == str(target)
+
+
+def test_dir_created_under_setgid_parent_is_accepted_twice(gw: Gateway, tmp_path: Path) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    parent.chmod(0o2755)
+    target = parent / "state"
+    gw.open_private_dir(target).close()
+    gw.open_private_dir(target).close()
+
+
+def test_setgid_dir_with_group_access_is_refused_for_mode(gw: Gateway, tmp_path: Path) -> None:
+    target = tmp_path / "state"
+    target.mkdir()
+    target.chmod(0o2750)
     with pytest.raises(UnsafePathError) as info:
         gw.open_private_dir(target)
     assert info.value.reason == "mode"
