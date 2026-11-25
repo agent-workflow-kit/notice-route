@@ -464,11 +464,36 @@ def test_lock_busy_is_not_cut_off_by_the_attempt_cap(store: Store) -> None:
 def test_lock_busy_keeps_a_stored_refusal_reason(store: Store, prior: str) -> None:
     row = make(store, reason=prior, attempts=1)
     res = apply(store, row, LOCK_BUSY)
-    assert res.reason == prior
+    assert res.reason == "lock_busy"  # the result says what happened; the column keeps the refusal
     assert delivery(store, row.delivery_id)[:2] == ("queued_retry", prior)
     again = reclaim(store, row)
     res = apply(store, again, Outcome("queued_retry", "link_invalid", refusal="link_refused"))
     assert (res.outcome, res.code) == ("failed", "link_invalid")
+
+
+def test_lock_busy_at_the_cap_eviction_keeps_the_give_back_and_the_attempts(store: Store) -> None:
+    row = make(store, level="info", attempts=2)
+    with store.write() as conn:
+        for _ in range(100):
+            did = q.insert_delivery(
+                conn, ts=NOW, source="s", level="error", outcome="deferred", destination="d"
+            )
+            q.enqueue(
+                conn,
+                delivery_id=did,
+                kind="single",
+                message="m",
+                level="error",
+                source="s",
+                deliver_after=NOW,
+                created_at=NOW,
+                lease=Lease(NOW, 20),
+            )
+    res = apply(store, row, LOCK_BUSY, count_hour=HOUR)
+    assert (res.outcome, res.code) == ("dropped", "overflow")
+    assert res.attempts == 2
+    assert rate(store) == 0
+    assert delivery(store, row.delivery_id)[3] == 2
 
 
 def test_lock_busy_of_a_held_row_makes_it_a_single_row(store: Store) -> None:

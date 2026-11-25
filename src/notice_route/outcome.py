@@ -283,8 +283,9 @@ def apply_outcome(
     ``attempts`` calls (refusal retries included), or None when the attempts are used up (the row
     then ends ``failed``, code ``retries_exhausted``, unless a second or uncurable refusal ended it
     first with the refusal code). ``count_hour`` is the UTC hour start in which the hourly count of
-    this call was taken; when given and no call was made (``env_missing``) the count is given
-    back (a digest passes it for one of its rows only). Everything is fenced by ``token``."""
+    this call was taken; when given and no call was made (``env_missing``, ``lock_busy``) the
+    count is given back (a digest passes it for one of its rows only). Everything is fenced by
+    ``token``."""
     if outcome.outcome is None:
         return Applied(False, None, None, None, None, 0, None, internal=True)
     held = conn.execute(
@@ -379,6 +380,8 @@ def apply_outcome(
         assert count_hour is not None
         give_back(conn, destination=_destination(row), level=row.level, hour=count_hour)
     shown = reason if reason is not None else prior_reason
+    if name == "queued_retry" and outcome.reason == "lock_busy":
+        shown = "lock_busy"  # the stored column may keep a refusal; the result says what happened
     return Applied(
         True,
         name,

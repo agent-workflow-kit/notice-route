@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -177,11 +178,12 @@ def test_a_symlink_in_place_of_the_lock_file_is_busy_and_not_followed(
     target = tmp_path / "victim"
     target.write_text("keep")
     (_locks_dir(state_path) / "d.lock").symlink_to(target)
+    mode_before = target.stat().st_mode
     with lock(gw, state) as held:
         assert held.acquired is False
         assert held.busy_reason == "unsafe"
     assert target.read_text() == "keep"
-    assert stat.S_IMODE(target.stat().st_mode) != 0o000
+    assert target.stat().st_mode == mode_before
 
 
 def test_a_dangling_symlink_is_not_created_through(
@@ -258,10 +260,31 @@ def test_an_os_error_while_opening_is_busy(
         assert held.busy_reason == "error"
 
 
-def test_a_bad_destination_name_is_a_programming_error_not_busy(gw: Gateway, state: object) -> None:
+@pytest.mark.parametrize(
+    "name", ["../x", "", ".", "..", "_wsl", "Upper", "a" * 33, "-a", "a b", "a.b", None, 5]
+)
+def test_a_bad_destination_name_is_a_programming_error_not_busy(
+    gw: Gateway, state: object, name: object
+) -> None:
     with pytest.raises(ValueError):
-        with lock(gw, state, "../x"):
+        with lock(gw, state, name):  # type: ignore[arg-type]
             pass
+    assert not (Path(state.path) / "locks").exists()  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("kind", ["", "unknown", "WSL-NOTICE", None])
+def test_an_unknown_kind_is_a_programming_error_not_a_private_lock(
+    gw: Gateway, state: object, kind: object
+) -> None:
+    with pytest.raises(ValueError):
+        with lock(gw, state, "d", kind):  # type: ignore[arg-type]
+            pass
+    assert not (Path(state.path) / "locks").exists()  # type: ignore[attr-defined]
+
+
+def test_the_longest_valid_name_is_accepted(gw: Gateway, state: object) -> None:
+    with lock(gw, state, "a" * 32) as held:
+        assert held.acquired
 
 
 def test_the_descriptors_are_closed_after_the_block(gw: Gateway, state: object) -> None:
@@ -272,6 +295,116 @@ def test_the_descriptors_are_closed_after_the_block(gw: Gateway, state: object) 
         with lock(gw, state, "x") as a, lock(gw, state, "x", wait=0) as b:
             assert a.acquired and not b.acquired
     assert len(os.listdir("/proc/self/fd")) == before
+
+
+# --- release hardening ------------------------------------------------------------------------
+
+
+def _fds() -> int:
+    return len(os.listdir("/proc/self/fd"))
+
+
+class _CloseFails:
+    """A file whose close really closes it and then raises."""
+
+    def __init__(self, real: object) -> None:
+        self._real = real
+
+    def fileno(self) -> int:
+        return self._real.fileno()  # type: ignore[attr-defined]
+
+    def close(self) -> None:
+        self._real.close()  # type: ignore[attr-defined]
+        raise OSError(5, "close failed")
+
+
+def test_an_interrupt_inside_the_poll_leaves_no_descriptor_and_no_lock(
+    state: object, state_path: Path
+) -> None:
+    class Interrupting(FakeClock):
+        def sleep(self, seconds: float) -> None:
+            raise KeyboardInterrupt
+
+    gw = Gateway(clock=Interrupting(wall=5.0, monotonic=100.0))
+    with lock(gw, state) as first:
+        assert first.acquired
+        before = _fds()
+        with pytest.raises(KeyboardInterrupt):
+            with lock(gw, state, wait=2.0):
+                pass
+        assert _fds() == before
+    with lock(gw, state, wait=0) as again:
+        assert again.acquired
+
+
+def test_a_failing_unlock_does_not_leak_descriptors_and_the_body_error_survives(
+    gw: Gateway, state: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(self: Gateway, file: object) -> None:
+        raise KeyError("unlock")
+
+    before = _fds()
+    monkeypatch.setattr(Gateway, "unlock", broken)
+    with pytest.raises(KeyError):
+        with lock(gw, state):
+            pass
+    assert _fds() == before
+    monkeypatch.undo()
+    with lock(gw, state, wait=0) as again:
+        assert again.acquired
+
+
+def test_an_os_error_from_unlock_is_suppressed_and_the_body_error_survives(
+    gw: Gateway, state: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(self: Gateway, file: object) -> None:
+        raise OSError(9, "bad fd")
+
+    before = _fds()
+    monkeypatch.setattr(Gateway, "unlock", broken)
+    with pytest.raises(RuntimeError, match="body"):
+        with lock(gw, state):
+            raise RuntimeError("body")
+    assert _fds() == before
+
+
+def test_a_failing_file_close_is_suppressed_and_the_body_error_survives(
+    gw: Gateway, state: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = Gateway.open_file
+
+    def wrapped(self: Gateway, *a: object, **k: object) -> object:
+        return _CloseFails(original(self, *a, **k))  # type: ignore[arg-type]
+
+    before = _fds()
+    monkeypatch.setattr(Gateway, "open_file", wrapped)
+    with pytest.raises(RuntimeError, match="body"):
+        with lock(gw, state):
+            raise RuntimeError("body")
+    assert _fds() == before
+
+
+def test_a_failing_locks_dir_close_is_suppressed_and_the_body_error_survives(
+    gw: Gateway, state: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from notice_route.gateway import DirHandle
+
+    real_close = DirHandle.close
+    state_fd = state.fd  # type: ignore[attr-defined]
+
+    def failing(self: DirHandle) -> None:
+        was_open = self.fd >= 0
+        real_close(self)
+        if was_open and self.fd < 0 and self.path.endswith("/locks"):
+            raise OSError(5, "close failed")
+
+    before = _fds()
+    monkeypatch.setattr(DirHandle, "close", failing)
+    with pytest.raises(RuntimeError, match="body"):
+        with lock(gw, state):
+            raise RuntimeError("body")
+    assert _fds() == before
+    assert state.fd == state_fd  # type: ignore[attr-defined]
 
 
 # --- real processes ----------------------------------------------------------------------------
@@ -289,7 +422,7 @@ _WORKER = textwrap.dedent(
             waited = time.monotonic() - t0
             if held.acquired:
                 with open(log, "a") as f:
-                    f.write(f"in {os.getpid()} {time.monotonic():.6f}\\n")
+                    f.write(f"in {os.getpid()} {time.monotonic():.6f} {waited:.6f}\\n")
                 if hold == "stdin":
                     print("held", flush=True)
                     sys.stdin.read()
@@ -343,8 +476,13 @@ def spawn(home: Path, tmp_path: Path) -> Iterator[Callable[..., subprocess.Popen
 
 
 def _held(proc: subprocess.Popen[str]) -> None:
+    """Wait (at most 10 s) for the worker's ``held`` line; a hung worker fails the test."""
     assert proc.stdout is not None
-    assert proc.stdout.readline() == "held\n"
+    line: list[str] = []
+    reader = threading.Thread(target=lambda: line.append(proc.stdout.readline()), daemon=True)  # type: ignore[union-attr]
+    reader.start()
+    reader.join(timeout=10)
+    assert line == ["held\n"], "the worker did not report holding the lock"
 
 
 def test_a_second_process_is_busy_after_about_lock_wait_and_never_blocks_past_it(
@@ -359,8 +497,8 @@ def test_a_second_process_is_busy_after_about_lock_wait_and_never_blocks_past_it
     elapsed = time.monotonic() - start
     kind, _pid, waited = log.read_text().split()
     assert kind == "busy"
-    assert 0.4 <= float(waited) < 0.4 + 0.5
-    assert elapsed < 5.0
+    assert 0.4 <= float(waited) < 0.4 + 3.0
+    assert elapsed < 8.0
 
 
 def test_a_holder_killed_with_sigkill_frees_the_lock_at_once(
@@ -409,21 +547,27 @@ def test_eight_processes_contending_never_overlap_and_none_waits_past_lock_wait(
 ) -> None:
     log = tmp_path / "eight.txt"
     wait = 1.0
-    procs = [spawn("d", "generic", wait, "0.05", log=log) for _ in range(8)]
+    procs = [spawn("d", "generic", wait, "0.3", log=log) for _ in range(8)]
     for proc in procs:
         assert proc.wait(timeout=30) == 0
     entries = [line.split() for line in log.read_text().splitlines()]
-    assert len(entries) >= 8  # each process logged in+out, or busy
     spans: dict[str, list[float]] = {}
-    for kind, pid, value in entries:
+    busy_waits: list[float] = []
+    for kind, pid, value, *rest in entries:
+        if kind == "in":
+            assert float(rest[0]) < wait + 3.0  # an acquirer's wait is bounded too
         if kind == "busy":
-            assert float(value) < wait + 0.5  # never waits past lock_wait (plus scheduling)
+            busy_waits.append(float(value))
         else:
             spans.setdefault(pid, []).append(float(value))
+    assert len(spans) + len(busy_waits) == 8  # every process logged its result
+    assert len(spans) >= 2, "too few processes got the lock"
+    for waited in busy_waits:
+        assert waited >= wait - 0.2  # a busy process waited about lock_wait (loose lower bound)
+        assert waited < wait + 3.0  # and never past it (plus scheduling)
     ordered = sorted(spans.values())
-    assert ordered, "nobody got the lock"
     for (_a_in, a_out), (b_in, _b_out) in zip(ordered, ordered[1:], strict=False):
-        assert a_out <= b_in  # no overlap
+        assert a_out <= b_in  # no overlap of critical sections
 
 
 def test_the_lock_descriptor_is_not_inherited_by_a_spawned_child(

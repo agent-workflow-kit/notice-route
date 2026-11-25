@@ -17,10 +17,12 @@ Rules (interface: Calling the notifiers, Files):
   two locks, so two processes cannot take them in opposite orders and deadlock.
 - The files are opened by :meth:`Gateway.open_file` (``O_NOFOLLOW``, ``O_NONBLOCK``, ``O_CLOEXEC``,
   regular file only, created 0600) inside the ``locks`` directory (private, 0700, checked). A
-  symlink, FIFO, directory or other bad file, an unusable ``locks`` directory and any ``OSError``
-  (``ENOLCK``, permissions) make the call ``lock_busy`` (``acquired`` False, ``busy_reason``
-  ``unsafe`` or ``error``): nothing is sent. A bad destination name is a ``ValueError`` (a
-  programming error: validation allows only ``[a-z0-9][a-z0-9_-]*``).
+  symlink, FIFO, directory or other file that is not a regular file, an unusable ``locks``
+  directory and any ``OSError`` (``ENOLCK``, permissions) make the call ``lock_busy``
+  (``acquired`` False, ``busy_reason`` ``unsafe`` or ``error``): nothing is sent. A bad
+  destination name or an unknown kind is a ``ValueError`` (a programming error, raised before
+  anything is opened: validation allows only ``[a-z0-9][a-z0-9_-]{0,31}`` and the kinds of
+  ``validate.KINDS``).
 - The lock is released on every path (return, exception, ``KeyboardInterrupt``) by unlocking and
   closing the descriptor; the kernel releases it too when the process dies. The descriptor is
   close-on-exec, so a notifier child never holds it. Lock files are never renamed or unlinked.
@@ -40,6 +42,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from .gateway import DirHandle, Gateway, UnsafePathError
+from .validate import _DESTINATION_NAME, KINDS  # the one grammar of destination names
 
 __all__ = ["LOCKS_DIR", "SHARED_LOCK_NAME", "Held", "lock_name", "send_lock"]
 
@@ -67,6 +70,10 @@ def send_lock(
 ) -> Iterator[Held]:
     """Take the send lock of ``destination`` (``state`` is the open state directory) for the
     body of the ``with`` block, waiting at most ``lock_wait`` seconds. See the module doc."""
+    if not isinstance(destination, str) or not _DESTINATION_NAME.fullmatch(destination):
+        raise ValueError("the destination name is not a valid destination name")
+    if kind not in KINDS:
+        raise ValueError("the destination kind is unknown")
     file_name = f"{lock_name(destination, kind)}.lock"
     locks: DirHandle | None = None
     file = None
@@ -83,11 +90,16 @@ def send_lock(
             result = Held(False, "error")
         yield result
     finally:
-        if file is not None:
-            if held:
+        try:
+            if file is not None:
+                try:
+                    if held:
+                        with suppress(OSError):
+                            gateway.unlock(file)
+                finally:
+                    with suppress(OSError):
+                        file.close()
+        finally:
+            if locks is not None:
                 with suppress(OSError):
-                    gateway.unlock(file)
-            with suppress(OSError):
-                file.close()
-        if locks is not None:
-            locks.close()
+                    locks.close()
