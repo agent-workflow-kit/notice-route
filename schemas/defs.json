@@ -255,7 +255,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 4096,
-          "description": "config_invalid and config_unsafe: a key path, home, --config, or the file path relative to the config directory (config_unsafe and unreadable files)."
+          "description": "config_invalid and config_unsafe: a key path, home, --config, . (the config directory itself), or the file path relative to the config directory (config_unsafe and unreadable files)."
         },
         "pointer": {
           "type": "string",

@@ -198,6 +198,10 @@ class UnsafePathError(Exception):
         self.path = path
 
 
+class LimitExceededError(Exception):
+    """A file or a directory listing is larger than the caller's limit (never truncated)."""
+
+
 class DirHandle:
     """An open directory descriptor; files and subdirectories are opened relative to it."""
 
@@ -527,10 +531,110 @@ class Gateway:
         """Release a lock taken with :meth:`try_lock`; harmless when not held."""
         fcntl.flock(file.fileno(), fcntl.LOCK_UN)
 
+    def open_config_dir(self, path: str, parent: DirHandle | None = None) -> DirHandle | None:
+        """Open an existing config directory without creating anything; ``None`` when absent.
+
+        ``path`` is any path without NUL when ``parent`` is None (relative paths use the working
+        directory), else one plain component inside ``parent``. The last component is opened
+        with ``O_NOFOLLOW``; it is refused (:class:`UnsafePathError`) when it is a symlink or
+        not a directory (``not_directory``), is not owned by the effective user (``owner``) or
+        is group- or world-writable (``mode``). Unlike :meth:`open_private_dir`, read access for
+        group and world is accepted, and setgid and sticky bits are tolerated. A missing
+        directory, or a missing parent on the way (also one that is not a directory), is ``None``.
+        Other ``OSError`` values (``PermissionError``, ``ENAMETOOLONG``) propagate.
+        The caller closes the handle.
+        """
+        if not isinstance(path, str) or "\x00" in path:
+            raise ValueError("path must be a string without NUL")
+        if parent is not None:
+            self._live(parent)
+            shown = f"{parent.path.rstrip('/')}/{_component(path)}"
+            dir_fd: int | None = parent.fd
+        else:
+            if path == "":
+                raise ValueError("path must not be empty")
+            shown, dir_fd = path, None
+        try:
+            fd = os.open(
+                path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
+                if exc.errno == errno.ENOTDIR and not _last_component_exists(path, dir_fd):
+                    return None  # a non-directory earlier on the way: nothing is there
+                raise UnsafePathError("not_directory", shown) from exc
+            raise
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISDIR(info.st_mode):
+                raise UnsafePathError("not_directory", shown)
+            if info.st_uid != os.geteuid():
+                raise UnsafePathError("owner", shown)
+            if info.st_mode & 0o022:  # group or world write
+                raise UnsafePathError("mode", shown)
+        except BaseException:
+            os.close(fd)
+            raise
+        return DirHandle(fd, shown)
+
+    def read_config_file(self, parent: DirHandle, name: str, limit: int) -> bytes | None:
+        """Read the config file ``name`` inside ``parent``; ``None`` when it does not exist.
+
+        Opened as :meth:`open_file` does (``O_NOFOLLOW``, ``O_NONBLOCK``, regular files only:
+        ``symlink`` and ``not_regular`` are :class:`UnsafePathError`) and then checked on the
+        descriptor: owned by the effective user (``owner``) and not group- or world-writable
+        (``mode``). At most ``limit`` bytes are accepted: one byte more raises
+        :class:`LimitExceededError` after reading no more than ``limit + 1`` bytes.
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        try:
+            file = self.open_file(parent, name)
+        except FileNotFoundError:
+            return None
+        with file:
+            info = os.fstat(file.fileno())
+            shown = f"{parent.path.rstrip('/')}/{name}"
+            if info.st_uid != os.geteuid():
+                raise UnsafePathError("owner", shown)
+            if info.st_mode & 0o022:
+                raise UnsafePathError("mode", shown)
+            data = bytearray()
+            while len(data) <= limit:
+                chunk = file.read(min(_CHUNK, limit + 1 - len(data)))
+                if not chunk:
+                    return bytes(data)
+                data += chunk
+        raise LimitExceededError(f"{shown!r} is larger than {limit} bytes")
+
+    def list_dir(self, handle: DirHandle, *, limit: int) -> list[str]:
+        """The names in the directory (unsorted, ``.`` and ``..`` excluded). More than ``limit``
+        entries is :class:`LimitExceededError` (the listing stops there)."""
+        self._live(handle)
+        names: list[str] = []
+        with os.scandir(handle.fd) as entries:
+            for entry in entries:
+                if len(names) >= limit:
+                    raise LimitExceededError(f"{handle.path!r} has more than {limit} entries")
+                names.append(entry.name)
+        return names
+
     @staticmethod
     def _live(handle: DirHandle) -> None:
         if handle.closed:
             raise ValueError("directory handle is closed")
+
+
+def _last_component_exists(path: str, dir_fd: int | None) -> bool:
+    """Whether ``path`` itself exists (a symlink or file), so that ENOTDIR came from it and not
+    from a component on the way."""
+    try:
+        os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return True
 
 
 @dataclass(frozen=True)

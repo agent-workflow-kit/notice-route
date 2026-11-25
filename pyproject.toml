@@ -5,7 +5,9 @@ description = "Routes notifications to channel tools by level, source, labels an
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
-dependencies = []
+dependencies = [
+    "pyyaml>=6.0.3",
+]
 
 [project.scripts]
 notice-route = "notice_route.cli:main"
