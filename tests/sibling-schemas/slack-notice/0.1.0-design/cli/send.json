@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "slack-notice/cli/send.json",
+  "title": "send --json output",
+  "description": "Printed on exit 0 (sent, dry_run) and exit 22 (disabled). A disabled run prints only {outcome}. Errors print the error envelope instead.",
+  "type": "object",
+  "properties": {
+    "outcome": {
+      "enum": [
+        "sent",
+        "dry_run",
+        "disabled"
+      ],
+      "description": "sent means Slack accepted the request, never delivered."
+    },
+    "tool": {
+      "const": "slack-notice"
+    },
+    "level": {
+      "$ref": "../defs.json#/$defs/level"
+    },
+    "truncated": {
+      "type": "boolean"
+    },
+    "bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Length of the request body (the JSON document, UTF-8)."
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "http_status": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 100,
+      "maximum": 599,
+      "description": "null for a dry run; a disabled run prints only outcome."
+    },
+    "dedupe_key": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/dedupe_key"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Echo of the caller's own --dedupe-key, or null."
+    },
+    "rendered": {
+      "type": "string",
+      "x-untrusted": true,
+      "description": "Untrusted. The body string, dry run only; holds no secret."
+    }
+  },
+  "required": [
+    "outcome"
+  ],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "enum": [
+              "sent",
+              "dry_run"
+            ]
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "required": [
+          "tool",
+          "level",
+          "truncated",
+          "bytes",
+          "duration_ms",
+          "http_status",
+          "dedupe_key"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "sent"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "not": {
+          "required": [
+            "rendered"
+          ]
+        },
+        "properties": {
+          "http_status": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "dry_run"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "required": [
+          "rendered"
+        ],
+        "properties": {
+          "http_status": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "disabled"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "maxProperties": 1
+      }
+    }
+  ]
+}

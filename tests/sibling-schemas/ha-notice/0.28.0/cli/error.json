@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ha-notice/cli/error.json",
+  "title": "Error envelope (any command with --json)",
+  "description": "Printed on stdout for a non-zero exit with --json, except exit 22 (disabled), which prints {\"outcome\": \"disabled\"}.",
+  "type": "object",
+  "properties": {
+    "error": {
+      "$ref": "../defs.json#/$defs/error"
+    }
+  },
+  "required": [
+    "error"
+  ],
+  "additionalProperties": false
+}

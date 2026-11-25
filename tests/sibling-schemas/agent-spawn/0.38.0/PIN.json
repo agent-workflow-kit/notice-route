@@ -1,0 +1,16 @@
+{
+  "tool": "agent-spawn",
+  "version": "0.38.0",
+  "source_commit": "90e86d22da6236e09fcd898474eeecd4b9bbf728",
+  "note": "copied: byte-for-byte from the sibling's schemas/ at source_commit; authored: written here (producers publish no payload examples). Re-pin: copy, update version/source_commit/hashes together.",
+  "copied": {
+    "defs.json": "104040dc7447d25a51af31ff39c3a57d024fb59d948952039945467ce1b94c48",
+    "hooks/post-escalate.json": "4aa665ec5c55c1530e2972e60879a378b8669aad86a094b7a098a023b4246b41",
+    "hooks/post-state-change.json": "b32bbffe9f594f13c4f0dccd5c2474d8d207f5c63bb70822634a0ab158400113"
+  },
+  "authored": {
+    "examples/post-escalate.json": "b9712750d4829897828f230564851bbe7de71e400090c7a4814c0dc811f83d20",
+    "examples/post-state-change-agent.json": "18fbe4e4d85885e45e0625fac244f22f35de8acce6ad063f748a20518bc60353",
+    "examples/post-state-change-session.json": "2ebdfaacc1b11e4f6302862d1b2f1a158932f1d343f64ee76aeef1362f03ebcd"
+  }
+}

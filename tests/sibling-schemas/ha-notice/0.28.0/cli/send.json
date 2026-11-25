@@ -1,0 +1,225 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ha-notice/cli/send.json",
+  "title": "send output",
+  "description": "Printed with --json on exit 0 (sent or dry run) and exit 22 (disabled, which prints only outcome). Errors print the error envelope.",
+  "type": "object",
+  "properties": {
+    "outcome": {
+      "enum": [
+        "sent",
+        "dry_run",
+        "disabled"
+      ]
+    },
+    "tool": {
+      "$ref": "../defs.json#/$defs/tool"
+    },
+    "level": {
+      "$ref": "../defs.json#/$defs/level"
+    },
+    "truncated": {
+      "type": "boolean"
+    },
+    "bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "UTF-8 size of the request body."
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "http_status": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 100,
+      "maximum": 599,
+      "description": "Null for a dry run; an integer when sent."
+    },
+    "tag_set": {
+      "type": "boolean"
+    },
+    "dedupe_key": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/dedupe_key"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The caller's own key, echoed; null when none was given."
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "insecure_http"
+        ]
+      },
+      "uniqueItems": true,
+      "description": "Fixed strings; [] when none. The only value in 0.x is insecure_http, which goes with the stderr line `warning: insecure_http: base_url is plain http, the token travels in cleartext` (once per run, before the first request)."
+    },
+    "rendered": {
+      "type": "object",
+      "x-untrusted": true,
+      "description": "Untrusted: the JSON body that would be sent (title and data omitted when empty). No secrets.",
+      "properties": {
+        "title": {
+          "type": "string",
+          "maxLength": 273
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "data": {
+          "type": "object",
+          "description": "Built only from the allowlist, in this order and omitted when empty: url and clickAction (the link), tag (awkit- plus 24 hex characters), group (config default_group), actions (the validated notification actions, in input order).",
+          "properties": {
+            "url": {
+              "type": "string",
+              "maxLength": 1024
+            },
+            "clickAction": {
+              "type": "string",
+              "maxLength": 1024
+            },
+            "tag": {
+              "type": "string",
+              "pattern": "^awkit-[0-9a-f]{24}(?![\\s\\S])"
+            },
+            "group": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{1,64}(?![\\s\\S])"
+            },
+            "actions": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 3,
+              "items": {
+                "type": "object",
+                "required": [
+                  "action",
+                  "title",
+                  "uri"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "action": {
+                    "const": "URI"
+                  },
+                  "title": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  },
+                  "uri": {
+                    "type": "string",
+                    "maxLength": 1024,
+                    "pattern": "^https?://[\\x21-\\x7e]+(?![\\s\\S])"
+                  }
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "message"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "outcome"
+  ],
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "disabled"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "outcome": {}
+        },
+        "maxProperties": 1
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "enum": [
+              "sent",
+              "dry_run"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "outcome",
+          "tool",
+          "level",
+          "truncated",
+          "bytes",
+          "duration_ms",
+          "http_status",
+          "tag_set",
+          "dedupe_key",
+          "warnings"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "dry_run"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "rendered"
+        ],
+        "properties": {
+          "http_status": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "sent"
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": [
+            "rendered"
+          ]
+        },
+        "properties": {
+          "http_status": {
+            "type": "integer"
+          }
+        }
+      }
+    }
+  ]
+}

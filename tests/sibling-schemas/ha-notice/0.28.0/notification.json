@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "ha-notice/notification.json",
+  "title": "ha-notice notification (input)",
+  "description": "The JSON object read by send --stdin-json or --file. Unknown fields exit 20 invalid_payload. Sanitizing, the cut of a title to 256 characters after sanitizing, the empty-message check (message has no minLength here; an absent message is also empty_message), the command-keyword check, the exact link rule (also for each action uri), the 64 character limit of an action title and the 3 action limit are applied by the tool and are not expressible here.",
+  "type": "object",
+  "properties": {
+    "title": {
+      "type": "string",
+      "x-untrusted": true,
+      "maxLength": 100000,
+      "description": "Untrusted. At most 100000 characters of input (more is exit 20 invalid_payload); cut at 256 characters after sanitizing with an ellipsis and truncated: true; one line (newlines become spaces)."
+    },
+    "message": {
+      "type": "string",
+      "maxLength": 100000,
+      "x-untrusted": true,
+      "description": "Untrusted. At most 100000 characters of input; must not be empty after sanitizing or absent (empty_message) and must not be a command message."
+    },
+    "level": {
+      "$ref": "defs.json#/$defs/level",
+      "default": "info"
+    },
+    "link": {
+      "type": "string",
+      "pattern": "^[\\x21-\\x7e]{1,1024}(?![\\s\\S])",
+      "maxLength": 1024,
+      "description": "Coarse gate only: 1 to 1024 printable ASCII characters (U+0021 to U+007E). The tool is authoritative: scheme (case-insensitive http or https), host, port and the reasons link_invalid and link_scheme."
+    },
+    "actions": {
+      "type": "array",
+      "maxItems": 3,
+      "x-untrusted": true,
+      "description": "Optional. At most 3 URI actions, shown in this order as notification buttons (the companion app's action URI). Each is refused, never cut or fixed, when invalid. A uri is checked by the tool with the link rule (http and https only) and config link_hosts; the schema is a coarse gate. Not a command: actions are never the message.",
+      "items": {
+        "type": "object",
+        "required": [
+          "title",
+          "uri"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 100000,
+            "x-untrusted": true,
+            "description": "Untrusted. At most 100000 characters of input; sanitized like a title (one line); empty after sanitizing, or more than 64 characters after sanitizing, is exit 20 invalid_payload (never cut)."
+          },
+          "uri": {
+            "type": "string",
+            "pattern": "^[\\x21-\\x7e]{1,1024}(?![\\s\\S])",
+            "maxLength": 1024,
+            "description": "Coarse gate only: the link rule (printable ASCII, 1 to 1024 characters, http or https, link_hosts). Exit 20 link_invalid or link_scheme with pointer /actions/<i>/uri."
+          }
+        }
+      }
+    }
+  },
+  "required": [
+    "message"
+  ],
+  "additionalProperties": false
+}

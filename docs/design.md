@@ -123,7 +123,7 @@ Still to verify (live tests in the plan, with conservative defaults until then):
 | `flush.py` | due rows in the order of `flush`, digests, delivery |
 | `history.py`, `hooks.py`, `cron.py`, `log.py` | `history`, `post-fail` from `flush`, the cron block, `log.jsonl` |
 
-Dependencies: `pyyaml` (YAML cannot be read from the standard library) and `pydantic` (the design guide's config validation); everything else is the standard library (`argparse`, `sqlite3`, `zoneinfo`, `subprocess`, `selectors`, `fcntl`, `hashlib`, `json`). No HTTP client is needed: the router never speaks to a network.
+Dependencies: `pyyaml` (YAML cannot be read from the standard library) and `pydantic` (the design guide's config validation); everything else is the standard library (`argparse`, `sqlite3`, `zoneinfo`, `subprocess`, `selectors`, `fcntl`, `hashlib`, `json`). No HTTP client is needed: the router never speaks to a network. Development only: `jsonschema` validates the fakes' output and every `--json` output against the schemas in tests (it is never imported by the package).
 
 ## Data model
 

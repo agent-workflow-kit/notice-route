@@ -1,0 +1,13 @@
+{
+  "tool": "slack-notice",
+  "version": "0.1.0-design",
+  "source_commit": "0d101850a02979b73e4e4b7f8440f5899f379e0e",
+  "note": "copied: byte-for-byte from the sibling's schemas/ at source_commit; authored: written here (producers publish no payload examples). Re-pin: copy, update version/source_commit/hashes together.",
+  "copied": {
+    "cli/error.json": "2ed1070af7e3f71bf9b151047afbcb1a427940d21c980d730166fdb0f582c4f5",
+    "cli/send.json": "30336d5b6f8f0ec07af4eca551ffd7bddbcd00e06b329c3557c9d9d102ba8767",
+    "defs.json": "26cf93a9b1d6dce248f4ec585cdd4f029813cd976a2711c76ed03afb7e0a1bc0",
+    "notification.json": "394f0bb48a90e7b53348b26164e3ddf1378af7231392046489a740a313aa43d5"
+  },
+  "authored": {}
+}

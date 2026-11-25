@@ -1,0 +1,778 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "slack-notice/defs.json",
+  "title": "slack-notice shared definitions",
+  "description": "Not an output on its own. Shared definitions referenced by the notification, CLI and log schemas. config.json embeds its own copies.",
+  "$defs": {
+    "level": {
+      "enum": [
+        "info",
+        "warn",
+        "action",
+        "error"
+      ],
+      "description": "Ordered info < warn < action < error; the order matters to callers, not to slack-notice."
+    },
+    "duration": {
+      "anyOf": [
+        {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        {
+          "type": "string",
+          "pattern": "^(?=.*[1-9])[0-9]+(?:\\.[0-9]+)?(?:ms|s|m)?(?![\\s\\S])"
+        }
+      ],
+      "description": "Seconds as a positive finite number, or a string matching [0-9]+(\\.[0-9]+)?(ms|s|m)? (no unit means seconds); zero is refused. Booleans are never accepted. Ranges are enforced by the loader and named in the key's description."
+    },
+    "ts": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z(?![\\s\\S])",
+      "description": "UTC with millisecond precision: YYYY-MM-DDTHH:MM:SS.mmmZ."
+    },
+    "sha256_16": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{16}(?![\\s\\S])",
+      "description": "First 16 hex characters of a SHA-256."
+    },
+    "actor": {
+      "type": "string",
+      "pattern": "^(human|auto):[A-Za-z0-9._@/-]{1,64}(?![\\s\\S])",
+      "description": "human:<user> or auto:<name>. Advisory against same-user processes."
+    },
+    "dedupe_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "description": "A caller's --dedupe-key: any non-empty string of at most 1024 characters, only hashed. Accepted for uniformity; Slack has no deduplication."
+    },
+    "exit_code": {
+      "enum": [
+        0,
+        1,
+        2,
+        12,
+        20,
+        22
+      ]
+    },
+    "error_code": {
+      "enum": [
+        "usage",
+        "config_invalid",
+        "internal",
+        "refused",
+        "host_rejected",
+        "auth_required",
+        "credential_invalid",
+        "rate_limited",
+        "upstream_error",
+        "network_error",
+        "outcome_unknown",
+        "wrong_host_response",
+        "unavailable"
+      ],
+      "description": "refused is exit 20; usage and config_invalid exit 2; the rest of the list except internal exit 12."
+    },
+    "refusal_reason": {
+      "enum": [
+        "invalid_payload",
+        "empty_message",
+        "link_invalid",
+        "link_scheme"
+      ],
+      "description": "On exit 20 (code refused)."
+    },
+    "error_details": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "maxLength": 4096,
+          "description": "config_invalid: a config key name matching [A-Za-z0-9_]{1,64} (else ?), --config for a missing --config file, home for a home directory that cannot be used (lookup failure, empty, relative or not an existing directory), or the file path for a file that cannot be read or parsed."
+        },
+        "phase": {
+          "enum": [
+            "input",
+            "lock"
+          ],
+          "description": "unavailable: where the deadline passed with nothing sent: input (the input did not arrive) or lock (the send lock wait)."
+        },
+        "pointer": {
+          "type": "string",
+          "pattern": "^(?:|/(?:[A-Za-z0-9_-]{1,64}|\\?))(?![\\s\\S])",
+          "description": "invalid_payload: empty for the whole input, else /<field> (/? when the field name does not match [A-Za-z0-9_-]{1,64}). Never an input value."
+        },
+        "env": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}(?![\\s\\S])",
+          "description": "credential_invalid: the name (never the value) of the variable."
+        },
+        "host_error": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-untrusted": true,
+          "pattern": "^[a-z_]{1,64}(?![\\s\\S])",
+          "description": "host_rejected: the string value of the response's key error when it matches [a-z_]{1,64}, else null. Untrusted: from the server."
+        },
+        "http_status": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 599,
+          "description": "Every code that came from a response (auth_required, host_rejected, rate_limited, upstream_error, wrong_host_response): the status. host_rejected: 400; auth_required: 401, 403, 404 or 410."
+        },
+        "tls": {
+          "type": "boolean",
+          "description": "network_error: true for a certificate or trust failure."
+        },
+        "timeout": {
+          "type": "boolean",
+          "description": "network_error: true when the deadline passed before the first request byte."
+        }
+      },
+      "additionalProperties": false,
+      "description": "Fixed strings and names only, never an input value or a credential; null when nothing applies."
+    },
+    "error": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/error_code"
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A fixed string of the tool: never a response body, header, exception text, input value, the webhook URL or any part of it."
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "On exit 20 (code refused) a refusal_reason; null otherwise."
+        },
+        "details": {
+          "$ref": "#/$defs/error_details"
+        },
+        "retryable": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "A boolean on exit 12 and exit 1 (see Error envelope in the interface), null on exit 2 and 20."
+        },
+        "retry_after_s": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Set only for rate_limited (the wait that was last performed, or the wait that did not fit the deadline; the tool's own backoff, not a server hint), else null."
+        },
+        "unknown_outcome": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Set on exit 12 and exit 1, null on exit 2 and 20. True when the message may have been delivered."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "refused"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "reason"
+            ],
+            "properties": {
+              "reason": {
+                "$ref": "#/$defs/refusal_reason"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "refused"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "else": {
+            "properties": {
+              "reason": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "host_rejected",
+                  "auth_required",
+                  "credential_invalid",
+                  "rate_limited",
+                  "upstream_error",
+                  "network_error",
+                  "outcome_unknown",
+                  "wrong_host_response",
+                  "unavailable"
+                ]
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "retryable",
+              "retry_after_s",
+              "unknown_outcome"
+            ],
+            "properties": {
+              "retryable": {
+                "type": "boolean"
+              },
+              "retry_after_s": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "unknown_outcome": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "internal"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "retryable": {
+                "const": false
+              },
+              "retry_after_s": {
+                "type": "null"
+              },
+              "unknown_outcome": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "usage",
+                  "config_invalid",
+                  "refused"
+                ]
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "retryable": {
+                "type": "null"
+              },
+              "retry_after_s": {
+                "type": "null"
+              },
+              "unknown_outcome": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "host_rejected",
+                  "auth_required",
+                  "credential_invalid",
+                  "upstream_error",
+                  "network_error",
+                  "outcome_unknown",
+                  "wrong_host_response",
+                  "unavailable"
+                ]
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "retry_after_s": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "host_rejected",
+                  "auth_required",
+                  "credential_invalid"
+                ]
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "retryable": {
+                "const": false
+              },
+              "unknown_outcome": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "rate_limited",
+                  "unavailable"
+                ]
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "retryable": {
+                "const": true
+              },
+              "unknown_outcome": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "network_error"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "unknown_outcome": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "wrong_host_response"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "retryable": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "network_error"
+              },
+              "details": {
+                "type": "object",
+                "properties": {
+                  "tls": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "tls"
+                ]
+              }
+            },
+            "required": [
+              "code",
+              "details"
+            ]
+          },
+          "then": {
+            "properties": {
+              "retryable": {
+                "const": false
+              }
+            }
+          },
+          "else": {
+            "if": {
+              "properties": {
+                "code": {
+                  "const": "network_error"
+                }
+              },
+              "required": [
+                "code"
+              ]
+            },
+            "then": {
+              "properties": {
+                "retryable": {
+                  "const": true
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "outcome_unknown",
+                  "upstream_error"
+                ]
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "properties": {
+              "retryable": {
+                "const": false
+              },
+              "unknown_outcome": {
+                "const": true
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "config_invalid"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "details"
+            ],
+            "properties": {
+              "details": {
+                "type": "object",
+                "required": [
+                  "key"
+                ],
+                "properties": {
+                  "key": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "unavailable"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "details"
+            ],
+            "properties": {
+              "details": {
+                "type": "object",
+                "required": [
+                  "phase"
+                ],
+                "properties": {
+                  "phase": {
+                    "enum": [
+                      "input",
+                      "lock"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "unavailable"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "else": {
+            "properties": {
+              "details": {
+                "not": {
+                  "required": [
+                    "phase"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "const": "invalid_payload"
+              }
+            },
+            "required": [
+              "reason"
+            ]
+          },
+          "then": {
+            "required": [
+              "details"
+            ],
+            "properties": {
+              "details": {
+                "type": "object",
+                "required": [
+                  "pointer"
+                ],
+                "properties": {
+                  "pointer": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "credential_invalid"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "details"
+            ],
+            "properties": {
+              "details": {
+                "type": "object",
+                "required": [
+                  "env"
+                ],
+                "properties": {
+                  "env": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "auth_required"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "details"
+            ],
+            "properties": {
+              "details": {
+                "type": "object",
+                "required": [
+                  "http_status"
+                ],
+                "properties": {
+                  "http_status": {
+                    "enum": [
+                      401,
+                      403,
+                      404,
+                      410
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "host_rejected"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "details"
+            ],
+            "properties": {
+              "details": {
+                "type": "object",
+                "required": [
+                  "host_error",
+                  "http_status"
+                ],
+                "properties": {
+                  "host_error": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "http_status": {
+                    "const": 400
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "const": "network_error"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          },
+          "then": {
+            "required": [
+              "details"
+            ],
+            "properties": {
+              "details": {
+                "type": "object",
+                "required": [
+                  "tls",
+                  "timeout"
+                ],
+                "properties": {
+                  "tls": {
+                    "type": "boolean"
+                  },
+                  "timeout": {
+                    "type": "boolean"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}
