@@ -180,20 +180,44 @@ class Gateway:
         goes to the group, ``TERM_GRACE`` seconds later SIGKILL. After the child exits or the
         group is killed, output is read for at most ``FINAL_READ`` more seconds and the pipes
         are closed, so a descendant that left the group cannot hold the call. A write to a
-        closed stdin (EPIPE) is ignored. Only the group created here is ever signaled.
+        closed stdin (EPIPE) is ignored. Only the group created here is ever signaled; when the
+        leader exits, the group is SIGKILLed (a same-group descendant dies, its later output is
+        dropped).
+
+        Raises ``ValueError`` for a bad ``argv`` (not a non-empty list of strings without NUL),
+        ``env`` (keys with ``=`` or NUL, values with NUL, non-strings), ``timeout`` (not a
+        finite positive int or float) or ``stdin`` (not None, str, bytes, bytearray or
+        memoryview), all before anything starts. Raises ``RuntimeError`` when SIGCHLD is
+        ignored (the kernel would reap children and the results would be wrong) or when the
+        child could not be reaped. Precondition: SIGPIPE is ignored, as Python does by default.
         """
         # TODO(#19): the notifier argv/env builders (scrubbed PATH, locale, named variables)
         # live in the caller; this method passes ``env`` through untouched.
+        if isinstance(argv, (str, bytes)):
+            raise ValueError("argv must be a list of strings, not one string")
         args = list(argv)
-        if not args or not all(isinstance(a, str) for a in args):
-            raise ValueError("argv must be a non-empty list of strings")
+        if not args or not all(isinstance(a, str) and "\x00" not in a for a in args):
+            raise ValueError("argv must be a non-empty list of strings without NUL")
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+            raise ValueError("timeout must be an int or a float")
         timeout = _finite(timeout, "timeout")
         if timeout <= 0:
             raise ValueError("timeout must be positive")
         environment = dict(env)
         if not all(isinstance(k, str) and isinstance(v, str) for k, v in environment.items()):
             raise ValueError("env must map strings to strings")
-        payload = stdin.encode("utf-8") if isinstance(stdin, str) else (stdin or b"")
+        if any("=" in k or "\x00" in k or "\x00" in v for k, v in environment.items()):
+            raise ValueError("env names may not hold '=' or NUL and values may not hold NUL")
+        if stdin is None:
+            payload = b""
+        elif isinstance(stdin, str):
+            payload = stdin.encode("utf-8")
+        elif isinstance(stdin, (bytes, bytearray, memoryview)):
+            payload = bytes(stdin)
+        else:
+            raise ValueError("stdin must be None, str, bytes, bytearray or memoryview")
+        if signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN:
+            raise RuntimeError("SIGCHLD is ignored: the kernel would reap children unseen")
         started = self.clock.monotonic()
         try:
             proc = subprocess.Popen(
@@ -234,7 +258,9 @@ class RunResult:
     ``signal`` say how the child ended afterwards (``signal`` is SIGTERM or SIGKILL unless the
     child handled TERM).
     ``overflow``: stdout or stderr exceeded its cap and the gateway killed the group;
-    ``overflow`` names the stream; the output holds at most the cap.
+    ``overflow`` names the first stream to cross its cap; the output holds at most the cap.
+    The field is also set, beside status ``timeout``, when a stream overflows during the TERM
+    grace window (the group is then SIGKILLed at once); the status keeps the first reason.
     ``spawn_failed``: the program could not be started; ``error`` says why.
     ``stdout`` and ``stderr`` are raw bytes, never decoded here.
     """
@@ -275,12 +301,13 @@ class _Supervisor:
         self.pgid = proc.pid  # start_new_session: the child leads a group with its own pid
         self.deadline = deadline
         self.t0 = t0
-        self.sel = selectors.DefaultSelector()
+        self.sel: selectors.BaseSelector | None = None
         self.pending = memoryview(payload)
         self.stdin_fd: int | None = None
         self.pipes: list[_Pipe] = []  # still open
         self.all_pipes: list[_Pipe] = []
         self.reaped = False
+        self.first_over: Literal["stdout", "stderr"] | None = None
 
     # The group id is this process's pid. It cannot be reused while the leader is unreaped
     # (even as a zombie), so every signal is sent before the leader is reaped, never after.
@@ -289,17 +316,19 @@ class _Supervisor:
             return
         try:
             os.killpg(self.pgid, sig)
-        except ProcessLookupError:
-            pass
+        except OSError:
+            pass  # ProcessLookupError (group gone) or PermissionError: nothing more to do
 
     def _leader_exited(self) -> bool:
         try:
             return os.waitid(os.P_PID, self.pgid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
         except ChildProcessError:
+            self.reaped = True  # someone else reaped it: the group id may be reused, never signal
             return True
 
     def _close_stdin(self) -> None:
         if self.stdin_fd is not None:
+            assert self.sel is not None
             self.sel.unregister(self.stdin_fd)
             self.stdin_fd = None
         if self.proc.stdin is not None:
@@ -309,6 +338,7 @@ class _Supervisor:
                 pass  # EPIPE on flushing a closed pipe: ignored by design
 
     def _close_pipe(self, pipe: _Pipe) -> None:
+        assert self.sel is not None
         self.sel.unregister(pipe.fd)
         self.pipes.remove(pipe)
         stream = self.proc.stdout if pipe.name == "stdout" else self.proc.stderr
@@ -332,6 +362,8 @@ class _Supervisor:
         if len(pipe.buf) > pipe.cap:
             del pipe.buf[pipe.cap :]
             pipe.over = True
+            if self.first_over is None:
+                self.first_over = pipe.name
 
     def _write(self) -> None:
         assert self.stdin_fd is not None
@@ -348,28 +380,42 @@ class _Supervisor:
 
     def run(self) -> RunResult:
         try:
-            return self._loop()
+            result = self._loop()
         except BaseException:
-            self._signal_group(signal.SIGKILL)
-            self._release()
+            try:
+                self._signal_group(signal.SIGKILL)
+            finally:
+                self._release()
             raise
+        if self.proc.returncode is None:
+            raise RuntimeError(f"could not reap child pid {self.pgid}")
+        return result
 
     def _release(self) -> None:
         """Close every pipe and reap the leader (bounded); used on every exit path."""
-        self._close_stdin()
-        for pipe in list(self.pipes):
-            self._close_pipe(pipe)
-        self.sel.close()
-        if not self.reaped:
+        try:
+            self._close_stdin()
+        finally:
             try:
-                self.proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                return
-            self.reaped = True
+                for stream in (self.proc.stdin, self.proc.stdout, self.proc.stderr):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except OSError:
+                            pass
+                if self.sel is not None:
+                    self.sel.close()
+            finally:
+                try:
+                    self.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    return
+                self.reaped = True
 
     def _loop(self) -> RunResult:
         proc = self.proc
         assert proc.stdin and proc.stdout and proc.stderr
+        self.sel = selectors.DefaultSelector()
         for stream in (proc.stdin, proc.stdout, proc.stderr):
             os.set_blocking(stream.fileno(), False)
         self.pipes = [
@@ -399,13 +445,15 @@ class _Supervisor:
                         self._read(key.data)
             else:
                 time.sleep(_POLL_SLICE)
-            if reason is None and any(p.over for p in self.pipes):
+            over_now = any(p.over for p in self.all_pipes)
+            if reason is None and over_now:
                 reason = "overflow"
             exited = self._leader_exited()
             now = self.clock.monotonic()
             if phase != "final":
-                if reason == "overflow" or exited:
-                    # Overflow: kill at once. Exit: whatever is left in the group is orphaned.
+                if over_now or exited:
+                    # Overflow (also during the TERM grace): kill at once. Exit: whatever is
+                    # left in the group is orphaned.
                     self._signal_group(signal.SIGKILL)
                     phase = "final"
                 elif phase == "run" and now >= self.deadline:
@@ -423,11 +471,6 @@ class _Supervisor:
         self._signal_group(signal.SIGKILL)  # idempotent; every path to here already sent it
         self._release()
         stdout, stderr = (bytes(p.buf) for p in self.all_pipes)
-        over: Literal["stdout", "stderr"] | None = None
-        for pipe in self.all_pipes:
-            if pipe.over:
-                over = pipe.name
-                break
         returncode = proc.returncode
         if reason == "overflow":
             status: RunStatus = "overflow"
@@ -443,7 +486,7 @@ class _Supervisor:
             signal=-returncode if returncode is not None and returncode < 0 else None,
             stdout=stdout,
             stderr=stderr,
-            overflow=over,
+            overflow=self.first_over,
             pid=self.pgid,
             elapsed=self.clock.monotonic() - self.t0,
         )
