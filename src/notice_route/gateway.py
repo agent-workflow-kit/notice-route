@@ -22,6 +22,7 @@ import secrets
 import select
 import selectors
 import signal
+import sqlite3
 import stat
 import subprocess
 import threading
@@ -46,6 +47,8 @@ __all__ = [
     "POLL_INTERVAL",
     "RunResult",
     "SYSTEM_TZ_DIRS",
+    "StateError",
+    "StateView",
     "SystemClock",
     "STDERR_LIMIT",
     "STDOUT_LIMIT",
@@ -217,6 +220,24 @@ class UnsafePathError(Exception):
         self.path = path
 
 
+class StateError(Exception):
+    """``state.db`` cannot be read (unsafe path, corrupt, not the expected schema): exit 1."""
+
+
+@dataclass(frozen=True)
+class StateView:
+    """What ``validate`` reads from ``state.db``, read-only (``exists`` False: no database)."""
+
+    exists: bool = False
+    flush_last: float | None = None
+    flush_env_missing: float | None = None
+    surfaced_today: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    queue_by_destination: Mapping[str, int] = field(default_factory=dict)
+
+
+_NOTIFIER_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
 class ZoneError(Exception):
     """A time zone cannot be loaded from the system database (the message never names it)."""
 
@@ -348,6 +369,7 @@ class Gateway:
     tz_dirs: tuple[str, ...] = SYSTEM_TZ_DIRS
     stdin_fd: int = 0
     environ: Callable[[], Mapping[str, str]] = _system_environ
+    exec_check_from: str = "/"  # directories above this one are trusted (tests only)
 
     def wall(self) -> float:
         return self.clock.wall()
@@ -714,6 +736,163 @@ class Gateway:
             except Exception:  # any parse failure is one outcome; its text is not kept
                 raise ZoneError("not a time zone file") from None
         raise ZoneError("unknown time zone")
+
+    def _dirs_trusted(self, directory: str) -> bool:
+        """Every directory from ``exec_check_from`` down to ``directory`` (both resolved) is owned
+        by the user or root and not group- or world-writable."""
+        uid = os.geteuid()
+        floor = os.path.realpath(self.exec_check_from)
+        current = directory
+        while True:
+            info = os.stat(current)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid not in (uid, 0)
+                or info.st_mode & 0o022
+            ):
+                return False
+            if current == floor or current == "/":
+                return True
+            parent = os.path.dirname(current)
+            if parent == current:
+                return True
+            current = parent
+
+    def check_exec(self, path: str) -> bool:
+        """``cmd_ok``: ``path`` resolved with ``realpath`` is a regular file owned by the user or
+        root, not group- or world-writable, without setuid or setgid, in directories that are
+        owned by the user or root and not group- or world-writable. Runs nothing."""
+        try:
+            resolved = os.path.realpath(path, strict=True)
+            info = os.stat(resolved)
+            uid = os.geteuid()
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid not in (uid, 0)
+                or info.st_mode & (0o022 | stat.S_ISUID | stat.S_ISGID)
+            ):
+                return False
+            return self._dirs_trusted(os.path.dirname(resolved))
+        except (OSError, ValueError):
+            return False
+
+    def check_env_file(self, path: str) -> bool:
+        """``cron.env_file``: by ``lstat`` a regular file (not a symlink) owned by the user with
+        mode 0600, in a directory chain that passes the directory rule of :meth:`check_exec`.
+        The file is never opened."""
+        try:
+            if not path.startswith("/"):
+                return False
+            info = os.lstat(path)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                return False
+            return self._dirs_trusted(os.path.realpath(os.path.dirname(path)))
+        except (OSError, ValueError):
+            return False
+
+    def read_state(self) -> StateView:
+        """Read ``<home>/.local/state/notice-route/state.db`` read-only; an empty view when the
+        directory or the file is missing. Raises :class:`HomeError` and :class:`StateError`.
+
+        TODO(#14): align the queries with ``store.py``'s schema once it exists.
+        """
+        directory = str(self.home_dir()).rstrip("/") + "/.local/state/notice-route"
+        try:
+            handle = self.open_config_dir(directory)
+        except (UnsafePathError, OSError, ValueError):
+            raise StateError("unsafe state directory") from None
+        if handle is None:
+            return StateView()
+        with handle:
+            try:
+                # the spec: no group or world access (open_config_dir only refuses writes)
+                if os.fstat(handle.fd).st_mode & 0o077:
+                    raise StateError("unsafe state directory")
+            except OSError:
+                raise StateError("unsafe state directory") from None
+            try:
+                self.open_file(handle, "state.db").close()
+            except FileNotFoundError:
+                return StateView()
+            except (UnsafePathError, OSError):
+                raise StateError("unsafe state.db") from None
+            db_path = handle.path.rstrip("/") + "/state.db"
+            # a read-only open of a WAL database without a -wal file would create -wal and -shm;
+            # such a database holds no uncheckpointed data, so it is opened immutable instead
+            wal_exists = self._exists_in(handle, "state.db-wal")
+            return self._query_state(db_path, immutable=not wal_exists)
+
+    @staticmethod
+    def _exists_in(handle: DirHandle, name: str) -> bool:
+        try:
+            os.stat(name, dir_fd=handle.fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True  # unknown: take the plain read-only path
+        return True
+
+    def _query_state(self, db_path: str, *, immutable: bool = False) -> StateView:
+        day = time.strftime("%Y-%m-%d", time.gmtime(self.wall()))
+        uri = "file:" + db_path.replace("%", "%25").replace("?", "%3f").replace("#", "%23")
+        surfaced: dict[str, list[str]] = {}
+        try:
+            # Accepted race: a writer may create the -wal between the caller's stat and this
+            # open, so immutable=1 can miss its newest rows. The output is advisory and read-only.
+            options = "?mode=ro&immutable=1" if immutable else "?mode=ro"
+            conn = sqlite3.connect(uri + options, uri=True, timeout=5.0)
+            try:
+                meta = {
+                    str(k): v
+                    for k, v in conn.execute(
+                        "SELECT key, value FROM meta WHERE key IN (?, ?)",
+                        ("flush_last", "flush_env_missing"),
+                    )
+                }
+                for dest, code in conn.execute(
+                    "SELECT destination, code FROM surfaced WHERE period LIKE ? ORDER BY rowid",
+                    (day + "%",),
+                ):
+                    if (
+                        isinstance(dest, str)
+                        and isinstance(code, str)
+                        and _NOTIFIER_CODE.fullmatch(code)
+                        and code not in surfaced.setdefault(dest, [])
+                    ):
+                        surfaced[dest].append(code)
+                queue = {
+                    str(d): int(n)
+                    for d, n in conn.execute(
+                        "SELECT d.destination, COUNT(*) FROM queue q "
+                        "JOIN deliveries d ON d.id = q.delivery_id "
+                        "WHERE d.destination IS NOT NULL GROUP BY d.destination"
+                    )
+                }
+            finally:
+                conn.close()
+        except (sqlite3.Error, ValueError, OverflowError):
+            raise StateError("state.db cannot be read") from None
+
+        def number(value: object) -> float | None:
+            if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+                return None
+            try:
+                result = float(value)
+            except ValueError:
+                return None
+            return result if math.isfinite(result) else None
+
+        return StateView(
+            True,
+            number(meta.get("flush_last")),
+            number(meta.get("flush_env_missing")),
+            {d: tuple(c) for d, c in surfaced.items() if c},
+            queue,
+        )
 
     def env_present(self, name: str) -> bool:
         """Whether ``name`` is in the environment, even with an empty value."""
