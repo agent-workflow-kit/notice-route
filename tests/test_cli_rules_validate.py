@@ -277,9 +277,7 @@ def test_global_flags_work_before_and_after_the_command(
 
 
 def test_verbose_with_quiet_is_a_usage_error(gw: Gateway) -> None:
-    with pytest.raises(SystemExit) as exc:
-        main(["rules", "--verbose", "--quiet"], gw)
-    assert exc.value.code == 2
+    assert main(["rules", "--verbose", "--quiet"], gw) == 2
 
 
 def test_example_config_and_drop_in_pass_both_commands(
@@ -383,9 +381,7 @@ def test_config_flag_is_refused_before_the_command_and_by_unknown_commands(
     gw: Gateway,
 ) -> None:
     for argv in (["--config", "/x", "rules"], ["bogus", "--config", "/x"]):
-        with pytest.raises(SystemExit) as exc:
-            main(argv, gw)
-        assert exc.value.code == 2
+        assert main(argv, gw) == 2
     assert main(["send", "--config", "/x"], gw) == 2  # send refuses it itself (exit 2 usage)
 
 

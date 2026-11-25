@@ -19,7 +19,7 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, NoReturn
 
 from . import __version__
 from .config import ConfigError
@@ -54,10 +54,19 @@ def _add_config_flag(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", metavar="PATH", default=None, help="config file to use")
 
 
+class _ArgvError(Exception):
+    """The command line could not be parsed; carries no text (argparse would echo the input)."""
+
+
+class _Parser(argparse.ArgumentParser):
+    """An argument parser whose usage errors never print argparse's text, which echoes argv."""
+
+    def error(self, message: str) -> NoReturn:
+        raise _ArgvError
+
+
 def build_parser() -> argparse.ArgumentParser:
-    # TODO(#22): argparse usage errors print plain text; under --json they must emit the
-    # {"error": {"code": "usage", ...}} envelope with exit 2 (interface.md, error envelope).
-    parser = argparse.ArgumentParser(prog=PROG, description=DESCRIPTION, allow_abbrev=False)
+    parser = _Parser(prog=PROG, description=DESCRIPTION, allow_abbrev=False)
     parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")
     _add_global_flags(parser, top=True)
     commands = parser.add_subparsers(dest="command", metavar="<command>")
@@ -105,6 +114,8 @@ class _OutputClosed(Exception):
 
 
 def _out(text: str) -> None:
+    if sys.stdout is None:  # closed with `>&-`
+        raise _OutputClosed
     try:
         sys.stdout.write(text)
         sys.stdout.flush()
@@ -113,6 +124,8 @@ def _out(text: str) -> None:
 
 
 def _err(text: str) -> None:
+    if sys.stderr is None:
+        return
     sys.stderr.write(text)
     sys.stderr.flush()
 
@@ -122,8 +135,9 @@ def _json(document: object) -> None:
 
 
 def _safe(value: object) -> str:
-    """Text for a terminal: ASCII only, control characters escaped."""
-    text = str(value).encode("ascii", "backslashreplace").decode("ascii")
+    """Text for a terminal: ASCII only, control characters escaped, a backslash doubled so an
+    escape never reads as the text itself."""
+    text = str(value).replace("\\", "\\\\").encode("ascii", "backslashreplace").decode("ascii")
     return "".join(c if c.isprintable() else f"\\x{ord(c):02x}" for c in text)
 
 
@@ -278,7 +292,7 @@ def _run_dry_run(args: argparse.Namespace, gateway: Gateway) -> int:
         _json(doc)
     else:
         _dry_run_text(doc)
-    if config is None and not args.quiet:
+    if doc["reason"] == "unconfigured" and not args.quiet:
         _err(f"{PROG}: no config\n")
     return code
 
@@ -298,9 +312,17 @@ def _refused(exc: PayloadError | UsageError, *, as_json: bool) -> int:
 
 
 def main(argv: Sequence[str] | None = None, gateway: Gateway | None = None) -> int:
+    gateway = Gateway() if gateway is None else gateway
     try:
-        return _main(argv, gateway)
+        code = _main(argv, gateway)
+        if sys.stdout is not None:
+            try:
+                sys.stdout.flush()
+            except OSError:
+                raise _OutputClosed from None
+        return code
     except _OutputClosed:
+        gateway.discard_stdout()
         try:
             _err(f"{PROG}: internal: cannot write to standard output\n")
         except OSError:
@@ -310,18 +332,22 @@ def main(argv: Sequence[str] | None = None, gateway: Gateway | None = None) -> i
 
 def _main(argv: Sequence[str] | None, gateway: Gateway | None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+        if args.command is not None and args.verbose and args.quiet:
+            parser.error("--verbose and --quiet cannot be combined")
+    except _ArgvError:
+        given = sys.argv[1:] if argv is None else argv
+        return _refused(UsageError("argv"), as_json="--json" in given)
     if args.command is None:
         parser.print_help(sys.stderr)
         return EXIT_USAGE
-    if args.verbose and args.quiet:
-        parser.error("--verbose and --quiet cannot be combined")
     gateway = Gateway() if gateway is None else gateway
     try:
         if args.command == "rules":
             return _run_rules(args, gateway)
         if args.command == "send" and args.config is not None:
-            raise UsageError("flags")  # send never takes --config, --dry-run included
+            raise UsageError("config")  # send never takes --config, --dry-run included
         if args.command == "test" or (args.command == "send" and args.dry_run):
             return _run_dry_run(args, gateway)
         if args.command == "send":

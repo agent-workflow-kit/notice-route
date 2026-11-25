@@ -21,13 +21,12 @@ def test_no_arguments_returns_usage_error(capsys: pytest.CaptureFixture[str]) ->
 def test_abbreviated_flag_is_refused_with_exit_2(
     flag: str, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    with pytest.raises(SystemExit) as exc:
-        main([flag])
-    assert exc.value.code == 2
-    assert "unrecognized arguments" in capsys.readouterr().err
+    assert main([flag]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "notice-route: usage: the command line cannot be used\n"
 
 
-def test_unknown_flag_is_refused_with_exit_2() -> None:
-    with pytest.raises(SystemExit) as exc:
-        main(["--no-such-flag"])
-    assert exc.value.code == 2
+def test_unknown_flag_is_refused_with_exit_2(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["--no-such-flag"]) == 2
+    assert capsys.readouterr().err == "notice-route: usage: the command line cannot be used\n"

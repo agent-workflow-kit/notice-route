@@ -181,6 +181,8 @@ USAGE_MESSAGES = {
     "labels": "too many --label flags",
     "terminal": "standard input is a terminal",
     "input_file": "the --file path cannot be used",
+    "argv": "the command line cannot be used",
+    "config": "--config is not accepted by this command",
 }
 # The pointers a refusal may carry: fixed strings, never built from the input.
 POINTERS = frozenset(
@@ -220,12 +222,15 @@ class PayloadError(Exception):
         }
 
 
+UsageReason = Literal["flags", "labels", "terminal", "input_file", "argv", "config"]
+
+
 class UsageError(Exception):
     """Exit 2, code ``usage``: a flag combination or a ``--file`` path that cannot be used."""
 
     exit_code = 2
 
-    def __init__(self, reason: Literal["flags", "labels", "terminal", "input_file"]) -> None:
+    def __init__(self, reason: UsageReason) -> None:
         super().__init__(USAGE_MESSAGES[reason])
         self.reason = reason
         self.message = USAGE_MESSAGES[reason]
