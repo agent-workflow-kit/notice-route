@@ -33,12 +33,14 @@ __all__ = [
     "EVENT_IDS_CAP",
     "EVICT_BATCH",
     "MESSAGES",
+    "MIN_SQLITE",
     "SEND_BUSY_S",
     "Store",
     "StoreError",
     "open_readonly",
     "open_store",
     "trim_deliveries",
+    "TRIM_EVENT_IDS_SQL",
     "trim_event_ids",
 ]
 
@@ -49,7 +51,16 @@ EVENT_IDS_CAP = 100_000
 EVICT_BATCH = 16
 
 Reason = Literal[
-    "unsafe", "corrupt", "foreign", "newer", "older", "readonly", "busy", "migration", "internal"
+    "unsafe",
+    "corrupt",
+    "foreign",
+    "newer",
+    "older",
+    "readonly",
+    "busy",
+    "migration",
+    "internal",
+    "sqlite_old",
 ]
 
 MESSAGES: dict[str, str] = {
@@ -62,7 +73,9 @@ MESSAGES: dict[str, str] = {
     "busy": "state database is busy",
     "migration": "state database migration failed",
     "internal": "state database cannot be used",
+    "sqlite_old": "SQLite 3.35 or newer is required",
 }
+MIN_SQLITE = (3, 35, 0)  # RETURNING (the dedup upserts)
 
 # SQLite primary result codes
 _BUSY, _LOCKED, _READONLY, _PERM, _CANTOPEN = 5, 6, 8, 3, 14
@@ -230,6 +243,8 @@ def _open(
     readonly: bool,
     migrations: tuple[Migration, ...],
 ) -> Store | None:
+    if not readonly and sqlite3.sqlite_version_info < MIN_SQLITE:  # RETURNING is a write need
+        raise StoreError("sqlite_old")
     if not (
         isinstance(busy_timeout, (int, float))
         and not isinstance(busy_timeout, bool)
@@ -498,6 +513,14 @@ def trim_deliveries(
     return len(ids)
 
 
+# Oldest first by row id (indexed: no sort). dedup.record_event_id gives a replaced record a
+# fresh id, so the id order is the order of the last write.
+TRIM_EVENT_IDS_SQL = (
+    "DELETE FROM event_ids WHERE id IN"
+    " (SELECT id FROM event_ids WHERE id IS NOT ? ORDER BY id LIMIT ?)"
+)
+
+
 def trim_event_ids(
     conn: sqlite3.Connection,
     *,
@@ -506,14 +529,9 @@ def trim_event_ids(
     keep_id: int | None = None,
 ) -> int:
     """As :func:`trim_deliveries` for ``event_ids`` (nothing protects an event id row
-    but ``keep_id``, the row the caller just inserted).
-    TODO(#17): call it where an event id is recorded."""
+    but ``keep_id``, the row the caller just inserted). ``dedup.record_event_id`` calls it."""
     want = _excess(conn, "event_ids", cap, batch)
     if want == 0:
         return 0
-    cur = conn.execute(
-        "DELETE FROM event_ids WHERE id IN"
-        " (SELECT id FROM event_ids WHERE id IS NOT ? ORDER BY id LIMIT ?)",
-        (keep_id, want),
-    )
+    cur = conn.execute(TRIM_EVENT_IDS_SQL, (keep_id, want))
     return cur.rowcount

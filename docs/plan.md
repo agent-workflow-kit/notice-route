@@ -27,7 +27,8 @@ This plan implements [interface.md](interface.md) and [design.md](design.md). It
 | `window.py` | 3 | quiet-hour membership and window ends (pure functions) |
 | `store.py` | 3 | SQLite access, migrations, bound parameters |
 | `queue.py` | 3 | queue rows, claims, leases, the cap and eviction |
-| `decide.py` | 3 | the per-destination decision order, dedup and rate statements |
+| `dedup.py` | 3 | the repeat and redelivery checks, the lifetime of their records |
+| `decide.py` | 3 | the per-destination decision order; calls `dedup.py` for dedup, holds the rate statements |
 | `notifier.py` | 4 | building the call, the child process, classification, the retry schedule |
 | `log.py` | 4 | the public `log.jsonl` |
 | `flush.py` | 5 | due rows, digests, delivery, heartbeat |

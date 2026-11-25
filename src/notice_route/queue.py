@@ -28,8 +28,8 @@ Rules (docs/interface.md: Deferral and digest, Files; docs/design.md: Queue and 
 
 Seams, owned by later issues:
 
-TODO(#17): a dedup or event-id record of an evicted delivery is deleted with it (``dedup`` and
-``event_ids`` rows by ``delivery_id``); the statements do not exist yet.
+A dedup or event-id record of an evicted delivery is deleted with it, in the same transaction
+(:func:`notice_route.dedup.release`, #17).
 TODO(#27): an ``overflow`` eviction is surfaced once per destination per UTC hour (the caller
 gets the evicted rows back and inserts the ``surfaced`` row in the same transaction).
 TODO(#23): flush step 4 and the prune of #26 (expire unclaimed rows 24 hours old or more, never a
@@ -49,6 +49,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Literal, get_args
 
+from . import dedup
 from .store import DELIVERIES_CAP, trim_deliveries
 from .validate import LEVELS, QuietWindow
 from .window import window_end
@@ -363,6 +364,7 @@ def enforce_cap(
             " deliver_after = NULL WHERE id = ?",
             (delivery_id,),
         )
+        dedup.release(conn, delivery_id)
         evicted.append(Evicted(queue_id, delivery_id, destination, kind, level))
     return tuple(evicted)
 
