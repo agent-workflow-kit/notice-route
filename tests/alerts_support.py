@@ -62,8 +62,10 @@ class Setup:
             "SELECT destination, code, period, delivery_id, processed FROM surfaced ORDER BY id"
         )
 
-    def flush(self, *extra: str) -> tuple[int, dict[str, Any], str]:
-        return flush(self.rig, *extra)
+    def flush(
+        self, *extra: str, env: dict[str, str] | None = None
+    ) -> tuple[int, dict[str, Any], str]:
+        return flush(self.rig, *extra, env=env)
 
     def alerts(self) -> list[tuple[Any, ...]]:
         return self.rig.query(
