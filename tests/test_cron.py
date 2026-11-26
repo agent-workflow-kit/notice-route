@@ -1,4 +1,4 @@
-"""``cron install`` and ``cron uninstall`` (#28), through the real CLI entry with the fake crontab."""
+"""``cron install`` and ``cron uninstall`` (#28), through the real CLI with the fake crontab."""
 
 from __future__ import annotations
 
@@ -394,6 +394,7 @@ def test_an_unsafe_env_file_is_refused_as_usage(rig: Rig, problem: str) -> None:
 def test_the_env_file_is_never_opened_or_echoed(rig: Rig, opened_names: list[str]) -> None:
     env_file = rig.env_file()
     rig.config({"cron": {"env_file": str(env_file)}})
+    opened_names.clear()  # the test's own writes above
     code, out, err = rig.run("install", "--verbose")
     assert code == 0
     assert "cron.env" not in {os.path.basename(n) for n in opened_names}

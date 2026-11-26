@@ -74,7 +74,9 @@ class Guard:
 def _resolve(name: str, search_path: str | None) -> str:
     if "/" in name:
         return os.path.realpath(name)
-    found = shutil.which(name, path=search_path if search_path is not None else os.environ.get("PATH"))
+    found = shutil.which(
+        name, path=search_path if search_path is not None else os.environ.get("PATH")
+    )
     return os.path.realpath(found) if found else name
 
 
