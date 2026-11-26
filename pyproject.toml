@@ -42,7 +42,10 @@ pythonVersion = "3.12"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["live: needs real models/hosts/credentials; never run in CI"]
+markers = [
+    "live: needs real models/hosts/credentials; never run in CI",
+    "live_local: a live test that needs no notifier, credential or network (real shell and processes only)",
+]
 addopts = "-m 'not live'"
 
 [tool.semantic_release]
