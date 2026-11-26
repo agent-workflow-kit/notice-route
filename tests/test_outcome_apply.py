@@ -30,7 +30,7 @@ EVENT_DIGEST = "c" * 64
 
 
 def retry_at(attempts: int) -> int | None:
-    """A stand-in for the schedule of #25: 60 s, then 300 s, and none after 3 attempts."""
+    """A stand-in for the schedule: 60 s, then 300 s, and none after 3 attempts."""
     return {1: NOW + 60, 2: NOW + 300}.get(attempts)
 
 

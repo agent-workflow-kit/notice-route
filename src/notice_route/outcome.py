@@ -39,7 +39,7 @@ Choices where the interface is silent (the narrower reading):
 - ``reason`` of a delivery is left as it was for outcomes that set none (a ``sent`` after
   ``quiet`` keeps ``quiet``), which also keeps "already link_refused" true on later calls.
 
-TODO(#25): the real retry schedule and attempt caps; ``retry_at`` is the seam.
+The retry schedule and attempt caps are :mod:`notice_route.retry`; ``retry_at`` is the seam.
 TODO(#27): the caller inserts the ``surfaced`` row for ``failed`` and ``unknown`` ends.
 ``send.py`` (#22) logs the result of a call that was not applied, and treats an exception escaping
 ``call_notifier`` through :func:`record_escaped`.
@@ -280,7 +280,7 @@ def apply_outcome(
 ) -> Applied:
     """Record ``outcome`` for the claimed ``row`` inside a ``Store.write`` transaction.
 
-    ``retry_at(attempts)`` is the retry schedule (#25): the ``deliver_after`` of a retry after
+    ``retry_at(attempts)`` is the retry schedule (:mod:`notice_route.retry`): the ``deliver_after`` of a retry after
     ``attempts`` calls (refusal retries included), or None when the attempts are used up (the row
     then ends ``failed``, code ``retries_exhausted``, unless a second or uncurable refusal ended it
     first with the refusal code). ``count_hour`` is the UTC hour start in which the hourly count of
