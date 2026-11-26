@@ -44,7 +44,7 @@ import math
 import sqlite3
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from . import log as logmod
@@ -59,11 +59,20 @@ from .decide import (  # pyright: ignore[reportPrivateUsage]
     labels_text,
 )
 from .dryrun import make_notice
+from .fallback import FallbackSeam, make_seam
 from .gateway import DirHandle, Gateway, SignalTrap
 from .links import build_links
 from .match import decide as match_decide
 from .notify import CallResult, call_notifier
-from .outcome import LOCK_BUSY, Applied, Outcome, apply_outcome, classify, record_escaped
+from .outcome import (
+    LOCK_BUSY,
+    Applied,
+    FallbackRoute,
+    Outcome,
+    apply_outcome,
+    classify,
+    record_escaped,
+)
 from .payload import Notification
 from .queue import Evicted, Lease, QueueRow, insert_delivery, release_claims
 from .render import render
@@ -188,6 +197,18 @@ class Seams:
     call: Callable[..., CallResult] = call_notifier
     retry_schedule: Callable[[str, int], Callable[[int], int | None]] = default_retry_schedule
     surface: Callable[[sqlite3.Connection, SurfaceEvent], None] = surface_event
+    # the fallback chain (docs/design.md C-63): set by ``with_fallback`` for a config that has a
+    # ``fallback`` key, ``None`` otherwise (then nothing runs)
+    fallback: FallbackSeam | None = None
+
+
+def with_fallback(seams: Seams, gateway: Gateway, config: Config) -> Seams:
+    """``seams`` with the fallback seam of ``config`` installed; a seam already set (a test's) is
+    kept and a config without a ``fallback`` key leaves ``seams`` as it is."""
+    if seams.fallback is not None:
+        return seams
+    seam = make_seam(gateway, config)
+    return seams if seam is None else replace(seams, fallback=seam)
 
 
 @dataclass
@@ -351,6 +372,7 @@ def run_send(
         doc.update(outcome="no_op", reason="disabled")
         return _finish(SendResult(22, doc), gateway, started)
     decision = match_decide(config.rules, n)
+    seams = with_fallback(seams, gateway, config)
     trap.armed = False
     with open_store(gateway, busy_timeout=SEND_BUSY_S) as store, gateway.open_state_dir() as state:
         ctx = _Context(
@@ -709,6 +731,18 @@ def _record_one(
         entry = _applied_entry(dest.name, applied)
     entries[dest.name] = entry
     ctx.log(entry)
+    if applied.fallback is not None:
+        _log_fallback(ctx, result, applied.fallback)
+
+
+def _log_fallback(ctx: _Context, result: SendResult, route: FallbackRoute) -> None:
+    """The log line of a fallback decision, for the fallback destination (the ``--json`` document
+    lists only the rule's destinations). A suppressed fallback writes nothing."""
+    if route.decision == "fault":
+        result.warnings.append("a fallback could not be routed")
+    elif route.outcome is not None and route.decision != "suppress":
+        code = "overflow" if route.reason == "overflow" else None
+        ctx.log(_entry(route.destination, route.outcome, reason=route.reason, code=code))
 
 
 def record_result(
@@ -758,6 +792,10 @@ def record_result(
             if applied.applied:  # rows the cap dropped when this result was requeued
                 for event in evicted_events(conn, dest, applied.evicted, lease.now):
                     seams.surface(conn, event)
+            if applied.applied and applied.outcome == "failed" and seams.fallback is not None:
+                route = seams.fallback(conn, dest, row, lease)  # never raises: see fallback.py
+                if route is not None:
+                    applied = replace(applied, fallback=route)
             return applied
 
     return with_retry(gateway, row, write)

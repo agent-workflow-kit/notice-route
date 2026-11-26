@@ -23,7 +23,7 @@ Step = str | Callable[[sqlite3.Connection], None]
 Migration = Sequence[Step]
 
 # Tables the store relies on (``_check_tables``): the seven of version 1, the override table of
-# version 2 and the hook outbox of version 3.
+# version 2 and the hook outbox of version 3 (version 4 adds a column, no table).
 TABLES = (
     "deliveries",
     "queue",
@@ -185,5 +185,10 @@ _V3: tuple[str, ...] = (
     "CREATE INDEX hook_outbox_due ON hook_outbox (next_attempt)",
 )
 
-MIGRATIONS: tuple[Migration, ...] = (_V1, _V2, _V3)
+# Version 4 (docs/design.md C-63): a fallback delivery names the failed delivery it replaces. NULL
+# for every other row; there is no foreign key (a deliveries row may be trimmed, and a chain whose
+# parent is gone gets no further fallback).
+_V4: tuple[str, ...] = ("ALTER TABLE deliveries ADD COLUMN fallback_of INTEGER",)
+
+MIGRATIONS: tuple[Migration, ...] = (_V1, _V2, _V3, _V4)
 SCHEMA_VERSION = len(MIGRATIONS)

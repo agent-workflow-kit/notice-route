@@ -168,6 +168,10 @@ def record_digest(
                 )
                 if a.applied:
                     a = _reason_digest(conn, m, a, outcome)
+                    if a.outcome == "failed" and seams.fallback is not None:
+                        route = seams.fallback(conn, dest, m, lease)
+                        if route is not None:
+                            a = replace(a, fallback=route)
                     if not surfaced and a.outcome in ("failed", "unknown"):
                         surfaced = True
                         assert a.outcome is not None

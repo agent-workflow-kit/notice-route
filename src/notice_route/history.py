@@ -129,7 +129,7 @@ class HistoryResult:
 _COLUMNS = (
     "d.id, d.ts, d.source, d.hook, d.object_id, d.rule, d.destination, d.level, d.outcome,"
     " d.reason, d.code, d.attempts, d.count, d.event_id, d.dedupe, d.labels, d.surfaced,"
-    " d.deliver_after, d.title"
+    " d.deliver_after, d.title, d.fallback_of"
 )
 _LABEL_CLAUSE = (
     "CASE WHEN json_valid(d.labels) THEN"
@@ -221,7 +221,7 @@ def _document(row: tuple[object, ...]) -> dict[str, Any] | None:
     """The ``--json`` object of one row, or ``None`` when a column is outside its grammar."""
     (
         rid, ts, source, hook, object_id, rule, destination, level, outcome, reason, code,
-        attempts, count, event_id, dedupe, labels, surfaced, deliver_after, title,
+        attempts, count, event_id, dedupe, labels, surfaced, deliver_after, title, fallback_of,
     ) = row  # fmt: skip
     ok: dict[str, Any] = {
         "id": _int(rid, 1),
@@ -239,6 +239,7 @@ def _document(row: tuple[object, ...]) -> dict[str, Any] | None:
         "count": _int(count, 1),
         "dedupe": _text(dedupe, DIGEST, null=True),
         "deliver_after": _int(deliver_after, 0, null=True),
+        "fallback_of": _int(fallback_of, 1, null=True),
     }
     if any(v is False for v in ok.values()):
         return None
@@ -282,6 +283,7 @@ def _document(row: tuple[object, ...]) -> dict[str, Any] | None:
         "surfaced": bool(surfaced),
         "deliver_after": ok["deliver_after"],
         "title": title[:100] if isinstance(title, str) else None,
+        "fallback_of": ok["fallback_of"],
     }
 
 
