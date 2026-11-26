@@ -1,0 +1,26 @@
+[
+  {
+    "id": 1,
+    "ts": "2023-11-11T22:13:20.000Z",
+    "source": "alpha",
+    "hook": null,
+    "object_id": 5,
+    "rule": "r1",
+    "destination": "chat",
+    "level": "info",
+    "outcome": "sent",
+    "reason": null,
+    "code": null,
+    "attempts": 0,
+    "count": 1,
+    "event_id": 17,
+    "dedupe": null,
+    "labels": [
+      "repo=a",
+      "team=x"
+    ],
+    "surfaced": false,
+    "deliver_after": null,
+    "title": "Build ok"
+  }
+]

@@ -187,6 +187,8 @@ USAGE_MESSAGES = {
     "actor": "--actor must be human:<name> or auto:<name>",
     "decision_id": "--decision-id takes one value of letters, digits and ._:-",
     "destination": "--destination names a destination that is not configured",
+    "filter": "a history filter is given twice or is not valid",
+    "limit": "--limit takes a whole number from 1 to 1000",
 }
 # The pointers a refusal may carry: fixed strings, never built from the input.
 POINTERS = frozenset(
@@ -237,6 +239,8 @@ UsageReason = Literal[
     "actor",
     "decision_id",
     "destination",
+    "filter",
+    "limit",
 ]
 
 
