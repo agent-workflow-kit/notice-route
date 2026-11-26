@@ -151,9 +151,9 @@ def test_a_hook_that_cannot_be_started_is_a_warning_only(rig: Rig) -> None:
 
 
 def _speed_up_once_started(rig: Rig, hook: Any, rate: float) -> None:
-    """Set the rig clock's rate once the hook has logged that it started (bounded wait)."""
+    """Set the rig clock's rate once the hook has ignored TERM and spawned its descendant."""
     try:
-        hook.wait_for("run", timeout=10)
+        hook.wait_for("grandchild", timeout=10)
     finally:
         rig.clock.rate = rate
 
@@ -161,20 +161,26 @@ def _speed_up_once_started(rig: Rig, hook: Any, rate: float) -> None:
 def test_a_hook_is_killed_at_its_timeout_and_the_result_is_unchanged(
     rig: Rig, make_hook: MakeHook
 ) -> None:
-    # The hook's deadline counts from its process start, so a hook that starts slowly (a cold
-    # interpreter on a loaded machine) must still get to run before the clock speeds up: the
-    # clock runs at its real rate until the hook has logged its start, then at 50x (one second of
-    # hook time is 20 ms). A fixed 50x from the start killed the slow starter before it logged.
+    # A hook that starts slowly (a cold interpreter on a loaded machine) must still get to set up
+    # before the clock is sped up: the clock runs at its real rate until the hook has ignored TERM
+    # and spawned its descendant (the "grandchild" record), then the rate becomes 50x. Changing
+    # RigClock.rate rescales all time since the rig was created, so the clock jumps forward and
+    # the 2 s deadline is already past at the switch. The test proves the hook is killed once its
+    # timeout has elapsed, whatever it ignores; it makes no per-second arithmetic claim.
     h = make_hook(
         start_delay=0.3, sleep=25, ignore_term=True, grandchild={"lifetime": 25, "hold": True}
     )
     s = with_hooks(rig, h, timeout="2s")
     s.fail("boom")
-    speeder = threading.Thread(target=_speed_up_once_started, args=(rig, h, 50.0))
+    speeder = threading.Thread(target=_speed_up_once_started, args=(rig, h, 50.0), daemon=True)
     speeder.start()
     t0 = time.monotonic()
-    code, _, err = s.flush()
-    speeder.join(timeout=15)
+    try:
+        code, _, err = s.flush()
+    finally:
+        speeder.join(timeout=15)
+    assert not speeder.is_alive()
+    h.wait_for("grandchild")
     assert code == 0 and "a post-fail hook failed (timeout)" in err
     assert time.monotonic() - t0 < 10
     run = h.wait_for("run")
@@ -235,10 +241,12 @@ def test_an_async_hook_is_not_waited_for(rig: Rig, make_hook: MakeHook, tmp_path
     s = with_hooks(rig, h, is_async=True)
     s.fail("boom")
     proc = rig.spawn("flush", "--json")
-    t0 = time.monotonic()
     proc.communicate(timeout=20)
     assert proc.returncode == 0
-    assert not marker.exists() and time.monotonic() - t0 < 1.4  # flush ended first
+    assert not marker.exists()  # flush ended first
+    assert "exit" not in [r["event"] for r in h.records()]
+    run = h.wait_for("run")
+    assert alive(run["pid"], run["start"])  # the hook is still running
     h.wait_for("exit", timeout=15)
     assert marker.exists()
     (run,) = h.runs()
