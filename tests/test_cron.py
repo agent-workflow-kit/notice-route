@@ -569,14 +569,15 @@ def test_a_slow_read_does_not_use_up_the_write_timeout(
     assert rig.crontab.kinds() == ["list", "list", "write"]
 
 
-def test_a_slow_crontab_still_installs_under_the_full_timeout(rig: Rig) -> None:
+@pytest.mark.parametrize("kind", ["list", "write"])
+def test_a_slow_crontab_still_installs_under_the_full_timeout(rig: Rig, kind: str) -> None:
     """The fake's ``slow`` behavior only delays: the call then works as usual."""
-    rig.crontab.behave(slow="list", slow_s=0.3)
+    rig.crontab.behave(slow=kind, slow_s=0.3)
     assert rig.run("install")[0] == 0
     assert rig.crontab.table() == block_of(rig)
 
 
-def test_a_write_that_hangs_or_overflows_says_it_may_have_changed(
+def test_a_write_that_hangs_says_it_may_have_changed(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """R13: only a write that exited nonzero is known to have left the table alone."""
@@ -585,6 +586,11 @@ def test_a_write_that_hangs_or_overflows_says_it_may_have_changed(
     rig.crontab.behave(hang="write", hang_s=20)
     err = rig.run("install")[2]
     assert "may have changed" in err and "unchanged" not in err
+
+
+def test_a_write_that_overflows_says_it_may_have_changed(rig: Rig) -> None:
+    """R13: a write whose output overflows the limit is not known to have left the table alone."""
+    rig.crontab.set_table(b"0 0 * * * keep\n")
     rig.crontab.behave(stdout_noise="x" * (gateway_module.STDOUT_LIMIT + 10))
     err = rig.run("install")[2]
     assert "may have changed" in err and "unchanged" not in err
