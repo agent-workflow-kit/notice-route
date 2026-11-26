@@ -119,7 +119,8 @@ cron:
 # also routed through the rules below as source notice-route). It is for scripts; the command runs
 # with sh -c and the router's environment minus the destinations' credential variables. Entries
 # have cmd, timeout (default 30s) and async (default false: flush waits for the hook before it
-# exits). Example, left out:
+# exits). A post-fail hook must not call `notice-route flush` or `send`: either exits 20
+# (hook_recursion). Example, left out:
 #
 # hooks:
 #   post-fail:

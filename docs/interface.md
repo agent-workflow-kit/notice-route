@@ -304,7 +304,7 @@ Wiring hazards: wire either agent-spawn's or claude-session's state hooks to not
 
 ## Config
 
-Keys and defaults; schema in [schemas/config.json](../schemas/config.json). `config.example.yaml` documents every key and `examples/awkit-wiring.yaml` is the drop-in with the rules for the awkit producers; together they are a complete worked configuration, validated against the schema in CI and rendered against the producers' hook examples.
+Keys and defaults; schema in [schemas/config.json](../schemas/config.json). `config.example.yaml` documents every key and `examples/awkit-wiring.yaml` is the drop-in with the rules for the awkit producers; together they are a complete worked configuration, validated against the schema in CI and rendered rule by rule against example payloads of the producers (agent-spawn's derived from its pinned hook examples).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|

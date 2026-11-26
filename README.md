@@ -39,7 +39,7 @@ Specified in [docs/interface.md](docs/interface.md#commands).
 
 ## Configuration
 
-`~/.config/notice-route/config.yaml` plus `config.d/*.yaml`, found only from your home directory in the password database (an environment variable cannot redirect it). The directory and files must be owned by you and not group- or world-writable. [config.example.yaml](config.example.yaml) is a complete worked configuration, and [examples/awkit-wiring.yaml](examples/awkit-wiring.yaml) is the matching `config.d` drop-in with the rules for the awkit producers. Credentials are passed only through the variables a destination names; a send that runs without them is delivered by `flush` from cron, whose env file must hold them (an empty value counts as unset).
+`~/.config/notice-route/config.yaml` plus `config.d/*.yaml`, found only from your home directory in the password database (an environment variable cannot redirect it). The directory and files must be owned by you and not group- or world-writable. [config.example.yaml](config.example.yaml) is a complete worked configuration, and [examples/awkit-wiring.yaml](examples/awkit-wiring.yaml) is the matching `config.d` drop-in with the rules for the awkit producers. CI checks both: they validate as one config offline, and every rule renders against example payloads it matches (`tests/test_example_config.py`); a placeholder that renders missing or excluded fails the build. Credentials are passed only through the variables a destination names; a send that runs without them is delivered by `flush` from cron, whose env file must hold them (an empty value counts as unset).
 
 ## Wiring a producer
 
