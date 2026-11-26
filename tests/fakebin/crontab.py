@@ -17,6 +17,8 @@ Behavior keys (all optional):
 - ``write_exit`` / ``write_stderr``: the same for ``-``; the table is then left untouched.
 - ``huge_list``: ``-l`` prints this many bytes of one line (more than the router's cap).
 - ``hang``: ``list`` or ``write`` sleeps (bounded by ``hang_s``, default 20) instead of working.
+- ``slow``: ``list`` or ``write`` first sleeps ``slow_s`` seconds (default 0.6) and then works
+  normally (a cold start under load, made deterministic).
 - ``mutate_after_list``: ``{"n": 2, "append": "text"}``: right after the n-th ``-l`` has printed
   its table, the stored table gets the text appended (a concurrent editor).
 - ``stdout_noise``: text ``-`` prints on stdout (a real crontab prints nothing).
@@ -62,6 +64,8 @@ def main(argv: list[str], state_dir: str) -> int:
     if kind == "other":
         sys.stderr.write("fake crontab: unsupported call\n")
         return 64
+    if behavior.get("slow") == kind:
+        time.sleep(float(behavior.get("slow_s", 0.6)))
     if behavior.get("hang") == kind:
         time.sleep(float(behavior.get("hang_s", 20)))
         return 0

@@ -526,11 +526,28 @@ def test_a_crontab_found_only_through_a_relative_path_entry_is_ignored(
     assert rig.crontab.calls() == []
 
 
+def only_for_the_write(monkeypatch: pytest.MonkeyPatch, timeout: float) -> None:
+    """Give ``crontab -`` the short ``timeout`` and every other call the product's full one, so a
+    slow cold start of the read (``crontab -l``) on a loaded machine cannot eat the short deadline
+    meant for the call under test (#81)."""
+    full = gateway_module.CRONTAB_TIMEOUT
+    run_crontab = gateway_module.Gateway.run_crontab
+
+    def run(self: Any, args: Any, *, stdin: bytes | None = None) -> Any:
+        monkeypatch.setattr(gateway_module, "CRONTAB_TIMEOUT", timeout if args == ["-"] else full)
+        return run_crontab(self, args, stdin=stdin)
+
+    monkeypatch.setattr(gateway_module.Gateway, "run_crontab", run)
+
+
 @pytest.mark.parametrize("hang", ["list", "write"])
 def test_a_hanging_crontab_times_out_with_exit_1(
     rig: Rig, monkeypatch: pytest.MonkeyPatch, hang: str
 ) -> None:
-    monkeypatch.setattr(gateway_module, "CRONTAB_TIMEOUT", 0.3)
+    if hang == "write":
+        only_for_the_write(monkeypatch, 0.3)
+    else:
+        monkeypatch.setattr(gateway_module, "CRONTAB_TIMEOUT", 0.3)
     rig.crontab.set_table(b"0 0 * * * keep\n")
     rig.crontab.behave(hang=hang, hang_s=20)
     code, _, err = rig.run("install")
@@ -540,16 +557,27 @@ def test_a_hanging_crontab_times_out_with_exit_1(
         assert "unchanged" not in err and "check it" in err
 
 
+def test_a_slow_read_does_not_use_up_the_write_timeout(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression for #81: a read slower than the write's short deadline still reaches the write."""
+    only_for_the_write(monkeypatch, 0.3)
+    rig.crontab.set_table(b"0 0 * * * keep\n")
+    rig.crontab.behave(slow="list", slow_s=0.6, hang="write", hang_s=20)
+    err = rig.run("install")[2]
+    assert "may have changed" in err and "cannot read" not in err
+    assert rig.crontab.kinds() == ["list", "list", "write"]
+
+
 def test_a_write_that_hangs_or_overflows_says_it_may_have_changed(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """R13: only a write that exited nonzero is known to have left the table alone."""
-    monkeypatch.setattr(gateway_module, "CRONTAB_TIMEOUT", 0.3)
+    only_for_the_write(monkeypatch, 0.3)
     rig.crontab.set_table(b"0 0 * * * keep\n")
     rig.crontab.behave(hang="write", hang_s=20)
     err = rig.run("install")[2]
     assert "may have changed" in err and "unchanged" not in err
-    monkeypatch.setattr(gateway_module, "CRONTAB_TIMEOUT", 10.0)
     rig.crontab.behave(stdout_noise="x" * (gateway_module.STDOUT_LIMIT + 10))
     err = rig.run("install")[2]
     assert "may have changed" in err and "unchanged" not in err
