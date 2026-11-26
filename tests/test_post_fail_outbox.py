@@ -62,7 +62,7 @@ def test_a_version_two_database_is_migrated_by_a_flush_and_keeps_its_rows(
     write(rig, "DROP TABLE hook_outbox")
     write(rig, "PRAGMA user_version=2")
     code, doc, err = s.flush()
-    assert code in (0, 22), (doc, err)
+    assert code == 22, (doc, err)
     assert rig.query("PRAGMA user_version") == [(SCHEMA_VERSION,)]
     assert rig.query("SELECT COUNT(*) FROM hook_outbox") == [(0,)]
     assert rig.query("SELECT COUNT(*) FROM deliveries") != [(0,)]
@@ -121,7 +121,7 @@ def test_a_hook_that_fails_is_run_again_by_a_later_flush_with_the_same_payload(
     rig.clock.jump_wall(1)
     h.set(exit=0)
     code, _, err = s.flush()
-    assert code in (0, 22) and err == ""
+    assert code == 22 and err == ""
     first, second = h.runs()
     assert first["stdin"] == second["stdin"]
     assert outbox(rig) == []  # it succeeded: the row is gone
@@ -138,7 +138,7 @@ def test_every_failure_warns_and_never_changes_the_exit_code(rig: Rig, make_hook
     s.flush()
     rig.clock.jump_wall(DELAYS[0])
     code, doc, err = s.flush()
-    assert code in (0, 22) and doc["outcome"] in ("ok", "no_op")
+    assert code == 22 and doc["outcome"] == "no_op"
     assert err.count("a post-fail hook failed (nonzero_exit)") == 1
 
 
@@ -157,7 +157,7 @@ def test_the_retry_delays_and_the_attempt_limit(rig: Rig, make_hook: MakeHook) -
         rig.clock.jump_wall(1)
         t += delay
         code, _, err = s.flush()
-        assert code in (0, 22)
+        assert code == 22
         assert len(h.runs()) == n + 1
     assert len(h.runs()) == 6
     assert outbox(rig) == []  # the sixth failure ended it
@@ -176,7 +176,7 @@ def test_a_row_a_day_old_is_given_up_without_a_run(rig: Rig, make_hook: MakeHook
     s.flush()
     rig.clock.jump_wall(DAY)
     code, _, err = s.flush()
-    assert code in (0, 22)
+    assert code == 22
     assert len(h.runs()) == 1
     assert outbox(rig) == []
     assert err.count("a post-fail hook gave up (expired)") == 1
@@ -355,7 +355,7 @@ def test_a_stored_payload_that_does_not_fit_is_deleted_unrun(
     write(rig, "UPDATE hook_outbox SET payload = ?", (payload,))
     rig.clock.jump_wall(DELAYS[0])
     code, _, err = s.flush()
-    assert code in (0, 22) and len(h.runs()) == 1 and outbox(rig) == []
+    assert code == 22 and len(h.runs()) == 1 and outbox(rig) == []
     assert payload[:20] not in err
 
 
@@ -386,6 +386,52 @@ def test_a_payload_for_another_destination_than_its_row_is_deleted_unrun(
     assert len(h.runs()) == 1 and outbox(rig) == []
 
 
+def test_a_destination_kind_changed_since_the_row_was_written_ends_it_silently(
+    rig: Rig, make_hook: MakeHook
+) -> None:
+    h = make_hook(exit=3)
+    s = with_hooks(rig, h)
+    s.fail("boom")
+    s.flush()
+    rig.configure(
+        {"chat": {"notifier": s.bad, "kind": "generic"}, "ops": {"notifier": s.ops}},
+        _rules(),
+        **hooks_config(h),
+    )
+    rig.clock.jump_wall(DELAYS[0])
+    _, _, err = s.flush()
+    assert len(h.runs()) == 1 and outbox(rig) == []
+    assert "gave up" not in err
+    assert hook_log(rig) == [("sync", "nonzero_exit")]
+
+
+@pytest.mark.parametrize("orphan", ["entry_gone", "entry_async", "destination_gone"])
+def test_an_orphan_row_that_is_also_a_day_old_is_deleted_without_a_record(
+    rig: Rig, make_hook: MakeHook, orphan: str
+) -> None:
+    h = make_hook(exit=3)
+    s = with_hooks(rig, h)
+    s.fail("boom")
+    s.flush()
+    if orphan == "entry_gone":
+        rig.configure(
+            {"chat": {"notifier": s.bad}, "ops": {"notifier": s.ops}}, _rules(), **hooks_config()
+        )
+    elif orphan == "entry_async":
+        rig.configure(
+            {"chat": {"notifier": s.bad}, "ops": {"notifier": s.ops}},
+            _rules(),
+            **hooks_config(h, is_async=True),
+        )
+    else:
+        rig.configure({"ops": {"notifier": s.ops}}, [_rules()[0]], **hooks_config(h))
+    rig.clock.jump_wall(DAY)
+    _, _, err = s.flush()
+    assert len(h.runs()) == 1 and outbox(rig) == []
+    assert "gave up" not in err
+    assert hook_log(rig) == [("sync", "nonzero_exit")]
+
+
 # --- claims ------------------------------------------------------------------------------------
 
 
@@ -403,6 +449,46 @@ def test_a_live_claim_keeps_a_row_from_running_and_a_lapsed_one_does_not(
     write(rig, "UPDATE hook_outbox SET claim_expires = ?", (NOW + DELAYS[0] - 1,))
     s.flush()
     assert len(h.runs()) == 2  # a lapsed claim is a crashed run: tried again
+
+
+def test_a_claim_moves_the_next_attempt_so_a_crashed_attempt_waits_its_delay() -> None:
+    import sqlite3
+
+    from notice_route import outbox as ob
+
+    conn = sqlite3.connect(":memory:")
+    for statement in MIGRATIONS[2]:
+        assert isinstance(statement, str)
+        conn.execute(statement)
+    ob.enqueue(conn, 1, "chat", "k.0", 1, "{}", NOW)
+    assert ob.claim(conn, 1, NOW, 30, "a") is not None  # attempt 1; the run then dies
+    (nxt,) = conn.execute("SELECT next_attempt FROM hook_outbox").fetchone()
+    assert nxt == NOW + DELAYS[0]
+    assert ob.due(conn, NOW + 31) == []  # the lease lapsed, the delay has not passed
+    assert [r.id for r in ob.due(conn, NOW + DELAYS[0])] == [1]
+    second = ob.claim(conn, 1, NOW + DELAYS[0], 90, "b")
+    assert second is not None and second.attempts == 2
+    (nxt,) = conn.execute("SELECT next_attempt FROM hook_outbox").fetchone()
+    assert nxt == NOW + DELAYS[0] + DELAYS[1]
+    conn.execute("UPDATE hook_outbox SET attempts = 5, next_attempt = 0, claim_expires = NULL")
+    assert ob.claim(conn, 1, NOW + 10_000, 90, "c") is not None  # the last attempt
+    (nxt,) = conn.execute("SELECT next_attempt FROM hook_outbox").fetchone()
+    assert nxt == NOW + 10_000 + DELAYS[-1]
+
+
+def test_a_negative_attempt_count_is_run_and_rescheduled_without_an_error(
+    rig: Rig, make_hook: MakeHook
+) -> None:
+    h = make_hook(exit=3)
+    s = with_hooks(rig, h)
+    s.fail("boom")
+    s.flush()
+    write(rig, "UPDATE hook_outbox SET attempts = -100")
+    rig.clock.jump_wall(DELAYS[0])
+    code, _, err = s.flush()
+    assert code == 22 and len(h.runs()) == 2
+    assert "internal" not in err
+    assert outbox(rig) == [("chat", 1, NOW + DELAYS[0] + DELAYS[0], None)]
 
 
 def test_an_attempt_that_crashed_still_counts(rig: Rig, make_hook: MakeHook) -> None:
@@ -434,6 +520,20 @@ def test_a_row_at_the_attempt_limit_is_given_up_without_a_run(
     assert len(h.runs()) == 1 and outbox(rig) == []
     assert "a post-fail hook gave up (nonzero_exit)" not in err
     assert err.count("a post-fail hook gave up") == 1
+
+
+def test_a_run_warns_once_per_word_for_rows_that_gave_up(rig: Rig, make_hook: MakeHook) -> None:
+    first, second = make_hook("one", exit=3), make_hook("two", exit=3)
+    s = with_hooks(rig, first, second)
+    s.fail("boom")
+    s.flush()
+    write(rig, "UPDATE hook_outbox SET attempts = 6 WHERE id = 1")
+    write(rig, "UPDATE hook_outbox SET created_at = ? WHERE id = 2", (NOW - DAY,))
+    rig.clock.jump_wall(DELAYS[0])
+    _, _, err = s.flush()
+    assert outbox(rig) == []
+    assert err.count("a post-fail hook gave up (exhausted)") == 1
+    assert err.count("a post-fail hook gave up (expired)") == 1
 
 
 def test_two_flushers_run_a_due_row_once(rig: Rig, make_hook: MakeHook) -> None:
@@ -486,7 +586,7 @@ def test_a_flush_killed_after_taking_the_row_loses_no_sync_hook(
     assert s.surfaced()[0][4] == 1 and h.runs() == []
     assert len(outbox(rig)) == 1  # taken and durable
     code, _, _ = s.flush()
-    assert code in (0, 22) and len(h.runs()) == 1 and outbox(rig) == []
+    assert code == 0 and len(h.runs()) == 1 and outbox(rig) == []
 
 
 def test_a_fault_of_the_alert_routing_keeps_the_hook_in_the_outbox(
@@ -503,7 +603,7 @@ def test_a_fault_of_the_alert_routing_keeps_the_hook_in_the_outbox(
 
     monkeypatch.setattr(alerts, "_route", broken)
     code, _, err = s.flush()
-    assert code in (0, 22) and len(h.runs()) == 1
+    assert code == 22 and len(h.runs()) == 1
     assert len(outbox(rig)) == 1 and s.surfaced()[0][4] == 1
     assert err.count("a post-fail hook failed") == 1
 
@@ -538,7 +638,7 @@ def test_a_destination_disabled_by_an_override_still_has_its_hook_retried(
     s.fail("boom")
     s.flush()
     code, _, _ = rig.run("destination", "disable", "chat", "--json")
-    assert code in (0, 22)
+    assert code == 0
     rig.clock.jump_wall(DELAYS[0])
     s.flush()
     assert len(h.runs()) == 2
@@ -564,6 +664,23 @@ def test_a_run_takes_at_most_one_hundred_rows(rig: Rig, make_hook: MakeHook) -> 
     assert len(h.runs()) == 1 + 100
     s.flush()  # the same second: the 100 are not due again, the other 6 are
     assert len(h.runs()) == 1 + 100 + 6
+
+
+def test_a_late_start_that_cannot_read_the_database_reports_nothing_started() -> None:
+    from concurrent.futures import Future
+    from typing import cast
+
+    from notice_route import flush as fl
+    from notice_route.outbox import Row
+    from notice_route.store import StoreError
+    from notice_route.validate import Hook
+
+    class Broken:
+        def write(self) -> Any:
+            raise StoreError("busy")
+
+    pending = fl._Pending(Row(1, "chat", "k.0", "{}"), Hook("/bin/a", 30.0, False), Future())
+    assert fl._start_late(cast(Any, None), cast(Any, Broken()), pending) == fl._GONE
 
 
 def test_hook_keys_tell_equal_commands_apart_and_skip_async_entries() -> None:

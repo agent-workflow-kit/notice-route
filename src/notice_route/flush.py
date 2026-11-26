@@ -55,7 +55,6 @@ reading:
 from __future__ import annotations
 
 import math
-import secrets
 import sqlite3
 import threading
 from collections.abc import Callable
@@ -414,14 +413,15 @@ def _run_outbox(run: _Run, store: Store, hook_pool: ThreadPoolExecutor) -> _Plan
     try:
         with store.write() as conn:
             now = instant(run.gateway.wall())
+            # an orphan (its entry or destination is gone) is deleted silently, before the limits
+            # can end it with a record
+            for row in outbox.unclaimed(conn, now):
+                if by_key.get(row.hook_key) is None or row.destination not in config.destinations:
+                    outbox.delete(conn, row.id)
             planned.ended = [(d, w) for _, d, w in outbox.end_lapsed(conn, now)]
             rows: list[tuple[outbox.Row, Hook]] = []
             for row in outbox.due(conn, now):
-                hook = by_key.get(row.hook_key)
-                if hook is None or row.destination not in config.destinations:
-                    outbox.delete(conn, row.id)
-                else:
-                    rows.append((row, hook))
+                rows.append((row, by_key[row.hook_key]))
     except StoreError:
         planned.error = True
         return planned
@@ -437,7 +437,7 @@ def _outbox_attempt(run: _Run, row: outbox.Row, hook: Hook) -> _Attempt:
     progress and finishes within its timeout)."""
     if run.trap.received is not None:
         return _Attempt(not_started=True)
-    token = secrets.token_hex(16)
+    token = run.gateway.new_token()
     lease = math.ceil(hook.timeout) + outbox.LEASE_GRACE_S
     try:
         with open_store(run.gateway) as store:
@@ -480,7 +480,7 @@ _GONE = "gone"  # the row was not there or not ours: nothing was started
 def _start_late(run: _Run, store: Store, pending: _Pending) -> str | None:
     """A synchronous hook that a signal kept from starting: started detached once (as in 1.0),
     and its row deleted when that worked. ``None`` when started, ``_GONE`` when there was nothing to
-    start, else a failure word."""
+    start (also when the database could not be read: the row stays), else a failure word."""
     payload = None
     try:
         with store.write() as conn:
@@ -492,7 +492,7 @@ def _start_late(run: _Run, store: Store, pending: _Pending) -> str | None:
                 if payload is None:
                     outbox.delete(conn, pending.row.id)
     except StoreError:
-        return "spawn_failed"
+        return _GONE  # nothing was tried: no record, and the row stays for the next run
     if payload is None:
         return _GONE
     failed = start_detached(run.gateway, pending.hook, payload)

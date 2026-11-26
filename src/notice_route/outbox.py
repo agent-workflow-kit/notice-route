@@ -38,6 +38,7 @@ __all__ = [
     "fail",
     "hook_keys",
     "succeed",
+    "unclaimed",
     "due",
 ]
 
@@ -113,6 +114,16 @@ def end_lapsed(conn: sqlite3.Connection, now: int) -> list[tuple[int, str, str]]
     return [(int(i), str(d), str(w)) for i, d, w in found]
 
 
+def unclaimed(conn: sqlite3.Connection, now: int) -> list[Row]:
+    """Every unclaimed row, due or not (the table is bounded, see docs/interface.md, Hooks)."""
+    found = conn.execute(
+        "SELECT id, destination, hook_key, payload FROM hook_outbox"
+        f" WHERE {_UNCLAIMED} ORDER BY id",
+        (now,),
+    ).fetchall()
+    return [Row(int(i), str(d), str(k), str(p)) for i, d, k, p in found]
+
+
 def due(conn: sqlite3.Connection, now: int, limit: int = RUN_LIMIT) -> list[Row]:
     """The unclaimed rows whose next attempt is not after ``now``, oldest first."""
     found = conn.execute(
@@ -126,20 +137,40 @@ def due(conn: sqlite3.Connection, now: int, limit: int = RUN_LIMIT) -> list[Row]
 def claim(
     conn: sqlite3.Connection, row_id: int, now: int, lease_s: int, token: str
 ) -> Claimed | None:
-    """Claim one due row for an attempt (count it and lease it); ``None`` when another run got
+    """Claim one due row for an attempt (count it, lease it and move ``next_attempt`` to the delay
+    after this attempt, so a run that dies is not retried before it; ``fail`` sets it again from
+    the end of the attempt); ``None`` when another run got
     it first, it is not due, or it reached a limit."""
+    before = conn.execute("SELECT attempts FROM hook_outbox WHERE id = ?", (row_id,)).fetchone()
+    if before is None:
+        return None
+    attempts = max(int(before[0]), 0) + 1  # a hand-edited negative count counts as zero
     cur = conn.execute(
-        "UPDATE hook_outbox SET attempts = attempts + 1, claimed_by = ?, claim_expires = ?"
+        "UPDATE hook_outbox SET attempts = ?, claimed_by = ?, claim_expires = ?, next_attempt = ?"
         f" WHERE id = ? AND next_attempt <= ? AND {_UNCLAIMED}"
         " AND attempts < ? AND created_at > ?",
-        (token, now + lease_s, row_id, now, now, MAX_ATTEMPTS, now - MAX_AGE_S),
+        (
+            attempts,
+            token,
+            now + lease_s,
+            now + _delay(attempts),
+            row_id,
+            now,
+            now,
+            MAX_ATTEMPTS,
+            now - MAX_AGE_S,
+        ),
     )
     if cur.rowcount != 1:
         return None
-    found = conn.execute(
-        "SELECT attempts, payload FROM hook_outbox WHERE id = ?", (row_id,)
-    ).fetchone()
-    return Claimed(int(found[0]), str(found[1]))
+    found = conn.execute("SELECT payload FROM hook_outbox WHERE id = ?", (row_id,)).fetchone()
+    return Claimed(attempts, str(found[0]))
+
+
+def _delay(attempts: int) -> int:
+    """The wait after attempt ``attempts`` (clamped: the last delay serves the last attempt, whose
+    row is ended anyway)."""
+    return DELAYS[min(max(attempts, 1), len(DELAYS)) - 1]
 
 
 def succeed(conn: sqlite3.Connection, row_id: int, token: str) -> None:
@@ -161,7 +192,7 @@ def fail(conn: sqlite3.Connection, row_id: int, token: str, now: int) -> bool:
     conn.execute(
         "UPDATE hook_outbox SET next_attempt = ?, claimed_by = NULL, claim_expires = NULL"
         " WHERE id = ?",
-        (now + DELAYS[attempts - 1], row_id),
+        (now + _delay(attempts), row_id),
     )
     return False
 
