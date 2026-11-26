@@ -275,15 +275,6 @@ def test_a_held_row_whose_window_has_ended_is_sent_as_itself(rig: Rig) -> None:
     assert len(n.events("invoke")) == 1
 
 
-def test_two_due_held_rows_are_left_for_the_digest(rig: Rig) -> None:
-    n = one(rig)
-    seed(rig, level="warn", kind="held")
-    seed(rig, level="warn", kind="held")
-    code, doc, _ = flush(rig)
-    assert (code, dest(doc)["due_held"], dest(doc)["sent"], dest(doc)["digests"]) == (22, 2, 0, 0)
-    assert n.events("invoke") == []  # TODO(#24)
-
-
 # --- stop after a result that is not sent ------------------------------------------------------
 
 

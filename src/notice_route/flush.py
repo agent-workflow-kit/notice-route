@@ -732,7 +732,9 @@ def _claim_digest(
     return _Exhausted() if spent else None
 
 
-def _call_digest(run: _Run, store: Store, dest: Destination, t: _Tally, claim: _DigestClaim) -> None:
+def _call_digest(
+    run: _Run, store: Store, dest: Destination, t: _Tally, claim: _DigestClaim
+) -> None:
     """Call for the claimed digest (no dedupe key), then record every member in one transaction."""
     assert run.state is not None
     members = claim.digest.rows
@@ -809,7 +811,9 @@ def _call_digest(run: _Run, store: Store, dest: Destination, t: _Tally, claim: _
         if m.delivery_id in done.evicted_ids and a.outcome in ("queued_retry", "deferred"):
             # dropped by the cap when a later member went back
             _tally(t, "dropped", 0)
-            run.log_row(m, outcome="dropped", reason="overflow", code="overflow", attempts=a.attempts)
+            run.log_row(
+                m, outcome="dropped", reason="overflow", code="overflow", attempts=a.attempts
+            )
             continue
         _tally(t, a.outcome, 0)
         run.log_row(m, outcome=a.outcome, reason=a.reason, code=a.code, attempts=a.attempts)

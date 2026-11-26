@@ -32,7 +32,9 @@ def held(rig: Rig, count: int = 2, **kw: Any) -> list[int]:
     """``count`` due held rows (ids returned); ``message`` and ``title`` may use ``{i}``."""
     ids: list[int] = []
     for i in range(count):
-        extra = {k: v.replace("{i}", str(i)) if isinstance(v, str) else v for k, v in kw.items()}
+        extra: dict[str, Any] = {
+            k: v.replace("{i}", str(i)) if isinstance(v, str) else v for k, v in kw.items()
+        }
         extra.setdefault("level", "warn")
         extra.setdefault("message", f"m{i}")
         extra.setdefault("title", f"t{i}")
@@ -91,7 +93,9 @@ def test_two_due_held_rows_become_one_digest_with_the_exact_text(rig: Rig) -> No
 @pytest.mark.parametrize(
     ("count", "lines", "tail"), [(10, 10, None), (11, 10, "and 1 more"), (25, 10, "and 15 more")]
 )
-def test_the_digest_for_10_11_and_25_rows(rig: Rig, count: int, lines: int, tail: str | None) -> None:
+def test_the_digest_for_10_11_and_25_rows(
+    rig: Rig, count: int, lines: int, tail: str | None
+) -> None:
     n = one(rig)
     held(rig, count)
     code, doc, _ = flush(rig)
@@ -267,7 +271,9 @@ def test_a_disabled_notifier_ends_every_member_disabled(rig: Rig) -> None:
 def test_a_retryable_digest_keeps_the_rows_held_and_adds_one_attempt_to_each(rig: Rig) -> None:
     one(rig, error={"code": "rate_limited"})
     for attempts in (0, 2, 2):
-        seed(rig, kind="held", attempts=attempts, outcome="queued_retry" if attempts else "deferred")
+        seed(
+            rig, kind="held", attempts=attempts, outcome="queued_retry" if attempts else "deferred"
+        )
     code, doc, _ = flush(rig)
     assert (code, dest(doc)["queued_retry"], dest(doc)["digests"]) == (0, 3, 1)
     # the schedule of the highest attempt count (3): 30 minutes
@@ -344,10 +350,13 @@ def test_a_busy_send_lock_returns_the_members_held_and_gives_back_one_count(rig:
         lock.close()
     assert (code, dest(doc)["queued_retry"], n.events("invoke")) == (0, 3, [])
     assert rate(rig) == [("other", 5)]
-    assert rig.query(
-        "SELECT d.outcome, d.reason, d.attempts, q.kind, q.deliver_after, q.claimed_by"
-        " FROM deliveries d JOIN queue q ON q.delivery_id = d.id ORDER BY d.id"
-    ) == [("queued_retry", "lock_busy", 0, "held", NOW + 60, None)] * 3
+    assert (
+        rig.query(
+            "SELECT d.outcome, d.reason, d.attempts, q.kind, q.deliver_after, q.claimed_by"
+            " FROM deliveries d JOIN queue q ON q.delivery_id = d.id ORDER BY d.id"
+        )
+        == [("queued_retry", "lock_busy", 0, "held", NOW + 60, None)] * 3
+    )
 
 
 def test_an_unset_variable_found_at_call_time_defers_the_members_held_and_gives_back_one_count(
@@ -362,10 +371,13 @@ def test_an_unset_variable_found_at_call_time_defers_the_members_held_and_gives_
     )
     code, _, _ = flush(rig)
     assert code == 0 and rate(rig) == [("other", 5)]
-    assert rig.query(
-        "SELECT d.outcome, d.reason, d.attempts, q.kind, q.deliver_after FROM deliveries d"
-        " JOIN queue q ON q.delivery_id = d.id ORDER BY d.id"
-    ) == [("deferred", "env_missing", 0, "held", NOW)] * 3
+    assert (
+        rig.query(
+            "SELECT d.outcome, d.reason, d.attempts, q.kind, q.deliver_after FROM deliveries d"
+            " JOIN queue q ON q.delivery_id = d.id ORDER BY d.id"
+        )
+        == [("deferred", "env_missing", 0, "held", NOW)] * 3
+    )
 
 
 # --- the hourly counters -----------------------------------------------------------------------
