@@ -56,7 +56,7 @@ def test_the_hook_gets_the_payload_on_stdin_and_the_documented_environment(
     assert run["env"]["NOTICE_ROUTE_OBJECT_TYPE"] == "destination"
     assert run["argv"] == []  # nothing of the payload on the command line
     assert run["cwd"] == "/" and set(run["fds"]) <= {0, 1, 2, 3}
-    assert run["pgid"] == run["pid"] or run["sid"] == run["pgid"]  # a group of its own
+    assert run["pgid"] == run["sid"] != os.getsid(0)  # a session and group of its own
     assert "credential_invalid" not in json.dumps(run["env"])
 
 
