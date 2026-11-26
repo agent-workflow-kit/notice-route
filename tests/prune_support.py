@@ -128,3 +128,19 @@ def deleted(**some: int) -> dict[str, int]:
 
 
 __all__ = ["DAY", "NOW", "TABLES"]
+
+
+def add_many_expired_queue(rig: Rig, count: int, destination: str, created_at: int) -> None:
+    """``count`` unclaimed queue rows (and their deliveries) created at ``created_at``."""
+    with open_store(rig.gateway()) as store, store.write() as conn:
+        for _ in range(count):
+            cur = conn.execute(
+                "INSERT INTO deliveries (ts, source, level, outcome, destination)"
+                " VALUES (?, 's', 'info', 'deferred', ?)",
+                (created_at, destination),
+            )
+            conn.execute(
+                "INSERT INTO queue (delivery_id, kind, message, level, source, deliver_after,"
+                " created_at) VALUES (?, 'single', 'm', 'info', 's', ?, ?)",
+                (cur.lastrowid, created_at, created_at),
+            )
