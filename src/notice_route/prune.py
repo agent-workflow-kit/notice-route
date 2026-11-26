@@ -232,12 +232,18 @@ def _is_empty(gateway: Gateway) -> bool:
     """A ``state.db`` that was created and never migrated is no database (as for the read-only
     commands): nothing is migrated or created for it. An older schema is not empty: ``prune``
     migrates it like every command that writes."""
-    try:
-        store = open_readonly(gateway)
-    except StoreError as exc:
-        if exc.reason == "older":
-            return False
-        raise
+    store = None
+    for attempt in range(BUSY_TRIES):
+        try:
+            store = open_readonly(gateway)
+        except StoreError as exc:
+            if exc.reason == "older":
+                return False
+            if exc.reason != "busy" or attempt == BUSY_TRIES - 1:
+                raise
+            gateway.clock.sleep(PAUSE_S * 10)
+            continue
+        break
     if store is None:
         return True
     store.close()
@@ -351,7 +357,7 @@ def _clean(e: Expired) -> Expired:
     return replace(
         e,
         destination=_text(e.destination),
-        kind=_text(e.kind),  # pyright: ignore[reportArgumentType]
+        kind=_text(e.kind),
         level=_text(e.level),
         source=_text(e.source),
     )

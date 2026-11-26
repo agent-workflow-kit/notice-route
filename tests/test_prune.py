@@ -516,6 +516,43 @@ def test_a_batch_whose_lock_wait_ran_out_is_tried_again(
     assert len(calls) == 2
 
 
+def test_a_pre_check_whose_lock_wait_ran_out_is_tried_again(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(rig)
+    add_window(rig, NOW - 500, 100, "a")
+    real = prune_mod.open_readonly
+    calls: list[int] = []
+
+    def flaky(*a: Any, **k: Any) -> Any:
+        calls.append(1)
+        if len(calls) == 1:
+            raise StoreError("busy")
+        return real(*a, **k)
+
+    monkeypatch.setattr(prune_mod, "open_readonly", flaky)
+    code, doc, _ = prune(rig)
+    assert (code, doc["deleted"]) == (0, deleted(dedup=1))
+    assert len(calls) == 2
+
+
+def test_a_pre_check_that_stays_busy_is_tried_three_times(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(rig)
+    add_window(rig, NOW - 500, 100, "a")
+    calls: list[int] = []
+
+    def busy(*a: Any, **k: Any) -> Any:
+        calls.append(1)
+        raise StoreError("busy")
+
+    monkeypatch.setattr(prune_mod, "open_readonly", busy)
+    code, _, _ = rig.run("prune", "--json")
+    assert code == 1
+    assert len(calls) == prune_mod.BUSY_TRIES == 3
+
+
 def test_a_database_that_stays_busy_is_exit_1_internal(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
