@@ -15,8 +15,10 @@ SQLite connection is not shared between threads. Per destination, in order:
    fresh token and counts the hourly call (a capped row is left alone), the send lock is taken,
    the notifier is called, the lock is released, and the result is recorded in a transaction of
    its own, fenced by the token;
-7. the due ``held`` rows: one such row is sent as itself. TODO(#24): two or more are folded into
-   a digest (:func:`_send_held`); until then they are left untouched.
+7. the due ``held`` rows: one such row is sent as itself, two or more are folded into one digest
+   (:func:`_send_held`, :mod:`notice_route.digest`): a transaction claims every member with one
+   shared token and counts one call in the class of the highest level (never held by the cap), the
+   call is made with no dedupe key, and one transaction records every member's result.
 
 After a call ends ``queued_retry`` (``lock_busy`` included), ``failed``, ``unknown`` or is deferred
 (``env_missing`` found at call time) no further call is made to that destination in the run; its
@@ -44,8 +46,10 @@ reading:
   time) ends ``failed``/``retries_exhausted`` without a call (the hourly count is given back).
 - The send lock being busy, a result whose claim was lost and a signal before a call are all
   handled as in ``send`` (``calling.py``, ``send.record_result``).
-- A digest, the retry schedule and surfacing are seams: ``send.Seams`` (``retry_schedule``,
-  ``surface``; TODO(#25), TODO(#27)).
+- The retry schedule and surfacing are seams: ``send.Seams`` (``retry_schedule``, ``surface``;
+  TODO(#25), TODO(#27)).
+- Digest (docs/design.md C-54): ``digests`` counts the digests built and not released unsent in the
+  run; the result counts (``sent``, ``failed``, ...) count member rows, as ``due_held`` does.
 """
 
 from __future__ import annotations
@@ -60,10 +64,11 @@ from typing import Any
 from . import dedup
 from . import log as logmod
 from .calling import Busy, Called, CallEnd, Escaped, Gate, NotRun, Skipped, call_row
-from .decide import claim_call, give_back, hour_start, instant
+from .decide import claim_call, count_call, give_back, hour_start, instant
+from .digest import Digest, build, record_digest, record_escaped_digest
 from .gateway import DirHandle, Gateway, SignalTrap
 from .outcome import LOCK_BUSY, Applied, Outcome, classify, record_escaped
-from .payload import UsageError
+from .payload import LEVELS, UsageError
 from .queue import (
     EXPIRY_S,
     Lease,
@@ -414,9 +419,9 @@ def _dry_run(run: _Run, selected: list[Destination]) -> list[_Tally]:
                 acts = acts or any(r.level == "info" for r in left)
                 left = [r for r in left if r.level not in ("info", "warn", "action")]
             held = [r for r in left if r.kind == "held"]
-            # steps 6 and 7: a due single row is sent; one due held row is sent as itself, two
-            # or more wait for the digest (TODO(#24))
-            acts = acts or any(r.kind == "single" for r in left) or len(held) == 1
+            # steps 6 and 7: a due single row is sent; due held rows are sent as one digest, or
+            # one row as itself
+            acts = acts or any(r.kind == "single" for r in left) or bool(held)
             t.state = "done" if acts else ("quiet" if quiet else "nothing_due")
     return tallies
 
@@ -612,8 +617,10 @@ def _exhaust(
     row: QueueRow,
     token: str,
     prior: int,
-    hour: int,
+    hour: int | None,
 ) -> None:
+    """End a claimed row ``failed``/``retries_exhausted`` without a call; ``hour`` is where its
+    hourly count is given back (``None``: it took none, a digest member)."""
     complete_row(conn, row.id, token)
     conn.execute(
         "UPDATE deliveries SET outcome = 'failed', code = 'retries_exhausted',"
@@ -621,7 +628,8 @@ def _exhaust(
         (row.delivery_id,),
     )
     dedup.release(conn, row.delivery_id)
-    give_back(conn, destination=dest.name, level=row.level, hour=hour)
+    if hour is not None:
+        give_back(conn, destination=dest.name, level=row.level, hour=hour)
     run.seams.surface(
         conn,
         SurfaceEvent(
@@ -638,17 +646,204 @@ def _exhaust(
 
 
 def _send_held(run: _Run, store: Store, dest: Destination, t: _Tally) -> None:
-    """Step 7. One due ``held`` row is sent as itself. TODO(#24): two or more become one digest
-    (title ``N held notifications``, claim all, count in the highest class, per-row results);
-    until then they are left as they are."""
-    with store.write() as conn:
-        lease = Lease.at(run.gateway.wall(), run.worst)
-        due = due_rows(conn, dest.name, lease, kind="held")
-    if len(due) != 1:
+    """Step 7. Two or more usable due ``held`` rows become one digest; otherwise the one row left
+    is sent as itself (the hourly cap applies to it)."""
+    while run.trap.received is None:
+        found = _claim_digest(run, store, dest, t)
+        if isinstance(found, _Exhausted):  # members ended without a call: look again
+            continue
+        if found is not None:
+            _call_digest(run, store, dest, t, found)
+            return
+        break
+    if run.trap.received is not None:
         return
     claim = _claim(run, store, dest, "held", set(), t)
     if isinstance(claim, _Claim):
         _call_and_record(run, store, dest, t, claim)
+
+
+@dataclass(frozen=True)
+class _DigestClaim:
+    digest: Digest
+    token: str
+    count_hour: int
+    call_row: QueueRow  # what the call sends: the digest's text under the first member's ids
+    priors: dict[int, int]  # each member's attempts before the call, by delivery id
+
+
+def _claim_digest(
+    run: _Run, store: Store, dest: Destination, t: _Tally
+) -> _DigestClaim | _Exhausted | None:
+    """One transaction: claim every usable due ``held`` row with one fresh token and count one
+    call in the class of the highest level (no cap check: a digest is never held by the cap). A
+    member whose attempts are used up ends ``failed`` without a call and is left out. ``None``
+    when fewer than two members are left (their claims are released)."""
+    spent: list[tuple[QueueRow, int]] = []
+    result: _DigestClaim | None = None
+    with store.write() as conn:
+        lease = Lease.at(run.gateway.wall(), run.worst)
+        usable: list[QueueRow] = []
+        for row in due_rows(conn, dest.name, lease, kind="held"):
+            if row.level in LEVELS:
+                usable.append(row)
+            else:  # a stored level that is none of the four: leave the row alone
+                if _ROW_FAULT not in t.warnings:
+                    t.warnings.append(_ROW_FAULT)
+                t.fault = t.fault or _ROW_FAULT
+                run.say(t, f"row {row.id} skipped (invalid level)")
+        if len(usable) < 2:
+            return None
+        token = run.gateway.new_token()
+        retry_at = run.seams.retry_schedule(dest.kind, lease.now)
+        live: list[QueueRow] = []
+        priors: dict[int, int] = {}
+        for row in usable:
+            claimed = claim_row(conn, row.id, lease, token)
+            assert claimed is not None  # inside BEGIN IMMEDIATE
+            prior = int(
+                conn.execute(
+                    "SELECT attempts FROM deliveries WHERE id = ?", (row.delivery_id,)
+                ).fetchone()[0]
+            )
+            if prior >= 1 and retry_at(prior) is None:
+                _exhaust(conn, run, dest, claimed, token, prior, None)
+                spent.append((claimed, prior))
+            else:
+                live.append(claimed)
+                priors[claimed.delivery_id] = prior
+        if len(live) >= 2:
+            digest = build(live)
+            count_call(conn, destination=dest.name, level=digest.level, now=lease.now)
+            first = digest.rows[0]
+            sent_as = QueueRow(
+                first.id, first.delivery_id, dest.name, "held", digest.title, digest.message,
+                None, digest.level, first.source, None, None, lease.now, lease.now, token,
+                lease.expires,
+            )  # fmt: skip
+            result = _DigestClaim(digest, token, hour_start(lease.now), sent_as, priors)
+        else:
+            release_claims(conn, token, lease)
+    for row, prior in spent:
+        t.failed += 1
+        t.acted = True
+        run.say(t, f"row {row.id} failed (retries_exhausted)")
+        run.log_row(row, outcome="failed", reason=None, code="retries_exhausted", attempts=prior)
+    if result is not None:
+        run.say(t, f"digest of {len(result.digest.rows)} rows")
+        return result
+    return _Exhausted() if spent else None
+
+
+def _call_digest(
+    run: _Run, store: Store, dest: Destination, t: _Tally, claim: _DigestClaim
+) -> None:
+    """Call for the claimed digest (no dedupe key), then record every member in one transaction."""
+    assert run.state is not None
+    members = claim.digest.rows
+    end: CallEnd = call_row(
+        run.gateway,
+        dest,
+        claim.call_row,
+        run.state,
+        run.config.lock_wait,
+        None,
+        run.seams.call,
+        run.gate,
+        run.cancelled,
+    )
+    if isinstance(end, (Skipped, NotRun)):  # no call was made: release every member and the count
+        _give_back(run, store, dest, _Claim(claim.call_row, claim.token, claim.count_hour, 0))
+        run.say(t, "digest not called (released)")
+        t.error = t.error or isinstance(end, NotRun)
+        return
+    t.digests += 1  # built, claimed and not released unsent by a signal
+    if isinstance(end, Escaped):
+        t.called = t.acted = True
+        recorded: list[int | None] | None = None
+        try:
+            recorded = with_retry(
+                run.gateway,
+                claim.call_row,
+                lambda: record_escaped_digest(store, members, claim.token),
+            )
+        except StoreError:
+            t.error = True
+        t.unknown += len(members)
+        run.say(t, "digest unknown")
+        for i, m in enumerate(members):
+            new = None if recorded is None else recorded[i]
+            if new is None:  # nothing recorded (a failed write) or the claim was lost
+                new = _attempts_of(store, claim, m, 1, read=recorded is not None)
+            run.log_row(m, outcome="unknown", reason="digest", code="killed", attempts=new)
+        return
+    outcome: Outcome = (
+        LOCK_BUSY
+        if isinstance(end, Busy)
+        else classify(end.result, kind=dest.kind, has_dedupe_key=False)
+    )
+    if isinstance(end, Called):
+        t.called = True
+    try:
+        done = record_digest(
+            store, run.gateway, run.seams, run.worst, dest, members, claim.token, outcome,
+            claim.count_hour,
+        )  # fmt: skip
+    except Exception:  # StoreError or a fault in the seam: the claims lapse, flush resends
+        t.error = True
+        t.acted = True
+        for _ in members:
+            _tally(t, outcome.outcome or "unknown", 0)
+        return
+    if outcome.internal:  # not_started: nothing is recorded, the claims lapse
+        t.error = True
+        return
+    t.acted = True
+    lost = False
+    for m, a in zip(members, done.applied, strict=True):
+        if not a.applied:
+            lost = True
+            name = outcome.outcome or "unknown"
+            _tally(t, name, 0)
+            run.log_row(
+                m,
+                outcome=name,
+                reason=outcome.reason or "digest",
+                code=outcome.code,
+                attempts=_attempts_of(store, claim, m, 1 if outcome.counted else 0, read=True),
+            )
+            continue
+        assert a.outcome is not None
+        if m.delivery_id in done.evicted_ids and a.outcome in ("queued_retry", "deferred"):
+            # dropped by the cap when a later member went back
+            _tally(t, "dropped", 0)
+            run.log_row(
+                m, outcome="dropped", reason="overflow", code="overflow", attempts=a.attempts
+            )
+            continue
+        _tally(t, a.outcome, 0)
+        run.log_row(m, outcome=a.outcome, reason=a.reason, code=a.code, attempts=a.attempts)
+    others = done.evicted_ids - {m.delivery_id for m in members}
+    t.dropped += len(others)
+    if lost:
+        t.warnings.append("a result was logged only: the claim was lost")
+    run.say(t, f"digest {outcome.outcome or 'unknown'}")
+
+
+def _attempts_of(
+    store: Store, claim: _DigestClaim, row: QueueRow, counted: int, *, read: bool
+) -> int:
+    """The attempts of a digest member whose result was not recorded, for its log line: what the
+    delivery has now (a read, no write transaction) when ``read`` and the row is still there,
+    else the attempts it had before the call plus ``counted``, as for a single row."""
+    if read:
+        try:
+            found = store.read("SELECT attempts FROM deliveries WHERE id = ?", (row.delivery_id,))
+        except StoreError:
+            found = []
+        if found:
+            return int(str(found[0][0]))
+    return claim.priors[row.delivery_id] + counted
 
 
 # --- one call --------------------------------------------------------------------------------

@@ -30,6 +30,7 @@ def seed(
     now: int = NOW,
     outcome: str = "deferred",
     reason: str | None = None,
+    rule: str | None = None,
 ) -> tuple[int, int]:
     """One ``deliveries`` row and its queue row; returns (delivery id, queue id)."""
     with open_store(rig.gateway()) as store, store.write() as conn:
@@ -56,6 +57,7 @@ def seed(
             lease=Lease(now, 100),
             title=title,
             link=link,
+            rule=rule,
             dedupe="ab" * 32,
             claim_token=claim,
             cap=10_000,
