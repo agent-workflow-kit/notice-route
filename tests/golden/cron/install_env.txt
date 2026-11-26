@@ -1,0 +1,5 @@
+# notice-route managed v1 flush=1m
+PATH=/usr/local/bin:/usr/bin:/bin:@DIR@
+* * * * * set -a && . '@ENV@' && set +a && '@EXE@' flush --quiet
+17 3 * * * set -a && . '@ENV@' && set +a && '@EXE@' prune --quiet
+# notice-route managed end
