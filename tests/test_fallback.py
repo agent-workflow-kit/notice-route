@@ -14,6 +14,7 @@ import pytest
 from notice_route.queue import Lease, enqueue, insert_delivery
 from notice_route.store import open_store
 from tests.flush_support import checked_log, dest, flush, seed
+from tests.manage_support import make_v3_database
 from tests.send_support import MORNING, NOW, Rig
 from tests.test_cli_rules_validate import schema_errors
 
@@ -282,9 +283,8 @@ def test_a_chain_that_already_has_three_hops_gets_no_further_delivery(rig: Rig) 
 def test_a_chain_with_a_missing_row_gets_no_further_delivery(rig: Rig) -> None:
     bad, good = rig.notifier("bad", **BAD), rig.notifier("good")
     rig.configure(
-        {"x": {"notifier": rig.notifier("x")}, "a": {"notifier": bad, "fallback": "b"}} | {
-            "b": {"notifier": good}
-        },
+        {"x": {"notifier": rig.notifier("x")}, "a": {"notifier": bad, "fallback": "b"}}
+        | {"b": {"notifier": good}},
         RULE_A,
     )
     make_chain(rig, ["x", "a"], drop_parent=True)
@@ -440,13 +440,103 @@ def test_two_flush_processes_make_one_fallback_row(rig: Rig) -> None:
     assert [r[1] for r in fallback_rows(rig)] == ["b"]
 
 
-def test_the_schema_version_is_4_and_an_older_database_migrates(rig: Rig) -> None:
+def test_the_schema_version_is_4_and_a_version_3_database_migrates_with_its_rows(
+    rig: Rig,
+) -> None:
     pair(rig)
+    make_v3_database(rig)
+    conn = sqlite3.connect(rig.state / "state.db")
+    conn.execute(
+        "INSERT INTO deliveries (ts, source, level, outcome, destination)"
+        " VALUES (1, 's', 'info', 'sent', 'a')"
+    )
+    conn.commit()
+    conn.close()
+    assert rig.run("history")[0] == 1  # read-only: it needs a writing command first
     rig.send("hello")
     assert rig.query("PRAGMA user_version") == [(4,)]
-    conn = sqlite3.connect(f"file:{rig.state / 'state.db'}?mode=ro", uri=True)
-    try:
-        names = [r[1] for r in conn.execute("PRAGMA table_info(deliveries)")]
-    finally:
-        conn.close()
-    assert names[-1] == "fallback_of"
+    assert [r[0] for r in rig.query("SELECT fallback_of FROM deliveries ORDER BY id")][:2] == [
+        None,
+        None,
+    ]
+    assert [r[1] for r in rig.query("PRAGMA table_info(deliveries)")][-1] == "fallback_of"
+    assert [(r[1], r[4]) for r in fallback_rows(rig)] == [("b", 2)]
+
+
+# --- faults and hostile stored data ------------------------------------------------------------
+
+
+def boom_after_insert(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The decision of the fallback writes a row, then fails."""
+    from notice_route import fallback as fallback_mod
+
+    real = fallback_mod.decide_fallback
+
+    def failing(*args: Any, **kwargs: Any) -> Any:
+        real(*args, **kwargs)
+        raise RuntimeError("BOOM-TEXT")
+
+    monkeypatch.setattr(fallback_mod, "decide_fallback", failing)
+
+
+def test_a_fault_in_the_fallback_is_rolled_back_and_the_failure_is_still_recorded(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bad, good = pair(rig)
+    boom_after_insert(monkeypatch)
+    code, doc, err = rig.send("hello")
+    assert code == 12 and doc["destinations"][0]["outcome"] == "failed"
+    assert "a fallback could not be routed" in err and "BOOM-TEXT" not in err
+    assert rows(rig) == [(1, "a", "failed", None, "credential_invalid", None)]
+    assert rig.query("SELECT COUNT(*) FROM queue") == [(0,)]
+    assert rig.query("SELECT COUNT(*) FROM dedup WHERE destination = 'b'") == [(0,)]
+    assert "BOOM-TEXT" not in rig.state_text()
+    assert len(bad.events("invoke")) == 1 and good.events("invoke") == []
+
+
+def test_a_fault_in_the_fallback_of_a_flush_is_one_warning_and_the_run_goes_on(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pair(rig)
+    seed(rig, "a")
+    boom_after_insert(monkeypatch)
+    code, _, err = flush(rig)
+    assert code == 12 and err.count("a fallback could not be routed") == 1
+    assert rows(rig)[0][2] == "failed" and fallback_rows(rig) == []
+
+
+def test_a_failed_row_without_a_usable_digest_gets_no_fallback(rig: Rig) -> None:
+    pair(rig)
+    seed(rig, "a")
+    conn = sqlite3.connect(rig.state / "state.db")
+    conn.execute("UPDATE queue SET dedupe = NULL")
+    conn.commit()
+    conn.close()
+    code, _, _ = flush(rig)
+    assert code == 12 and fallback_rows(rig) == []
+
+
+def test_the_labels_and_the_text_of_a_failed_notification_reach_the_fallback_unchanged(
+    rig: Rig,
+) -> None:
+    _, good = pair(rig)
+    text = "héllo 世界 " + "x" * 3000
+    rig.send(text, extra=("--label", "env=prod", "--label", "team=core"))
+    flush(rig)
+    assert [r[0] for r in rig.query("SELECT labels FROM deliveries WHERE destination = 'b'")] == [
+        '["env=prod", "team=core"]'
+    ]
+    (call,) = good.events("stdin")
+    assert json.loads(call["text"])["message"] == text
+
+
+def test_a_fallback_row_never_reaches_a_destination_twice_in_a_chain(rig: Rig) -> None:
+    a, b = chain(rig, (True, True))
+    rig.configure(
+        {"a": {"notifier": a, "fallback": "b"}, "b": {"notifier": b}},
+        [{"name": "r", "match": {"level_min": "info"}, "notify": ["a", "b"]}],
+    )
+    rig.send("hello")  # both fail: b's own failure has no fallback and a is not revisited
+    for _ in range(3):
+        flush(rig)
+    assert len(a.events("invoke")) == 1 and len(b.events("invoke")) == 1

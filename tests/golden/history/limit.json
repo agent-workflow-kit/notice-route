@@ -20,7 +20,8 @@
     ],
     "surfaced": false,
     "deliver_after": null,
-    "title": "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt"
+    "title": "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt",
+    "fallback_of": null
   },
   {
     "id": 7,
@@ -41,7 +42,8 @@
     "labels": [],
     "surfaced": false,
     "deliver_after": null,
-    "title": null
+    "title": null,
+    "fallback_of": null
   },
   {
     "id": 6,
@@ -62,6 +64,7 @@
     "labels": [],
     "surfaced": false,
     "deliver_after": null,
-    "title": null
+    "title": null,
+    "fallback_of": null
   }
 ]

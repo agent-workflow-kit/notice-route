@@ -20,7 +20,8 @@
     ],
     "surfaced": false,
     "deliver_after": null,
-    "title": "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt"
+    "title": "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt",
+    "fallback_of": null
   },
   {
     "id": 7,
@@ -41,7 +42,8 @@
     "labels": [],
     "surfaced": false,
     "deliver_after": null,
-    "title": null
+    "title": null,
+    "fallback_of": null
   },
   {
     "id": 6,
@@ -62,7 +64,8 @@
     "labels": [],
     "surfaced": false,
     "deliver_after": null,
-    "title": null
+    "title": null,
+    "fallback_of": null
   },
   {
     "id": 5,
@@ -83,7 +86,8 @@
     "labels": [],
     "surfaced": false,
     "deliver_after": null,
-    "title": null
+    "title": null,
+    "fallback_of": null
   },
   {
     "id": 4,
@@ -104,7 +108,8 @@
     "labels": [],
     "surfaced": false,
     "deliver_after": null,
-    "title": null
+    "title": null,
+    "fallback_of": null
   },
   {
     "id": 3,
@@ -127,7 +132,8 @@
     ],
     "surfaced": true,
     "deliver_after": null,
-    "title": null
+    "title": null,
+    "fallback_of": null
   },
   {
     "id": 2,
@@ -150,7 +156,8 @@
     ],
     "surfaced": false,
     "deliver_after": 1699913600,
-    "title": null
+    "title": null,
+    "fallback_of": null
   },
   {
     "id": 1,
@@ -174,6 +181,7 @@
     ],
     "surfaced": false,
     "deliver_after": null,
-    "title": "Build ok"
+    "title": "Build ok",
+    "fallback_of": null
   }
 ]

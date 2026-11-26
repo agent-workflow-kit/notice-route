@@ -240,7 +240,7 @@ class FallbackRoute:
     ``destination`` is the fallback destination and ``decision`` the decision of its step
     (``defer``, ``drop``, ``disabled``, ``suppress``, or ``fault`` when the seam failed and was
     rolled back: the failure is recorded without a fallback). ``outcome`` and ``reason`` are the
-    ``deliveries`` ones; ``delivery_id`` is the new row (``None`` for ``suppress`` and ``fault``)."""
+    ``deliveries`` ones; ``delivery_id`` is the new row (``None`` for ``suppress``, ``fault``)."""
 
     destination: str
     decision: str
