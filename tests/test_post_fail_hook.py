@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -149,15 +150,31 @@ def test_a_hook_that_cannot_be_started_is_a_warning_only(rig: Rig) -> None:
     assert code == 0 and "a post-fail hook failed (nonzero_exit)" in err  # sh: not found, 127
 
 
+def _speed_up_once_started(rig: Rig, hook: Any, rate: float) -> None:
+    """Set the rig clock's rate once the hook has logged that it started (bounded wait)."""
+    try:
+        hook.wait_for("run", timeout=10)
+    finally:
+        rig.clock.rate = rate
+
+
 def test_a_hook_is_killed_at_its_timeout_and_the_result_is_unchanged(
     rig: Rig, make_hook: MakeHook
 ) -> None:
-    rig.clock.rate = 50.0  # one second of hook time is 20 ms
-    h = make_hook(sleep=25, ignore_term=True, grandchild={"lifetime": 25, "hold": True})
+    # The hook's deadline counts from its process start, so a hook that starts slowly (a cold
+    # interpreter on a loaded machine) must still get to run before the clock speeds up: the
+    # clock runs at its real rate until the hook has logged its start, then at 50x (one second of
+    # hook time is 20 ms). A fixed 50x from the start killed the slow starter before it logged.
+    h = make_hook(
+        start_delay=0.3, sleep=25, ignore_term=True, grandchild={"lifetime": 25, "hold": True}
+    )
     s = with_hooks(rig, h, timeout="2s")
     s.fail("boom")
+    speeder = threading.Thread(target=_speed_up_once_started, args=(rig, h, 50.0))
+    speeder.start()
     t0 = time.monotonic()
     code, _, err = s.flush()
+    speeder.join(timeout=15)
     assert code == 0 and "a post-fail hook failed (timeout)" in err
     assert time.monotonic() - t0 < 10
     run = h.wait_for("run")

@@ -2,6 +2,7 @@
 
 ``main(argv, behavior_path)`` reads the behavior JSON at every run, appends JSON lines to the
 log named in it, and then acts: ``exit`` (exit code), ``sleep`` (seconds before the answer),
+``start_delay`` (seconds before the first record: a slow start),
 ``ignore_term`` (ignore SIGTERM), ``stdout_bytes`` (that much output), ``grandchild`` (a
 ``setsid`` descendant that sleeps ``lifetime`` seconds, at most 30, and holds the pipes when
 ``hold`` is set), ``call_router`` (run the router's own ``send`` or ``flush`` entry in this
@@ -41,6 +42,8 @@ def main(argv: list[str], behavior_path: str) -> int:
         b: dict[str, Any] = json.load(handle)
     log = b["log"]
     limit = float(b.get("max_seconds", 30))
+    if b.get("start_delay"):
+        time.sleep(min(float(b["start_delay"]), limit))
     stdin = sys.stdin.read() if not b.get("no_read") else ""
     names = [x for x in os.listdir("/proc/self/fd") if x.isdigit()]
     fds = sorted(int(x) for x in names)
