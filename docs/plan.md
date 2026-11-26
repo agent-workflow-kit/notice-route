@@ -90,7 +90,7 @@ This plan implements [interface.md](interface.md) and [design.md](design.md). It
 
 - **0.x:** stages 0 to 6, releases cut by the release job from the PR titles. Interface changes before 1.0 are `feat` commits that name the break, with the registry updated.
 - **1.0 qualifies when:** the `live` suite passes against the three real notifiers on the author's machine; the macOS checklist is done; the review and ticket slices have run through the router for a period without an interface change; the router's interface is declared stable by a deliberate breaking-change commit.
-- **1.x (additive):** `queue` and `destination` management commands; a fallback chain between destinations; a link to the awkit dashboard in notifications; an outbox for `post-fail`; a sliding-window cap if the hourly bucket proves too coarse; more rule conditions only if real use needs them; retry-after hints from notifiers once they report them.
+- **1.x (additive):** `queue` and `destination` management commands (#34, implemented: `queue list|show|drop`, `destination list|enable|disable`, an override table in `state.db` at schema version 2, design C-61); a fallback chain between destinations; a link to the awkit dashboard in notifications; an outbox for `post-fail`; a sliding-window cap if the hourly bucket proves too coarse; more rule conditions only if real use needs them; retry-after hints from notifiers once they report them.
 - **2.0:** nothing planned.
 
 ## Open issues
@@ -100,4 +100,4 @@ Stages 0 to 6 are implemented and released in the 0.x series (see [CHANGELOG.md]
 - **#31 (human):** the live suite against the real notifiers. A person reads [live-testing.md](live-testing.md) and runs `NOTICE_ROUTE_LIVE=1 make live`. It sends real test messages to the user's own destinations, so no agent runs it.
 - **#32 (human):** the macOS checks (cron, `flock`, `zoneinfo`), listed in [live-testing.md](live-testing.md).
 - **#33 (tracking):** the sibling issues and facts this tool relies on. It has no code of its own.
-- **#34 to #41 (1.x):** the additive items in the version roadmap. None is started.
+- **#34 to #41 (1.x):** the additive items in the version roadmap. #34 (the queue and destination management commands) is implemented; the others are not started.

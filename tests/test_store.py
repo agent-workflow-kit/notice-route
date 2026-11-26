@@ -80,7 +80,7 @@ def test_first_open_creates_a_private_versioned_wal_database(
 ) -> None:
     with open_store(gw) as store:
         assert store is not None
-        assert pragma(store.conn, "user_version") == SCHEMA_VERSION == 1
+        assert pragma(store.conn, "user_version") == SCHEMA_VERSION == 2
         assert pragma(store.conn, "application_id") == APPLICATION_ID
         assert str(pragma(store.conn, "journal_mode")).lower() == "wal"
     assert mode(state) == 0o700
@@ -112,7 +112,7 @@ def test_reopening_changes_nothing(gw: Gateway, db: Path) -> None:
     with open_store(gw) as s:
         assert s is not None
         assert s.conn.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0] == 1
-        assert pragma(s.conn, "user_version") == 1
+        assert pragma(s.conn, "user_version") == SCHEMA_VERSION
 
 
 def test_connection_is_hardened(gw: Gateway) -> None:
@@ -329,7 +329,7 @@ def test_a_migration_adds_a_column_with_a_default_and_old_rows_read(gw: Gateway)
         old = add_delivery(store)
     with open_store(gw, migrations=V2) as store:
         assert store is not None
-        assert pragma(store.conn, "user_version") == 2
+        assert pragma(store.conn, "user_version") == SCHEMA_VERSION + 1
         row = store.conn.execute("SELECT id, extra FROM deliveries").fetchone()
         assert row == (old, 7)
 
@@ -344,7 +344,7 @@ def test_a_failing_migration_leaves_the_old_version_usable(gw: Gateway) -> None:
     assert err.value.reason == "migration"
     with open_store(gw) as store:
         assert store is not None
-        assert pragma(store.conn, "user_version") == 1
+        assert pragma(store.conn, "user_version") == SCHEMA_VERSION
         cols = [r[1] for r in store.conn.execute("PRAGMA table_info(deliveries)")]
         assert "a" not in cols
         assert store.conn.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0] == 1
@@ -644,7 +644,7 @@ def test_a_path_with_uri_characters_works(tmp_path: Path) -> None:
     open_store(g).close()
     with ro(g) as store:
         assert store is not None
-        assert pragma(store.conn, "user_version") == 1
+        assert pragma(store.conn, "user_version") == SCHEMA_VERSION
 
 
 # --- read-only open --------------------------------------------------------------------------
@@ -746,7 +746,7 @@ def test_concurrent_first_run_creation_is_safe(
     results = [(p.pid, *p.communicate(timeout=60), p.returncode) for p in children]
     for pid, out, err, code in results:
         assert code == 0, (pid, err)
-        assert out.strip() == "1"
+        assert out.strip() == str(SCHEMA_VERSION)
     db = home / ".local" / "state" / "notice-route" / "state.db"
     c = raw(db)
     assert c.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -778,7 +778,7 @@ def test_a_crash_in_the_middle_of_a_migration_leaves_a_usable_database(
     child.wait(timeout=10)
     with open_store(gw) as store:  # the half-done migration is gone
         assert store is not None
-        assert pragma(store.conn, "user_version") == 1
+        assert pragma(store.conn, "user_version") == SCHEMA_VERSION
         assert "extra" not in [r[1] for r in store.conn.execute("PRAGMA table_info(deliveries)")]
         assert store.conn.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0] == 1
         assert store.conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"

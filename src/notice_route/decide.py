@@ -66,6 +66,7 @@ from typing import Literal
 
 from . import dedup
 from .gateway import Gateway
+from .overrides import disabled_among
 from .queue import Lease, enqueue, insert_delivery, quiet_deliver_after
 from .report import env_unset, worst_case_s
 from .store import Store
@@ -273,16 +274,18 @@ def _classify(
     environ: Mapping[str, str],
     retention: int,
     alert: bool = False,
+    overridden: bool = False,
 ) -> _Plan:
     """Steps 1 to 9. ``state`` yields the connection (``None``: no database, so no records);
     with ``write`` the repeat check and the counter write, otherwise they only read. An ``alert``
     (a failure alert, :func:`decide_alert`) stops after step 6: a destination that would be sent
     now gets an unclaimed ``single`` row due now (``flush`` claims it, so the credential and the
-    cap apply there)."""
+    cap apply there). ``overridden``: an operator disabled the destination (``destination
+    disable``); it is decided exactly like ``enabled: false``."""
     level = notice.level
     if level not in LEVELS:
         raise ValueError("level must be one of info, warn, action, error")
-    if not dest.enabled:
+    if not dest.enabled or overridden:
         return _Plan("disabled", "disabled")
     if _RANK[level] < _RANK[dest.floor]:
         return _Plan("drop", "dropped", "below_floor")
@@ -346,8 +349,11 @@ def preview(
     *,
     now: int,
     environ: Mapping[str, str],
+    overrides: frozenset[str] = frozenset(),
 ) -> list[DestinationDecision]:
     """The decision of every destination, writing nothing: ``test`` and ``send --dry-run``.
+    ``overrides`` are the destinations an operator disabled (the caller reads them from the store
+    it opened: :func:`notice_route.overrides.disabled_among`).
 
     ``open_state`` opens the database read-only (``None``: there is none, read as empty) and is
     called at most once, the first time a destination needs state (steps 4 to 8), so a config
@@ -373,6 +379,7 @@ def preview(
             now=now,
             environ=environ,
             retention=retention,
+            overridden=name in overrides,
         )
         out.append(
             DestinationDecision(
@@ -453,6 +460,8 @@ def _decide_all(
     retention = math.ceil(config.retention_event_ids)
     now = lease.now
     out: list[DestinationDecision] = []
+    # read inside the decision transaction: a ``disable`` that committed first is seen
+    disabled = disabled_among(conn, destinations)
     for name in dict.fromkeys(destinations):
         dest = config.destinations[name]
         plan = _classify(
@@ -465,6 +474,7 @@ def _decide_all(
             environ=environ,
             retention=retention,
             alert=alert,
+            overridden=name in disabled,
         )
         if plan.decision == "suppress":
             repeats = None

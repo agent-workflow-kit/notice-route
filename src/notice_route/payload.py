@@ -175,7 +175,8 @@ REFUSAL_MESSAGES = {
     "payload_unrecognized": "the input is neither a hook payload nor a channel notice",
     "source_mismatch": "the source does not match the payload or is reserved",
     "payload_invalid": "the input is not valid",
-    "hook_recursion": "send and flush are refused inside a router hook",
+    "hook_recursion": "this command is refused inside a router hook",
+    "claimed": "the queue row has a live claim",
 }
 USAGE_MESSAGES = {
     "flags": "the input flags cannot be combined this way",
@@ -187,8 +188,10 @@ USAGE_MESSAGES = {
     "verbose_quiet": "--verbose and --quiet cannot be combined",
     "actor": "--actor must be human:<name> or auto:<name>",
     "decision_id": "--decision-id takes one value of letters, digits and ._:-",
-    "destination": "--destination names a destination that is not configured",
-    "filter": "a history filter is given twice or is not valid",
+    "destination": "the destination is not configured",
+    "name": "the destination name is not valid",
+    "id": "the queue row id takes a whole number from 1 to 9223372036854775807",
+    "filter": "a filter is given twice or is not valid",
     "limit": "--limit takes a whole number from 1 to 1000",
 }
 # The pointers a refusal may carry: fixed strings, never built from the input.
@@ -240,6 +243,8 @@ UsageReason = Literal[
     "actor",
     "decision_id",
     "destination",
+    "name",
+    "id",
     "filter",
     "limit",
 ]

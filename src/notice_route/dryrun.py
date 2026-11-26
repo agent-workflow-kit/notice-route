@@ -22,6 +22,7 @@ from typing import Any
 from .decide import DestinationDecision, Notice, preview
 from .links import build_links
 from .match import decide
+from .overrides import disabled_among
 from .payload import Notification
 from .render import Rendered, render
 from .store import Store
@@ -132,7 +133,20 @@ def _document(
     notice = make_notice(
         n, decision.rule, decision.level, rendered, built.link, pass_through=decision.pass_through
     )
-    results = preview(lambda: store, config, notice, decision.rule.notify, now=now, environ=environ)
+    disabled = (
+        frozenset()
+        if store is None
+        else disabled_among(store.conn, decision.rule.notify)  # an operator's overrides
+    )
+    results = preview(
+        lambda: store,
+        config,
+        notice,
+        decision.rule.notify,
+        now=now,
+        environ=environ,
+        overrides=disabled,
+    )
     doc.update(
         title=rendered.title,
         message=rendered.message,

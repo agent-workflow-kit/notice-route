@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "notice-route/log.json",
   "title": "notice-route log.jsonl record",
-  "description": "One line per destination outcome (record delivery), per flush summary (record flush) and per post-fail hook run (record hook: destination, hook post-fail, mode sync or async, and a fixed-word result; an async hook is logged only as started or spawn_failed, since its end is not observed). Never holds title text, message text, links or credentials; titles and messages appear only as the first 16 hex characters of the SHA-256 of the rendered UTF-8 title and message of the row (for a digest's rows, each row's own text); the dedupe digest as its first 16 characters (dedupe_key_sha256). A drop rule and no_rule write a delivery record with destination null and reason rule_drop or no_rule. A flush record carries totals across the destinations it handled, with destination null. Rotates at 10 MiB, keeping three rotated files (log.1 to log.3). It is a record of recent activity, not an audit trail. A problem with the log warns on stderr and never changes a result. ts is UTC with milliseconds. actor and decision_id are the --actor and --decision-id of the call.",
+  "description": "One line per destination outcome (record delivery), per flush summary (record flush), per post-fail hook run (record hook: destination, hook post-fail, mode sync or async, and a fixed-word result; an async hook is logged only as started or spawn_failed, since its end is not observed) and per change of a destination override (record override: destination and override disabled or cleared; every other field null). Never holds title text, message text, links or credentials; titles and messages appear only as the first 16 hex characters of the SHA-256 of the rendered UTF-8 title and message of the row (for a digest's rows, each row's own text); the dedupe digest as its first 16 characters (dedupe_key_sha256). A drop rule and no_rule write a delivery record with destination null and reason rule_drop or no_rule. A flush record carries totals across the destinations it handled, with destination null. Rotates at 10 MiB, keeping three rotated files (log.1 to log.3). It is a record of recent activity, not an audit trail. A problem with the log warns on stderr and never changes a result. ts is UTC with milliseconds. actor and decision_id are the --actor and --decision-id of the call.",
   "type": "object",
   "properties": {
     "ts": {
@@ -19,7 +19,8 @@
       "enum": [
         "delivery",
         "flush",
-        "hook"
+        "hook",
+        "override"
       ]
     },
     "source": {
@@ -250,6 +251,20 @@
           "type": "null"
         }
       ]
+    },
+    "override": {
+      "oneOf": [
+        {
+          "enum": [
+            "disabled",
+            "cleared"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "An override record: the new state of the destination's override (disabled: set; cleared: deleted)."
     }
   },
   "additionalProperties": false,
@@ -282,7 +297,8 @@
     "expired",
     "duration_ms",
     "mode",
-    "result"
+    "result",
+    "override"
   ],
   "allOf": [
     {
@@ -337,6 +353,9 @@
             "type": "null"
           },
           "result": {
+            "type": "null"
+          },
+          "override": {
             "type": "null"
           }
         }
@@ -419,6 +438,9 @@
             "type": "null"
           },
           "result": {
+            "type": "null"
+          },
+          "override": {
             "type": "null"
           }
         }
@@ -514,6 +536,9 @@
               "lost",
               "started"
             ]
+          },
+          "override": {
+            "type": "null"
           }
         },
         "required": [
@@ -552,6 +577,98 @@
             "$ref": "defs.json#/$defs/level"
           }
         }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "record": {
+            "const": "override"
+          }
+        },
+        "required": [
+          "record"
+        ]
+      },
+      "then": {
+        "properties": {
+          "source": {
+            "type": "null"
+          },
+          "hook": {
+            "type": "null"
+          },
+          "rule": {
+            "type": "null"
+          },
+          "level": {
+            "type": "null"
+          },
+          "outcome": {
+            "type": "null"
+          },
+          "reason": {
+            "type": "null"
+          },
+          "code": {
+            "type": "null"
+          },
+          "attempts": {
+            "type": "null"
+          },
+          "title_sha256": {
+            "type": "null"
+          },
+          "message_sha256": {
+            "type": "null"
+          },
+          "event_id": {
+            "type": "null"
+          },
+          "dedupe_key_sha256": {
+            "type": "null"
+          },
+          "due": {
+            "type": "null"
+          },
+          "sent": {
+            "type": "null"
+          },
+          "queued_retry": {
+            "type": "null"
+          },
+          "failed": {
+            "type": "null"
+          },
+          "unknown": {
+            "type": "null"
+          },
+          "dropped": {
+            "type": "null"
+          },
+          "expired": {
+            "type": "null"
+          },
+          "mode": {
+            "type": "null"
+          },
+          "result": {
+            "type": "null"
+          },
+          "destination": {
+            "$ref": "defs.json#/$defs/destination_name"
+          },
+          "override": {
+            "enum": [
+              "disabled",
+              "cleared"
+            ]
+          }
+        },
+        "required": [
+          "destination",
+          "override"
+        ]
       }
     }
   ]

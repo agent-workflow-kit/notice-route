@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "notice-route/cli/destination-disable.json",
+  "title": "destination disable --json output",
+  "description": "Exit 0 (ok: the override was written, or with dry_run would be) or 22 (no_op). config_enabled, override and enabled are the state after the change (for a dry run, the state a real run would leave); all are null for unconfigured and disabled (the router has no destinations or is disabled).",
+  "type": "object",
+  "properties": {
+    "outcome": {
+      "enum": [
+        "ok",
+        "no_op"
+      ]
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "destination": {
+      "$ref": "../defs.json#/$defs/destination_name"
+    },
+    "action": {
+      "enum": [
+        "disabled",
+        null
+      ]
+    },
+    "reason": {
+      "enum": [
+        "already_disabled",
+        "config_disabled",
+        "unconfigured",
+        "disabled",
+        null
+      ]
+    },
+    "config_enabled": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "override": {
+      "enum": [
+        "disabled",
+        null
+      ]
+    },
+    "enabled": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "outcome",
+    "dry_run",
+    "destination",
+    "action",
+    "reason",
+    "config_enabled",
+    "override",
+    "enabled"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "ok"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "action": {
+            "const": "disabled"
+          },
+          "reason": {
+            "type": "null"
+          },
+          "config_enabled": {
+            "const": true
+          },
+          "enabled": {
+            "const": false
+          },
+          "override": {
+            "const": "disabled"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "action": {
+            "type": "null"
+          },
+          "reason": {
+            "enum": [
+              "already_disabled",
+              "config_disabled",
+              "unconfigured",
+              "disabled"
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

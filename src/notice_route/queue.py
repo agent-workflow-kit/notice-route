@@ -35,9 +35,10 @@ evicted rows back and inserts the ``surfaced`` row in the same transaction:
 :mod:`notice_route.surfacing`).
 Public helpers over the one lease predicate (``_UNCLAIMED``), for ``flush`` (#23) and ``prune``
 (#26): :func:`due_rows`, :func:`claim_row`, :func:`count_due`, :func:`expire_unclaimed`,
-:func:`drop_unclaimed` and :func:`postpone_unclaimed`. No caller needs its own copy of the
-predicate. ``release_claims`` takes one token (``flush`` claims one row per call).
-``prune`` (#26) expires unclaimed queue rows through :func:`expire_unclaimed`.
+:func:`drop_unclaimed` and :func:`postpone_unclaimed`; and, for ``queue list|show|drop`` (#34),
+:func:`view_rows`, which reports the claim state of a row with the same predicate. No caller needs
+its own copy of the predicate. ``release_claims`` takes one token (``flush`` claims one row per
+call). ``prune`` (#26) expires unclaimed queue rows through :func:`expire_unclaimed`.
 The outcome of a sent, failed or retried row is written to its ``deliveries`` row in the
 transaction that calls :func:`complete_row` or :func:`requeue_row`
 (:mod:`notice_route.outcome`, #20).
@@ -66,6 +67,7 @@ __all__ = [
     "Expired",
     "Lease",
     "QueueRow",
+    "QueueView",
     "Released",
     "claim_due",
     "claim_row",
@@ -84,6 +86,7 @@ __all__ = [
     "release_claims",
     "requeue_row",
     "unclaimed_count",
+    "view_rows",
 ]
 
 QUEUE_CAP = 100  # unclaimed rows per destination
@@ -240,6 +243,29 @@ class Released:
     evicted: tuple[Evicted, ...] = ()
 
 
+@dataclass(frozen=True)
+class QueueView:
+    """One row as ``queue list|show`` shows it, every column exactly as stored (the caller checks
+    each against its grammar). ``claim`` is ``live`` when the one lease predicate says the row is
+    claimed, ``lapsed`` when a claim is recorded but the predicate says it is not, else ``none``.
+    Never the message, the link or the claimant token; ``title`` is cut to 100 characters."""
+
+    id: object
+    delivery_id: object
+    destination: object
+    kind: object
+    level: object
+    source: object
+    rule: object
+    title: object
+    deliver_after: object
+    created_at: object
+    attempts: object
+    reason: object
+    claim: Literal["live", "lapsed", "none"]
+    claim_expires: object
+
+
 # --- SQL (constant) ------------------------------------------------------------------------
 
 # Unclaimed at ``now`` with the longest lease ``length``; parameters ``now``, ``now + length``.
@@ -275,6 +301,60 @@ _SELECT_VICTIMS = (
     + _RANK
     + ", q.id LIMIT ?"
 )
+
+
+# parameters: now, now + length (the select list), then destination twice, kind twice, id twice
+# and the limit
+_SELECT_VIEW = (
+    "SELECT q.id, q.delivery_id, d.destination, q.kind, q.level, q.source, q.rule,"
+    " substr(q.title, 1, 100), q.deliver_after, q.created_at, d.attempts, d.reason,"
+    " CASE WHEN " + _UNCLAIMED + " THEN 0 ELSE 1 END,"
+    " (q.claimed_by IS NOT NULL OR q.claim_expires IS NOT NULL), q.claim_expires"
+    + _FROM
+    + " WHERE (? IS NULL OR d.destination = ?) AND (? IS NULL OR q.kind = ?)"
+    " AND (? IS NULL OR q.id = ?) ORDER BY q.id LIMIT ?"
+)
+
+
+def view_rows(
+    conn: _Conn,
+    lease: Lease,
+    *,
+    destination: str | None = None,
+    kind: Kind | None = None,
+    row_id: int | None = None,
+    limit: int = 100,
+) -> list[QueueView]:
+    """Queue rows by id, lowest first, at most ``limit``, optionally of one destination, one kind
+    or one id, with the claim state decided by the one lease predicate at ``lease``. Changes
+    nothing. The columns are returned as stored, for the caller to check."""
+    if kind is not None and kind not in _KINDS:
+        raise ValueError("kind must be held or single")
+    if type(limit) is not int or not 1 <= limit < (1 << 63):
+        raise ValueError("limit must be a positive integer within int64")
+    if row_id is not None:
+        _id(row_id, "row_id")
+    found = conn.execute(
+        _SELECT_VIEW,
+        (
+            lease.now,
+            lease.expires,
+            destination,
+            destination,
+            kind,
+            kind,
+            row_id,
+            row_id,
+            limit,
+        ),
+    ).fetchall()
+    out: list[QueueView] = []
+    for row in found:
+        claim: Literal["live", "lapsed", "none"] = (
+            "live" if row[12] == 1 else ("lapsed" if row[13] else "none")
+        )
+        out.append(QueueView(*row[:12], claim=claim, claim_expires=row[14]))
+    return out
 
 
 def _row(values: tuple[object, ...]) -> QueueRow:
