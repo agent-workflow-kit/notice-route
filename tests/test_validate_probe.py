@@ -679,7 +679,20 @@ def test_a_signal_during_the_output_when_no_call_started_exits_128_plus_n_with_n
     assert (code, out) == (128 + signal.SIGTERM, "")
 
 
-@pytest.mark.parametrize("case", ["no_config", "nothing_to_probe", "all_skipped"])
+def test_a_signal_inside_run_probes_with_every_probe_skipped_exits_128_plus_n(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    n = rig.notifier()
+    n.stub.chmod(0o777)  # cmd[0] fails the check: never started
+    rig.configure({"d": {"notifier": n}})
+    # delivered once the targets exist and the loop passed its stop() check, before any call
+    _signal_inside(monkeypatch, gateway_module.Gateway, "resolve_exec", after=True)
+    code, out, _ = rig.run(*PROBE)
+    assert (code, out) == (128 + signal.SIGTERM, "")
+    assert invokes(n) == []
+
+
+@pytest.mark.parametrize("case", ["no_config", "nothing_to_probe"])
 def test_a_signal_after_the_config_load_and_before_any_call_exits_128_plus_n(
     rig: Rig, monkeypatch: pytest.MonkeyPatch, case: str
 ) -> None:
@@ -688,9 +701,6 @@ def test_a_signal_after_the_config_load_and_before_any_call_exits_128_plus_n(
     n = rig.notifier()
     if case == "nothing_to_probe":
         rig.configure({"g": {"notifier": n, "kind": "generic"}})
-    elif case == "all_skipped":
-        n.stub.chmod(0o777)  # cmd[0] fails the check: never started
-        rig.configure({"d": {"notifier": n}})
     _signal_inside(monkeypatch, cli, "run_probes", after=False)
     code, out, _ = rig.run(*PROBE)
     assert (code, out) == (128 + signal.SIGTERM, "")
