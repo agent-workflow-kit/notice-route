@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "notice-route/hooks/post-fail.json",
   "title": "post-fail hook payload (stdin)",
-  "description": "Run by the next flush after a destination's failure was surfaced: at most once per code and destination per UTC day, except rate_capped, env_missing, overflow and expired, at most once per destination per UTC hour; at most 8 distinct codes per destination per UTC day, after which further codes are surfaced once that day as other. Carries no title, message, link or payload text. The router also routes this payload through its own rules as source notice-route and hook post-fail (the bare names source and level are the derived fields of templates; the failed notification's are notification_source and notification_level).",
+  "description": "Run by the next flush after a destination's failure was surfaced: at most once per code and destination per UTC day, except rate_capped, env_missing, overflow and expired, at most once per destination per UTC hour; at most 8 distinct codes per destination per UTC day, after which further codes are surfaced once that day as other. A synchronous hook that fails is run again with this same payload by a later flush (an outbox, at most 6 attempts within 24 hours), so a hook may see one payload more than once: key its effect on event_id and code. Carries no title, message, link or payload text. The router also routes this payload through its own rules as source notice-route and hook post-fail (the bare names source and level are the derived fields of templates; the failed notification's are notification_source and notification_level).",
   "type": "object",
   "properties": {
     "tool": {

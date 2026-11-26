@@ -90,7 +90,7 @@ This plan implements [interface.md](interface.md) and [design.md](design.md). It
 
 - **0.x:** stages 0 to 6, releases cut by the release job from the PR titles. Interface changes before 1.0 are `feat` commits that name the break, with the registry updated.
 - **1.0 qualifies when:** the `live` suite passes against the three real notifiers on the author's machine; the macOS checklist is done; the review and ticket slices have run through the router for a period without an interface change; the router's interface is declared stable by a deliberate breaking-change commit.
-- **1.x (additive):** `queue` and `destination` management commands (#34, implemented: `queue list|show|drop`, `destination list|enable|disable`, an override table in `state.db` at schema version 2, design C-61); a fallback chain between destinations; a link to the awkit dashboard in notifications; an outbox for `post-fail`; a sliding-window cap if the hourly bucket proves too coarse; more rule conditions only if real use needs them; retry-after hints from notifiers once they report them.
+- **1.x (additive):** `queue` and `destination` management commands (#34, implemented: `queue list|show|drop`, `destination list|enable|disable`, an override table in `state.db` at schema version 2, design C-61); a fallback chain between destinations; a link to the awkit dashboard in notifications; an outbox for `post-fail` (#37, implemented: a `hook_outbox` table at schema version 3 retries synchronous hooks, design C-62); a sliding-window cap if the hourly bucket proves too coarse; more rule conditions only if real use needs them; retry-after hints from notifiers once they report them.
 - **2.0:** nothing planned.
 
 ## Open issues
