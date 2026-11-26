@@ -22,8 +22,8 @@ APPLICATION_ID = 0x4E525445
 Step = str | Callable[[sqlite3.Connection], None]
 Migration = Sequence[Step]
 
-# Tables the store relies on (``_check_tables``): the seven of version 1 and the override table of
-# version 2.
+# Tables the store relies on (``_check_tables``): the seven of version 1, the override table of
+# version 2 and the hook outbox of version 3.
 TABLES = (
     "deliveries",
     "queue",
@@ -33,6 +33,7 @@ TABLES = (
     "rate",
     "meta",
     "destination_overrides",
+    "hook_outbox",
 )
 
 _V1: tuple[str, ...] = (
@@ -160,5 +161,29 @@ _V2: tuple[str, ...] = (
     """,
 )
 
-MIGRATIONS: tuple[Migration, ...] = (_V1, _V2)
+# Version 3 (docs/design.md C-62): the ``post-fail`` outbox. One row per taken ``surfaced`` row and
+# synchronous hook entry; ``hook_key`` identifies the entry without storing its ``cmd``;
+# ``payload`` is the hook's stdin as JSON (validated again before every run). ``attempts`` rises
+# when an attempt is claimed; ``claimed_by`` and ``claim_expires`` are the lease of a running one.
+_V3: tuple[str, ...] = (
+    """
+    CREATE TABLE hook_outbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        surfaced_id INTEGER NOT NULL,
+        destination TEXT NOT NULL,
+        hook_key TEXT NOT NULL,
+        event_id INTEGER NOT NULL,
+        payload TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt INTEGER NOT NULL,
+        claimed_by TEXT,
+        claim_expires INTEGER,
+        UNIQUE (surfaced_id, hook_key)
+    )
+    """,
+    "CREATE INDEX hook_outbox_due ON hook_outbox (next_attempt)",
+)
+
+MIGRATIONS: tuple[Migration, ...] = (_V1, _V2, _V3)
 SCHEMA_VERSION = len(MIGRATIONS)

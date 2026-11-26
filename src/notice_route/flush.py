@@ -56,15 +56,16 @@ from __future__ import annotations
 
 import math
 import sqlite3
+import secrets
 import threading
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
-from . import dedup
+from . import dedup, outbox
 from . import log as logmod
-from .alerts import HookJob, take_surfaced
+from .alerts import HookJob, stored_payload, take_surfaced
 from .calling import Busy, Called, CallEnd, Escaped, Gate, NotRun, Skipped, call_row
 from .decide import claim_call, count_call, give_back, hour_start, instant
 from .digest import Digest, build, record_digest, record_escaped_digest
@@ -314,34 +315,33 @@ def run_flush(
         if full:
             _meta(store, "flush_last", wall)
         taken = _take_surfaced(run, store)
-        sync_jobs = [
-            (job, hook)
-            for job in taken.jobs
-            for hook in config.hooks_post_fail
-            if not hook.is_async
-        ]
         with (
             ThreadPoolExecutor(max_workers=len(selected)) as pool,
             ThreadPoolExecutor(max_workers=_HOOK_THREADS) as hook_pool,
         ):
-            hook_futures = [
-                hook_pool.submit(_run_sync_hook, run, hook, job) for job, hook in sync_jobs
-            ]
+            planned = _run_outbox(run, store, hook_pool)
             futures = [pool.submit(_destination, run, d) for d in selected]
             tallies = [f.result() for f in futures]
-            words = [_hook_word(f) for f in hook_futures]
+            attempts = [(p, _attempt_of(p.future)) for p in planned.pending]
         hook_records: list[tuple[str, str, str]] = []  # destination, mode, result
         hook_failures: list[str] = []
-        late: list[tuple[HookJob, Hook]] = []  # a signal came first: started detached instead
-        for (job, hook), word in zip(sync_jobs, words, strict=True):
-            if word is _NOT_STARTED:
-                late.append((job, hook))
-                continue
-            hook_records.append((job.destination, "sync", word or "ok"))
-            if word is not None:
-                hook_failures.append(word)
+        gave_up: list[str] = []
+        for destination, word in planned.ended:
+            hook_records.append((destination, "sync", "gave_up"))
+            gave_up.append(word)
+        late: list[_Pending] = []  # a signal came first: started detached instead
+        for pending, attempt in attempts:
+            if attempt.not_started:
+                late.append(pending)
+            elif attempt.ran:
+                destination = pending.row.destination
+                hook_records.append((destination, "sync", attempt.word or "ok"))
+                if attempt.word is not None:
+                    (gave_up if attempt.gave_up else hook_failures).append(attempt.word)
+                if attempt.gave_up:
+                    hook_records.append((destination, "sync", "gave_up"))
         result = FlushResult(0)
-        if taken.error:
+        if taken.error or planned.error:
             result.error = ("internal", "state database cannot be written")
         if full:
             missing = any(t.state == "env_missing" for t in tallies)
@@ -354,15 +354,22 @@ def run_flush(
         # detached: nobody waits for these, and no thread is running now; the supervisor closes
         # every descriptor, so it holds neither the flush lock nor the database
         detached = [(j, h) for j in taken.jobs for h in config.hooks_post_fail if h.is_async]
-        for job, hook in detached + late:
+        for job, hook in detached:
             failed = start_detached(gateway, hook, job.payload)
-            # a sync hook that a signal kept from starting is still logged as mode sync
-            mode = "sync" if (job, hook) in late else "async"
-            hook_records.append((job.destination, mode, failed or "started"))
+            hook_records.append((job.destination, "async", failed or "started"))
+            if failed is not None:
+                hook_failures.append(failed)
+        for pending in late:  # logged as mode sync; the row is deleted once it is started
+            failed = _start_late(run, store, pending)
+            if failed == _GONE:
+                continue
+            hook_records.append((pending.row.destination, "sync", failed or "started"))
             if failed is not None:
                 hook_failures.append(failed)
         for destination, mode, word in hook_records:
             run.log_hook(destination, mode, word)
+    for word in dict.fromkeys(gave_up):
+        finished.warnings.append(f"a post-fail hook gave up ({word})")
     for word in dict.fromkeys(hook_failures):
         finished.warnings.append(f"a post-fail hook failed ({word})")
     if taken.faults:
@@ -372,22 +379,132 @@ def run_flush(
     return finished
 
 
-_NOT_STARTED: Any = object()  # a sync hook that a signal kept from starting
+@dataclass
+class _Attempt:
+    """What one worker did with one outbox row."""
+
+    ran: bool = False
+    not_started: bool = False  # a signal came first
+    word: str | None = None  # the failure word of a run that failed
+    gave_up: bool = False  # that run was the last one
 
 
-def _run_sync_hook(run: _Run, hook: Hook, job: HookJob) -> str | None:
-    """One synchronous hook: not started once a signal was trapped (a hook already running is
-    like a call in progress and finishes within its timeout)."""
+@dataclass
+class _Pending:
+    row: outbox.Row
+    hook: Hook
+    future: Future[_Attempt]
+
+
+@dataclass
+class _Planned:
+    pending: list[_Pending] = field(default_factory=list[_Pending])
+    ended: list[tuple[str, str]] = field(default_factory=list[tuple[str, str]])  # dest, word
+    error: bool = False
+
+
+def _run_outbox(run: _Run, store: Store, hook_pool: ThreadPoolExecutor) -> _Planned:
+    """Plan and start the due outbox rows (design C-62): rows that reached a limit are ended, rows
+    of an entry or destination the config no longer has are deleted, and each other due row (at
+    most :data:`outbox.RUN_LIMIT`) goes to a worker."""
+    planned = _Planned()
+    config = run.config
+    by_key = {
+        k: h for k, h in zip(outbox.hook_keys(config.hooks_post_fail), config.hooks_post_fail)
+        if k is not None
+    }  # fmt: skip
+    try:
+        with store.write() as conn:
+            now = instant(run.gateway.wall())
+            planned.ended = [(d, w) for _, d, w in outbox.end_lapsed(conn, now)]
+            rows: list[tuple[outbox.Row, Hook]] = []
+            for row in outbox.due(conn, now):
+                hook = by_key.get(row.hook_key)
+                if hook is None or row.destination not in config.destinations:
+                    outbox.delete(conn, row.id)
+                else:
+                    rows.append((row, hook))
+    except StoreError:
+        planned.error = True
+        return planned
+    for row, hook in rows:
+        future = hook_pool.submit(_outbox_attempt, run, row, hook)
+        planned.pending.append(_Pending(row, hook, future))
+    return planned
+
+
+def _outbox_attempt(run: _Run, row: outbox.Row, hook: Hook) -> _Attempt:
+    """One attempt: claim the row, run the hook, then delete the row or schedule the next
+    attempt. Not started once a signal was trapped (a hook already running is like a call in
+    progress and finishes within its timeout)."""
     if run.trap.received is not None:
-        return _NOT_STARTED
-    return run_hook(run.gateway, hook, job.payload)
+        return _Attempt(not_started=True)
+    token = secrets.token_hex(16)
+    lease = math.ceil(hook.timeout) + outbox.LEASE_GRACE_S
+    try:
+        with open_store(run.gateway) as store:
+            with store.write() as conn:
+                claimed = outbox.claim(conn, row.id, instant(run.gateway.wall()), lease, token)
+            if claimed is None:
+                return _Attempt()  # another run has it, or it is not due after all
+            payload = stored_payload(run.config, row.destination, claimed.payload)
+            if payload is None:
+                with store.write() as conn:
+                    outbox.succeed(conn, row.id, token)  # not a payload we made: dropped
+                return _Attempt()
+            try:
+                word = run_hook(run.gateway, hook, payload)
+            except Exception:  # a hook never changes the result
+                word = "lost"
+            try:
+                with store.write() as conn:
+                    if word is None:
+                        outbox.succeed(conn, row.id, token)
+                        return _Attempt(ran=True)
+                    gave_up = outbox.fail(conn, row.id, token, instant(run.gateway.wall()))
+            except StoreError:  # the claim lapses; the row is tried again
+                return _Attempt(ran=True, word=word)
+            return _Attempt(ran=True, word=word, gave_up=gave_up)
+    except StoreError:
+        return _Attempt()
 
 
-def _hook_word(future: Future[str | None]) -> str | None:
+def _attempt_of(future: Future[_Attempt]) -> _Attempt:
     try:
         return future.result()
-    except Exception:  # a hook never changes the result
-        return "lost"
+    except Exception:  # a worker never changes the result
+        return _Attempt(ran=True, word="lost")
+
+
+_GONE = "gone"  # the row was not there or not ours: nothing was started
+
+
+def _start_late(run: _Run, store: Store, pending: _Pending) -> str | None:
+    """A synchronous hook that a signal kept from starting: started detached once (as in 1.0),
+    and its row deleted when that worked. ``None`` when started, ``_GONE`` when there was nothing to
+    start, else a failure word."""
+    payload = None
+    try:
+        with store.write() as conn:
+            found = conn.execute(
+                "SELECT payload FROM hook_outbox WHERE id = ?", (pending.row.id,)
+            ).fetchone()
+            if found is not None:
+                payload = stored_payload(run.config, pending.row.destination, found[0])
+                if payload is None:
+                    outbox.delete(conn, pending.row.id)
+    except StoreError:
+        return "spawn_failed"
+    if payload is None:
+        return _GONE
+    failed = start_detached(run.gateway, pending.hook, payload)
+    if failed is None:
+        try:
+            with store.write() as conn:
+                outbox.delete(conn, pending.row.id)
+        except StoreError:
+            pass  # the row stays and is run again: at least once
+    return failed
 
 
 @dataclass

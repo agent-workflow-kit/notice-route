@@ -80,7 +80,7 @@ def test_first_open_creates_a_private_versioned_wal_database(
 ) -> None:
     with open_store(gw) as store:
         assert store is not None
-        assert pragma(store.conn, "user_version") == SCHEMA_VERSION == 2
+        assert pragma(store.conn, "user_version") == SCHEMA_VERSION == 3
         assert pragma(store.conn, "application_id") == APPLICATION_ID
         assert str(pragma(store.conn, "journal_mode")).lower() == "wal"
     assert mode(state) == 0o700
