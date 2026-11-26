@@ -1,0 +1,8 @@
+{
+  "outcome": "no_op",
+  "probe": true,
+  "destinations": [],
+  "warnings": [],
+  "send_worst_case_s": 0,
+  "flush_age_s": null
+}

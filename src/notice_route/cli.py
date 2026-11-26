@@ -42,11 +42,12 @@ from .history import (
     run_history,
 )
 from .payload import InputFlags, PayloadError, UsageError, load_notification
+from .probe import Probes, run_probes
 from .prune import PruneOptions, run_prune
 from .report import rules_document, validate_document
 from .send import SendOptions, SendResult, run_send
 from .store import StoreError, open_readonly
-from .validate import load_valid_config
+from .validate import Config, load_valid_config
 
 PROG = "notice-route"
 DESCRIPTION = "Routes notifications to channel tools by level, source, labels and time."
@@ -112,7 +113,11 @@ def build_parser() -> argparse.ArgumentParser:
     validate = commands.add_parser("validate", help="check the config offline", allow_abbrev=False)
     _add_global_flags(validate, top=False)
     _add_config_flag(validate)
-    # TODO(#29): --probe (it refuses --config, like every command that runs a notifier).
+    validate.add_argument(
+        "--probe",
+        action="store_true",
+        help="also run each notifier's own validate (never sends; refuses --config)",
+    )
 
     test = commands.add_parser(
         "test", help="show what send would do, without doing it", allow_abbrev=False
@@ -296,13 +301,16 @@ def _validate_text(doc: dict[str, Any]) -> None:
     for d in doc["destinations"]:
         unset = ",".join(d["env_unset"]) or "none"
         surfaced = ",".join(d["surfaced_today"]) or "none"
-        _out(
-            _safe(
-                f"destination {d['name']}: cmd_ok={str(d['cmd_ok']).lower()} "
-                f"env_unset={unset} surfaced_today={surfaced}"
-            )
-            + "\n"
+        line = (
+            f"destination {d['name']}: cmd_ok={str(d['cmd_ok']).lower()} "
+            f"env_unset={unset} surfaced_today={surfaced}"
         )
+        if d["probe"] is not None:
+            p = d["probe"]
+            code = "none" if p["exit"] is None else str(p["exit"])
+            enabled = "unknown" if p["enabled"] is None else str(p["enabled"]).lower()
+            line += f" probe={p['status']} exit={code} enabled={enabled}"
+        _out(_safe(line) + "\n")
     for w in doc["warnings"]:
         where = w["rule"] or w["destination"]
         _out(
@@ -331,8 +339,41 @@ def _run_rules(args: argparse.Namespace, gateway: Gateway) -> int:
 
 
 def _run_validate(args: argparse.Namespace, gateway: Gateway) -> int:
-    config = load_valid_config(gateway, args.config)
-    doc, code = validate_document(config, gateway)
+    if not args.probe:
+        config = load_valid_config(gateway, args.config)
+        doc, code = validate_document(config, gateway)
+        return _validate_output(args, config, doc, code)
+    if args.config is not None:
+        raise UsageError("config")  # a probe runs a command: it never takes --config
+    # A signal before the first call exits 128+N; once a call runs it finishes (the trap only
+    # sets a flag) and the report follows.
+    with gateway.trapped_signals() as trap:
+        trap.armed = True
+        try:
+            config = load_valid_config(gateway, None)
+            trap.armed = False  # a call that started finishes; a signal only sets the flag
+            probes = Probes({}) if config is None else run_probes(gateway, config, trap)
+            if probes.signal is not None:
+                return 128 + probes.signal
+            doc, code = validate_document(config, gateway, probes.results)
+        except Interrupted as exc:
+            return 128 + exc.signum
+        finally:
+            trap.armed = False
+        trap.armed = True
+        try:
+            return _validate_output(args, config, doc, code)
+        except Interrupted as exc:
+            gateway.discard_stdout()
+            gateway.discard_stderr()
+            return 128 + exc.signum
+        finally:
+            trap.armed = False
+
+
+def _validate_output(
+    args: argparse.Namespace, config: Config | None, doc: dict[str, Any], code: int
+) -> int:
     if args.json:
         _json(doc)
     else:

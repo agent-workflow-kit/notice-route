@@ -367,3 +367,28 @@ def test_disabled_without_json_prints_the_message_on_stderr_only(
     result = run(n, home, args=["send", "--stdin-json"])
     assert (result.returncode, result.stdout) == (22, b"")
     assert result.stderr == b"disabled in config\n"
+
+
+def test_validate_prints_its_document_reads_no_stdin_and_sends_nothing(
+    make_notifier: Make, home: Path
+) -> None:
+    n = make_notifier("ha-notice", tool="ha-notice")
+    result = run(n, home, stdin=b"", args=["validate", "--json", "--probe"])
+    doc = last_json(result)
+    assert result.returncode == 0
+    assert (doc["ok"], doc["enabled"], doc["probe"]) == (True, True, {"api_ok": True})
+    assert n.events("stdin") == []
+    plain = run(make_notifier("s"), home, stdin=b"", args=["validate", "--json"])
+    assert "probe" not in last_json(plain)
+
+
+def test_validate_honors_disabled_and_scripted_exits(make_notifier: Make, home: Path) -> None:
+    off = run(make_notifier(disabled=True), home, stdin=b"", args=["validate", "--json"])
+    assert (off.returncode, last_json(off)) == (22, {"outcome": "disabled"})
+    bad = run(
+        make_notifier("b", error={"code": "credential_invalid"}),
+        home,
+        stdin=b"",
+        args=["validate", "--json"],
+    )
+    assert (bad.returncode, last_json(bad)["error"]["code"]) == (12, "credential_invalid")

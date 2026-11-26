@@ -76,7 +76,7 @@ The sources are the notifiers' interfaces (`Calling from automation`, `Exit code
 ## Simplifications
 
 - Not modeled (exit 1, code `fake_unsupported`, a code in no sibling schema): `clear`,
-  `validate`, `--dry-run`, `--file` and the text flags as input sources, ha-notice `actions`.
+  `--dry-run`, `--file` and the text flags as input sources, ha-notice `actions`.
 - The sanitizer is reduced to the emptiness test (removed characters, whitespace and marks).
   Text is never cut, so `truncated` is always false, and `bytes` is an approximation of the
   request body.
@@ -92,7 +92,20 @@ The sources are the notifiers' interfaces (`Calling from automation`, `Exit code
 - Authored hook payload examples (`examples/` under agent-spawn's pin) are written here: the
   producer publishes schemas but no examples. They validate against the pinned schemas.
 
+- `validate [--probe] [--json]` (#29) reads no stdin and sends nothing; the scripted effects
+  (`hang`, `sleep`, `grandchild`, output, `exit`, `error`, `disabled`, `die_by_signal`) apply.
+  Default output `{ok, enabled, checks: [config]}` plus `probe: {api_ok}` for `ha-notice` with
+  `--probe`. It is built from the interface text: no pinned `validate` schema exists under
+  `tests/sibling-schemas/`, no check list beyond `config`, and `disabled` answers exit 22 for
+  plain `validate` as well (the real `slack-notice` answers exit 0 with `enabled` false; the
+  real `ha-notice` answers 22 only with `--probe` or `--test-message`). Use `result` to script
+  `enabled`.
+
 ## Unverified (for the live-verification issue, #31)
+
+- `validate --json [--probe]` of the real trio: the exact stdout (`enabled` present as a
+  boolean on exit 0, `{"outcome":"disabled"}` on exit 22), the exit codes of failed checks, and
+  the real `wsl-notice` `--probe` grammar (the router passes `validate --json --probe` for it).
 
 - wsl-notice: its repository is `desktop-notice` (design 0.1.0, schemas in `schemas/cli`); this
   fake assumes the same call shape, exit codes and envelope as the other two and has no

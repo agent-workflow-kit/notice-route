@@ -35,7 +35,7 @@ On ``acquired`` False the pipeline records :data:`notice_route.outcome.LOCK_BUSY
 (requeue 60 s later, no attempt, hourly count given back with ``count_hour``).
 ``send.py`` (#22) wraps its :func:`~notice_route.notify.call_notifier` call with this.
 ``flush`` (#23) does the same for each row it sends; :func:`flush_lock` is its own lock.
-TODO(#29): ``validate --probe`` calls a notifier under the same lock.
+``validate --probe`` (#29, ``probe.py``) calls a notifier under the same lock.
 """
 
 from __future__ import annotations
