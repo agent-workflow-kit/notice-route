@@ -540,6 +540,28 @@ def test_a_hanging_crontab_times_out_with_exit_1(
         assert "unchanged" not in err and "check it" in err
 
 
+def test_a_write_that_hangs_or_overflows_says_it_may_have_changed(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R13: only a write that exited nonzero is known to have left the table alone."""
+    monkeypatch.setattr(gateway_module, "CRONTAB_TIMEOUT", 0.3)
+    rig.crontab.set_table(b"0 0 * * * keep\n")
+    rig.crontab.behave(hang="write", hang_s=20)
+    err = rig.run("install")[2]
+    assert "may have changed" in err and "unchanged" not in err
+    monkeypatch.setattr(gateway_module, "CRONTAB_TIMEOUT", 10.0)
+    rig.crontab.behave(stdout_noise="x" * (gateway_module.STDOUT_LIMIT + 10))
+    err = rig.run("install")[2]
+    assert "may have changed" in err and "unchanged" not in err
+
+
+def test_a_write_that_exits_nonzero_says_it_is_unchanged(rig: Rig) -> None:
+    rig.crontab.set_table(b"0 0 * * * keep\n")
+    rig.crontab.behave(write_exit=1, write_stderr="nope\n")
+    err = rig.run("install")[2]
+    assert "(it is unchanged)" in err and "may have changed" not in err
+
+
 def test_a_crontab_too_large_to_read_is_refused(rig: Rig) -> None:
     rig.crontab.behave(huge_list=gateway_module.STDOUT_LIMIT + 10)
     code, _, err = rig.run("install")

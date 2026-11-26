@@ -178,3 +178,45 @@ def test_the_fake_is_the_crontab_on_path_and_runs(fake_crontab: FakeCrontab) -> 
     assert result.returncode == 1
     assert result.stderr == b"no crontab for fakeuser\n"
     assert fake_crontab.kinds() == ["list"]
+
+
+def test_wrapper_programs_with_a_crontab_argument_are_refused(
+    crontab_guard_fixture: Guard, spawned: list[object]
+) -> None:
+    crontab_guard_fixture.expected = True
+    for argv in (
+        ["timeout", "5", "crontab", "-l"],
+        ["nohup", "/usr/bin/crontab", "-l"],
+        ["nice", "-n", "5", "crontab", "-l"],
+        ["setsid", "crontab", "-l"],
+        ["sudo", "-u", "someone", "crontab", "-l"],
+    ):
+        with pytest.raises(RealCrontabAttempt):
+            subprocess.run(argv, env={"PATH": "/usr/bin:/bin"}, check=False)
+    assert spawned == []
+
+
+def test_a_harmless_wrapper_command_is_not_refused(
+    crontab_guard_fixture: Guard, spawned: list[object]
+) -> None:
+    with pytest.raises(OSError, match="test recorder"):
+        subprocess.run(["nice", "true"], env={"PATH": "/usr/bin:/bin"}, check=False)
+    assert len(spawned) == 1
+    assert crontab_guard_fixture.attempts == []
+
+
+def test_posix_spawnp_searches_the_parents_path_not_the_child_env(
+    crontab_guard_fixture: Guard,
+    spawned: list[object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    crontab_guard_fixture.expected = True
+    link_dir = tmp_path / "linkbin"
+    link_dir.mkdir()
+    real = next(p for p in sorted(SYSTEM_CRONTABS) if os.access(p, os.X_OK))
+    (link_dir / "innocent-tool").symlink_to(real)
+    monkeypatch.setenv("PATH", f"{link_dir}:/usr/bin:/bin")
+    with pytest.raises(RealCrontabAttempt):
+        os.posix_spawnp("innocent-tool", ["innocent-tool", "-l"], {})
+    assert spawned == []

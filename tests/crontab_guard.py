@@ -13,9 +13,12 @@ The suite must never read or write the user's real crontab, so every test runs u
 - The guard sits in front of ``subprocess.Popen`` (so ``subprocess.run`` and the gateway),
   the ``os.exec*`` and ``os.spawn*`` families and ``os.posix_spawn(p)``; ``os.system`` is
   refused for every command. A bare name is searched the way the call itself would search it
-  (``os.get_exec_path`` of the child's ``env``, so a child ``env`` without ``PATH`` uses the
+  (``os.get_exec_path`` of the child's ``env`` except for ``posix_spawnp``, which uses the
+  parent's ``PATH``, so a child ``env`` without ``PATH`` uses the
   default path, never the parent's). With ``shell=True`` and for an interpreter or launcher
-  (``sh``, ``bash``, ``dash``, ``zsh``, ``env``, ``xargs``, ``python*``) every word of every
+  (``sh``, ``bash``, ``dash``, ``zsh``, ``env``, ``xargs``, ``python*`` and the wrappers
+  ``timeout``, ``nohup``, ``nice``, ``setsid``, ``flock``, ``time``, ``sudo``, ``doas``,
+  ``ionice``, ``stdbuf``, ``chroot``, ``command``, ``exec``, ``busybox``) every word of every
   argument is checked too.
 - The real start functions are kept in ``Guard.real`` (a table the wrappers call at call
   time), so a test of the guard replaces the entries with recorders and can never reach the
@@ -23,9 +26,11 @@ The suite must never read or write the user's real crontab, so every test runs u
 
 What the guard does NOT cover: it lives in this interpreter only. A child process is not
 guarded (one that resets ``PATH``, uses an absolute path or an empty environment escapes;
-today no test child can reach cron). Also unguarded: ``ctypes``/``cffi`` calls,
-``_posixsubprocess.fork_exec``, a copied or hard-linked ``crontab`` binary (its realpath is not a
-system path and its name may differ) and code that runs at import time before the fixture.
+today no test child can reach cron). Also unguarded: any other wrapper or interpreter not
+listed above (``perl``, ``ruby``, ``node``, ``awk``, ``find -exec``, ``strace``, ...),
+``ctypes``/``cffi`` calls, ``_posixsubprocess.fork_exec``, a copied or hard-linked ``crontab``
+binary (its realpath is not a system path and its name may differ)
+and code that runs at import time before the fixture.
 """
 
 from __future__ import annotations
@@ -57,7 +62,13 @@ SYSTEM_CRONTABS = frozenset(
     }
 )
 
-LAUNCHERS = frozenset({"sh", "bash", "dash", "zsh", "env", "xargs"})
+LAUNCHERS = frozenset(
+    {
+        "sh", "bash", "dash", "zsh", "env", "xargs",
+        "timeout", "nohup", "nice", "setsid", "flock", "time", "sudo", "doas",
+        "ionice", "stdbuf", "chroot", "command", "exec", "busybox",
+    }
+)  # fmt: skip
 _WORD_BREAKS = re.compile(r"[\s;&|()<>`'\"$]+")
 
 
@@ -196,7 +207,10 @@ def install(monkeypatch: pytest.MonkeyPatch, guard: Guard) -> None:
                 argv = list(rest[:-1] if letter_e and rest else rest)
                 if letter_e and rest:
                     env = rest[-1]
-            search = _exec_dirs(env) if searched else None
+            if name == "posix_spawnp":
+                search: list[str] | None = _exec_dirs(None)  # it searches the parent's PATH
+            else:
+                search = _exec_dirs(env) if searched else None
             guard.check_launch(path, argv or [path], search)
             return guard.real[name](*args, **kwargs)
 
