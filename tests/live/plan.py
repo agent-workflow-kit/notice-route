@@ -13,9 +13,7 @@ from collections.abc import Callable, Mapping
 from tests.live.support import REPORT_DIR_VAR, TOOLS, tool_config
 
 
-def describe(
-    environ: Mapping[str, str], which: Callable[[str], str | None] = shutil.which
-) -> str:
+def describe(environ: Mapping[str, str], which: Callable[[str], str | None] = shutil.which) -> str:
     lines = [
         "notice-route live suite (opt-in, side-effecting)",
         "",
@@ -24,7 +22,7 @@ def describe(
         "to the destinations those notifiers' own configs name. It never runs crontab.",
         "",
     ]
-    for name, spec in TOOLS.items():
+    for name in TOOLS:
         cfg, reason = tool_config(name, environ, need_credential=True, which=which)
         if cfg is not None:
             cred = f", credential variable {cfg.cred_env} (set)" if cfg.cred_env else ""
@@ -33,7 +31,11 @@ def describe(
         else:
             lines.append(f"  {name}: its tests will be skipped ({reason})")
     where = environ.get(REPORT_DIR_VAR) or "a new private directory under the temp directory"
-    lines += ["", f"The observation report is written to: {where}", "Read docs/live-testing.md first."]
+    lines += [
+        "",
+        f"The observation report is written to: {where}",
+        "Read docs/live-testing.md first.",
+    ]
     return "\n".join(lines)
 
 

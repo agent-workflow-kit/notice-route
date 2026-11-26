@@ -23,7 +23,7 @@ ALL = ["slack-notice", "ha-notice", "wsl-notice"]
 def test_validate_json_real_output(name: str, make_tool: Callable[..., ToolConfig],
                                    report: Report) -> None:  # fmt: skip
     """FIDELITY (#29): the exact stdout and exit code of `validate --json [--probe]`. The router
-    reads only the exit code and the boolean `enabled` (exit 22 reports `{"outcome":"disabled"}`)."""
+    reads only the exit code and the boolean `enabled` (exit 22 is `{"outcome":"disabled"}`)."""
     cfg = make_tool(name, need_credential=cfg_needs(name))
     r = run_tool(cfg, cfg.spec.probe_args, os.environ, credential=True)
     report.record(f"validate/{name}", code=r.code, stdout=r.out[:2000], stderr=r.err[:400],
@@ -78,7 +78,8 @@ def test_router_validate_probe(make_tool: Callable[..., ToolConfig], router: Liv
         names.append(dest)
     router.pass_names = tuple(c.cred_env for c in found.values() if c.cred_env)
     router.write_config({"destinations": dests,
-                         "rules": [{"name": "pt", "match": {"level_min": "info"}, "notify": names}]})  # fmt: skip
+                         "rules": [{"name": "pt", "match": {"level_min": "info"},
+                                    "notify": names}]})  # fmt: skip
     r = router.run("validate", "--probe", "--json")
     report.record("router_validate_probe", code=r.code, stdout=r.out[:3000], stderr=r.err[:400])
     assert r.code in (0, 12, 22), r.code

@@ -145,11 +145,17 @@ def test_bad_credential_fails_surfaces_and_alerts(name: str, make_tool: Callable
     hook.chmod(0o700)
     config = json.loads((router.home / ".config/notice-route/config.yaml").read_text())
     config["destinations"]["capture"] = {"kind": "generic", "cmd": [str(capture)]}
-    config["rules"].insert(0, {
-        "name": "alerts", "match": {"source": "notice-route", "hook": "post-fail"},
-        "notify": ["capture"], "level": "error",
-        "title": "notice-route live test alert",
-        "message": "TEST ALERT from the live suite: delivery to {{object_id}} failed."})  # fmt: skip
+    config["rules"].insert(
+        0,
+        {
+            "name": "alerts",
+            "match": {"source": "notice-route", "hook": "post-fail"},
+            "notify": ["capture"],
+            "level": "error",
+            "title": "notice-route live test alert",
+            "message": "TEST ALERT from the live suite: delivery to {{object_id}} failed.",
+        },
+    )
     config["hooks"] = {"post-fail": [{"cmd": str(hook), "timeout": "10s"}]}
     router.write_config(config)
     router.overrides[cfg.cred_env] = BAD_VALUE
@@ -192,7 +198,9 @@ def test_wsl_interop_failed_is_retried_three_times(make_tool: Callable[..., Tool
     report.record("wsl_interop/first", code=r1.code, stdout=r1.out[:1500], stderr=r1.err[:300])
     (entry,) = r1.json()["destinations"]
     if entry["code"] != "interop_failed":
-        pytest.skip(f"the real tool answered {entry['outcome']}/{entry['code']}, not interop_failed")
+        pytest.skip(
+            f"the real tool answered {entry['outcome']}/{entry['code']}, not interop_failed"
+        )
     assert entry["outcome"] == "queued_retry"
     f2 = router.run("flush", "--json", offset=120.0)
     f3 = router.run("flush", "--json", offset=120.0 + 600.0)
@@ -276,7 +284,9 @@ def test_flusher_signals_with_a_real_notifier(sig: str, make_tool: Callable[...,
         assert states == ["already_running"]
         proc.send_signal(signal.SIGCONT)
     out, err = proc.communicate(timeout=120)
-    report.record(f"flusher/{sig}/first", code=proc.returncode, stdout=out[:800].decode("utf-8", "replace"))
+    report.record(
+        f"flusher/{sig}/first", code=proc.returncode, stdout=out[:800].decode("utf-8", "replace")
+    )
     follow = router.run("flush", "--json")
     rows = history(router, "--destination", dest)
     assert [x["outcome"] for x in rows].count("sent") == 1, (rows, follow.out[:300])

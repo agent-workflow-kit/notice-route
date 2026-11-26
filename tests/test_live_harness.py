@@ -200,7 +200,9 @@ def test_prerequisite_reasons_never_hold_a_value(tmp_path: Path) -> None:
         assert CANARY not in reason
 
 
-def test_a_designated_tool_is_ready_without_a_credential_when_none_is_needed(tmp_path: Path) -> None:
+def test_a_designated_tool_is_ready_without_a_credential_when_none_is_needed(
+    tmp_path: Path,
+) -> None:
     exe = make_exe(tmp_path, "slack-notice")
     cfg, reason = tool_config("slack-notice", {}, need_credential=False, which=lambda n: str(exe))
     assert reason == "" and cfg is not None
@@ -286,7 +288,7 @@ def test_test_messages_are_clearly_labelled() -> None:
     assert "live test" in support.title_for("abcd")
 
 
-# --- nothing at import time, no network libraries, no crontab ---------------------------------------
+# --- nothing at import time, no network libraries, no crontab ---------------------------
 
 
 def load_fresh(path: Path) -> None:
@@ -341,7 +343,17 @@ def imported_modules(tree: ast.AST) -> set[str]:
 
 
 def test_no_live_module_imports_a_network_library() -> None:
-    banned = {"socket", "ssl", "http", "urllib", "urllib3", "requests", "httpx", "aiohttp", "ftplib"}
+    banned = {
+        "socket",
+        "ssl",
+        "http",
+        "urllib",
+        "urllib3",
+        "requests",
+        "httpx",
+        "aiohttp",
+        "ftplib",
+    }
     for path in LIVE_FILES:
         assert not imported_modules(ast.parse(path.read_text())) & banned, path.name
 
@@ -423,7 +435,7 @@ def test_every_live_test_is_listed_in_the_runbook() -> None:
         assert f"`{name}`" in docs, name
 
 
-# --- the plumbing, driven locally ------------------------------------------------------------------
+# --- the plumbing, driven locally ----------------------------------------------------
 
 
 def test_window_around_now_contains_now() -> None:

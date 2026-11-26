@@ -74,8 +74,12 @@ TOOLS: dict[str, ToolSpec] = {
 ENV_VARS: tuple[str, ...] = (
     OPT_IN_VAR,
     REPORT_DIR_VAR,
-    *(v for s in TOOLS.values() for v in (s.bin_var, s.config_var, *( [s.cred_var] if s.uses_credential else []))),
-)  # fmt: skip
+    *(
+        v
+        for s in TOOLS.values()
+        for v in (s.bin_var, s.config_var, *([s.cred_var] if s.uses_credential else []))
+    ),
+)
 
 
 def opted_in(environ: Mapping[str, str]) -> bool:
@@ -137,7 +141,7 @@ def tool_config(
 
 
 def wsl_ready(environ: Mapping[str, str]) -> str:
-    """"" when the environment looks like WSL with interop, else the reason it does not."""
+    """ "" when the environment looks like WSL with interop, else the reason it does not."""
     for var in ("WSL_DISTRO_NAME", "WSL_INTEROP"):
         if not environ.get(var):
             return f"{var} is not set (not a WSL session with interop)"
@@ -260,7 +264,9 @@ def _run(argv: Sequence[str], stdin: bytes, env: Mapping[str, str], timeout: flo
     except subprocess.TimeoutExpired:
         proc.kill()  # the exact process this call started
         out, err = proc.communicate()
-        return Result(124, out.decode("utf-8", "replace"), "timeout\n" + err.decode("utf-8", "replace"))
+        return Result(
+            124, out.decode("utf-8", "replace"), "timeout\n" + err.decode("utf-8", "replace")
+        )
     return Result(proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace"))
 
 
@@ -292,8 +298,9 @@ ROUTER_SCRIPT = (
     "class Clock(SystemClock):\n"
     "    def wall(self):\n"
     "        return super().wall() + offset\n"
-    "sys.exit(main(sys.argv[4:], Gateway(passwd_home=lambda: home, exec_check_from=floor, clock=Clock())))\n"
-)  # fmt: skip
+    "gw = Gateway(passwd_home=lambda: home, exec_check_from=floor, clock=Clock())\n"
+    "sys.exit(main(sys.argv[4:], gw))\n"
+)
 
 
 @dataclass
@@ -329,7 +336,16 @@ class LiveRouter:
         return env
 
     def argv(self, *args: str, offset: float = 0.0) -> list[str]:
-        return [sys.executable, "-I", "-c", ROUTER_SCRIPT, str(self.home), self.floor, str(offset), *args]
+        return [
+            sys.executable,
+            "-I",
+            "-c",
+            ROUTER_SCRIPT,
+            str(self.home),
+            self.floor,
+            str(offset),
+            *args,
+        ]
 
     def write_config(self, config: dict[str, Any]) -> Path:
         directory = self.home / ".config" / "notice-route"

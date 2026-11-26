@@ -17,7 +17,14 @@ from tests.live.support import LiveRouter, Report
 
 pytestmark = pytest.mark.live_local
 
-FIXED = {"PATH", "LANG", "LC_ALL", "NOTICE_ROUTE_HOOK", "NOTICE_ROUTE_ID", "NOTICE_ROUTE_OBJECT_TYPE"}
+FIXED = {
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "NOTICE_ROUTE_HOOK",
+    "NOTICE_ROUTE_ID",
+    "NOTICE_ROUTE_OBJECT_TYPE",
+}
 SH_ADDED = {"PWD", "SHLVL", "_", "OLDPWD"}  # what a POSIX sh may add on its own
 
 
@@ -52,7 +59,9 @@ def wait_for(path: Path, seconds: float) -> bool:
     return False
 
 
-def test_sync_hook_environment_and_payload(router: LiveRouter, scratch: Path, report: Report) -> None:
+def test_sync_hook_environment_and_payload(
+    router: LiveRouter, scratch: Path, report: Report
+) -> None:
     """#27 note 2: the hook runs as `sh -c <cmd>`; its environment is exactly the documented set
     plus what `sh` adds itself (observed on this platform: record, compare on macOS)."""
     out = scratch / "env.txt"
