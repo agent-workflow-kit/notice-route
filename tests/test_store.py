@@ -962,6 +962,31 @@ def test_the_open_path_shares_one_deadline(home: Path) -> None:
     assert err.value.reason == "busy"
 
 
+@pytest.mark.parametrize(("busy_timeout", "refused"), [(0.5, True), (5.0, False)])
+def test_the_busy_deadline_follows_the_gateway_clock(
+    home: Path, monkeypatch: pytest.MonkeyPatch, busy_timeout: float, refused: bool
+) -> None:
+    """The deadline is read from the gateway clock, never from real time: a stall that the clock
+    counts as longer than the timeout is ``busy`` (a test that speeds the clock up scales the
+    timeout, see ``tests/send_support.py``; the product is not to be changed for it)."""
+    clock = FakeClock()
+    gw = Gateway(passwd_home=lambda: str(home), clock=clock)
+    real = store_module._ensure_wal  # pyright: ignore[reportPrivateUsage]
+
+    def stalled(*args: object, **kwargs: object) -> None:
+        clock.advance_monotonic(1.0)  # one second passes on the clock
+        real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store_module, "_ensure_wal", stalled)
+    if refused:
+        with pytest.raises(StoreError) as err:
+            open_store(gw, busy_timeout=busy_timeout)
+        assert err.value.reason == "busy"
+    else:
+        with open_store(gw, busy_timeout=busy_timeout) as store:
+            assert store is not None
+
+
 def test_a_normal_open_leaves_the_full_busy_timeout_set(home: Path) -> None:
     gw = Gateway(passwd_home=lambda: str(home), clock=_SlowClock(0.001))
     with open_store(gw, busy_timeout=0.5) as store:

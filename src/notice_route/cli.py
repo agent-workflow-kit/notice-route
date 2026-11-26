@@ -28,7 +28,20 @@ from .decide import instant
 from .dryrun import dry_run_document
 from .flush import FlushOptions, FlushResult, run_flush
 from .gateway import Gateway, HomeError, Interrupted, StateError
+from .history import (
+    DEFAULT_LIMIT,
+    DESTINATION,
+    LABEL,
+    LEVELS,
+    MAX_LIMIT,
+    OUTCOMES,
+    SOURCE,
+    HistoryFilters,
+    parse_since,
+    run_history,
+)
 from .payload import InputFlags, PayloadError, UsageError, load_notification
+from .prune import PruneOptions, run_prune
 from .report import rules_document, validate_document
 from .send import SendOptions, SendResult, run_send
 from .store import StoreError, open_readonly
@@ -125,6 +138,36 @@ def build_parser() -> argparse.ArgumentParser:
     flush.add_argument(
         "--config", metavar="PATH", default=argparse.SUPPRESS, help=argparse.SUPPRESS
     )
+
+    history = commands.add_parser(
+        "history", help="list recent decisions, newest first", allow_abbrev=False
+    )
+    _add_global_flags(history, top=False)
+    for flag, meta in (
+        ("--since", "DURATION|TIME"),
+        ("--source", "NAME"),
+        ("--destination", "NAME"),
+        ("--level", "LEVEL"),
+        ("--outcome", "OUTCOME"),
+        ("--limit", "N"),
+    ):
+        # appended, so that a repeated filter can be refused (exit 2) instead of one winning
+        history.add_argument(flag, action="append", default=[], metavar=meta)
+    history.add_argument(
+        "--label", action="append", default=[], metavar="K=V", help="exact key=value; repeatable"
+    )
+    history.add_argument(
+        "--config", metavar="PATH", default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
+
+    prune = commands.add_parser(
+        "prune", help="delete old history and expire old queue rows", allow_abbrev=False
+    )
+    _add_global_flags(prune, top=False)
+    prune.add_argument("--dry-run", action="store_true", help="count what would go; change nothing")
+    prune.add_argument(
+        "--config", metavar="PATH", default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
     return parser
 
 
@@ -168,8 +211,21 @@ def _json(document: object) -> None:
 def _safe(value: object) -> str:
     """Text for a terminal: ASCII only, control characters escaped, a backslash doubled so an
     escape never reads as the text itself."""
-    text = str(value).replace("\\", "\\\\").encode("ascii", "backslashreplace").decode("ascii")
-    return "".join(c if c.isprintable() else f"\\x{ord(c):02x}" for c in text)
+    out: list[str] = []
+    for c in str(value):
+        n = ord(c)
+        if c == "\\":
+            out.append("\\\\")
+        elif c.isascii() and c.isprintable():
+            out.append(c)
+        elif n <= 0xFF:
+            out.append(f"\\x{n:02x}")
+        elif n <= 0xFFFF:
+            out.append(f"\\u{n:04x}")
+        else:  # the interface allows only \xNN and \uNNNN: a surrogate pair
+            n -= 0x10000
+            out.append(f"\\u{0xD800 + (n >> 10):04x}\\u{0xDC00 + (n & 0x3FF):04x}")
+    return "".join(out)
 
 
 def _error(code: str, message: str, details: dict[str, str] | None, *, as_json: bool) -> None:
@@ -342,13 +398,18 @@ _DECISION_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 _NAME_OUTSIDE = re.compile(r"[^A-Za-z0-9._@-]")
 
 
+def _default_actor(gateway: Gateway) -> str:
+    """``human:<login name>`` when stdin is a terminal, else ``auto:unknown``."""
+    user = _NAME_OUTSIDE.sub("_", gateway.login_name())[:64]
+    return f"human:{user}" if user and gateway.stdin_is_tty() else "auto:unknown"
+
+
 def _audit(args: argparse.Namespace, gateway: Gateway) -> tuple[str, str | None]:
     """The actor and the decision id of the call (design guide section 6): ``--actor``, else
     ``human:<login name>`` when stdin is a terminal, else ``auto:unknown``."""
     actor = args.actor
     if actor is None:
-        user = _NAME_OUTSIDE.sub("_", gateway.login_name())[:64]
-        actor = f"human:{user}" if user and gateway.stdin_is_tty() else "auto:unknown"
+        actor = _default_actor(gateway)
     elif not _ACTOR.fullmatch(actor):
         raise UsageError("actor")
     if len(args.decision_id) > 1 or (
@@ -433,6 +494,102 @@ def _run_flush(args: argparse.Namespace, gateway: Gateway) -> int:
             return result.exit_code if result.called else 128 + exc.signum
         finally:
             trap.armed = False
+    return result.exit_code
+
+
+_LIMIT = re.compile(r"[1-9][0-9]{0,3}")
+
+
+def _history_filters(args: argparse.Namespace, now: int) -> HistoryFilters:
+    """The filters of ``history``; anything outside its grammar is exit 2 (``usage``), the text
+    is never echoed."""
+    once: dict[str, str] = {}
+    for name in ("since", "source", "destination", "level", "outcome", "limit"):
+        given: list[str] = getattr(args, name)
+        if len(given) > 1:
+            raise UsageError("filter")
+        if given:
+            once[name] = given[0]
+    since = None
+    if "since" in once:
+        since = parse_since(once["since"], now)
+        if since is None:
+            raise UsageError("filter")
+    for name, pattern in (("source", SOURCE), ("destination", DESTINATION)):
+        if name in once and not pattern.fullmatch(once[name]):
+            raise UsageError("filter")
+    if "level" in once and once["level"] not in LEVELS:
+        raise UsageError("filter")
+    if "outcome" in once and once["outcome"] not in OUTCOMES:  # suppressed writes no row
+        raise UsageError("filter")
+    limit = DEFAULT_LIMIT
+    if "limit" in once:
+        if not _LIMIT.fullmatch(once["limit"]) or int(once["limit"]) > MAX_LIMIT:
+            raise UsageError("limit")
+        limit = int(once["limit"])
+    for label in args.label:
+        if not LABEL.fullmatch(label):
+            raise UsageError("filter")
+    return HistoryFilters(
+        since,
+        once.get("source"),
+        once.get("destination"),
+        once.get("level"),
+        once.get("outcome"),
+        tuple(dict.fromkeys(args.label)),
+        limit,
+    )
+
+
+def _history_line(row: dict[str, Any]) -> str:
+    """One row for a terminal: every field but the title is within a closed grammar; the title
+    is untrusted text, cut, quoted and escaped by :func:`_safe`."""
+
+    def show(value: object) -> str:
+        return "-" if value is None else str(value)
+
+    reason = "" if row["reason"] is None else f"/{row['reason']}"
+    title = "" if row["title"] is None else ' "' + _safe(row["title"]).replace('"', '\\"') + '"'
+    return (
+        _safe(
+            f"{row['id']} {row['ts']} {row['outcome']}{reason} {row['source']}"
+            f" {show(row['destination'])} {show(row['level'])} rule={show(row['rule'])}"
+            f" attempts={row['attempts']} count={row['count']}"
+        )
+        + title
+    )
+
+
+def _run_history(args: argparse.Namespace, gateway: Gateway) -> int:
+    filters = _history_filters(args, int(gateway.wall()))
+    result = run_history(gateway, filters)
+    if args.json:
+        _json(result.rows)
+    else:
+        for row in result.rows:
+            _out(_history_line(row) + "\n")
+    if result.skipped and not args.quiet:
+        _err(f"{PROG}: warning: {result.skipped} unreadable history rows left out\n")
+    return EXIT_OK
+
+
+_PRUNE_TABLES = ("history", "event_ids", "dedup", "surfaced", "rate", "queue")
+
+
+def _run_prune(args: argparse.Namespace, gateway: Gateway) -> int:
+    """``prune``: the flags (exit 2), the config, then the run. It needs no ``--actor``: the
+    log lines it writes carry the default actor."""
+    config = load_valid_config(gateway, None)
+    result = run_prune(gateway, config, PruneOptions(_default_actor(gateway), args.dry_run))
+    doc = result.document
+    assert doc is not None
+    for text in result.warnings:  # as send and flush: a warning is printed under --quiet too
+        _guarded(gateway, "err", lambda text=text: _err(f"{PROG}: warning: {_safe(text)}\n"))
+    if args.json:
+        _json(doc)
+    elif not args.quiet:
+        for table in _PRUNE_TABLES:
+            _out(f"{table}: {doc['deleted'][table]}\n")
     return result.exit_code
 
 
@@ -553,6 +710,10 @@ def _main(argv: Sequence[str] | None, gateway: Gateway | None) -> int:
             return _run_send(args, gateway)
         if args.command == "flush":
             return _run_flush(args, gateway)
+        if args.command == "prune":
+            return _run_prune(args, gateway)
+        if args.command == "history":
+            return _run_history(args, gateway)
         return _run_validate(args, gateway)
     except (PayloadError, UsageError) as exc:
         return _refused(exc, as_json=args.json)
@@ -562,8 +723,11 @@ def _main(argv: Sequence[str] | None, gateway: Gateway | None) -> int:
     except HomeError:
         _error("config_invalid", "invalid configuration", {"key": "home"}, as_json=args.json)
         return EXIT_USAGE
-    except (StateError, StoreError):
-        _error("internal", "state database cannot be read", None, as_json=args.json)
+    except (StateError, StoreError) as exc:
+        # a prune that ran out of lock waits says so (a cron line is then worth a rerun)
+        busy = args.command == "prune" and isinstance(exc, StoreError) and exc.reason == "busy"
+        message = "state database is busy" if busy else "state database cannot be read"
+        _error("internal", message, None, as_json=args.json)
         return EXIT_INTERNAL
     except _OutputClosed:
         raise

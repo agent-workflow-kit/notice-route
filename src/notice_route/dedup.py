@@ -37,8 +37,8 @@ Seams:
 - ``send.py`` (#22) is the pipeline that calls them (through ``decide.py``).
 - Every delivery end except ``sent`` and ``unknown`` (``failed``, ``dropped``, ``expired`` and a
   notifier-side ``disabled``) calls :func:`release` in the same transaction: ``outcome.py`` does so
-  for a call; TODO(#23) (flush step 4 expiry) and TODO(#26) (``prune`` expiry of queue rows) must.
-- TODO(#26) ``prune`` calls :func:`prune_windows` and :func:`prune_event_ids` in loops of one
+  for a call; ``flush`` step 4 and ``prune`` (``queue.expire_unclaimed``) do.
+- ``prune`` (#26) calls :func:`prune_windows` and :func:`prune_event_ids` in loops of one
   transaction each; its dry run uses :func:`count_prunable_windows` and
   :func:`count_prunable_event_ids`.
 """
