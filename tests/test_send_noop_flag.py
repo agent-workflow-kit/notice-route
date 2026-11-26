@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import signal
 import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -296,16 +298,59 @@ def test_a_late_signal_leaves_the_document_and_the_mapped_exit(rig: Rig) -> None
     assert json.loads(out)["reason"] == "no_rule"
 
 
+SEND_SCHEMA_SHA256 = "31d122e097e4b3a3bcaf6ec3dfe57f5138e73205662af9eae7e4ae4c8fa30fe3"
+
+
 def test_the_published_send_schema_is_unchanged() -> None:
-    result = subprocess.run(
-        ["git", "diff", "--quiet", "origin/main", "--", "schemas/cli/send.json"],
-        cwd=ROOT,
-        env=scrubbed_env(ROOT),
-        capture_output=True,
-        timeout=30,
+    digest = hashlib.sha256((ROOT / "schemas" / "cli" / "send.json").read_bytes()).hexdigest()
+    assert digest == SEND_SCHEMA_SHA256
+
+    def git(*argv: str) -> int:
+        return subprocess.run(
+            ["git", *argv], cwd=ROOT, env=scrubbed_env(ROOT), capture_output=True, timeout=30
+        ).returncode
+
+    if git("rev-parse", "--verify", "-q", "origin/main") != 0:
+        pytest.skip("no origin/main to compare with; the pinned digest was checked")
+    assert git("diff", "--quiet", "origin/main", "--", "schemas/cli/send.json") == 0
+
+
+@pytest.mark.parametrize("argv", [["test", "--message", "x"], ["flush"]])
+def test_other_commands_still_exit_22_on_a_no_op_without_the_flag(
+    rig: Rig, argv: list[str]
+) -> None:
+    _all_disabled(rig)
+    code, _, _ = rig.run(*argv, "--json")
+    assert code == 22
+
+
+def test_a_signal_exit_stays_128_plus_n_with_the_flag(rig: Rig) -> None:
+    from notice_route.gateway import Gateway
+
+    n = rig.notifier()
+    rig.configure({"chat": {"notifier": n}, "late": {"notifier": n, "quiet": "night"}})
+
+    class Signalling(Gateway):
+        def new_token(self) -> str:  # called inside the decision transaction
+            os.kill(os.getpid(), signal.SIGTERM)
+            return super().new_token()
+
+    base = rig.gateway(b'{"message": "hi", "level": "warn"}')
+    gw = Signalling(
+        passwd_home=base.passwd_home,
+        clock=rig.clock,
+        exec_check_from=base.exec_check_from,
+        stdin_fd=base.stdin_fd,
+        environ=base.environ,
     )
-    assert result.returncode in (0, 128)  # 128: no origin/main to compare with (a bare export)
+    code, out, err = rig.run(*SEND, FLAG, gateway=gw)
+    assert (code, out, err) == (128 + signal.SIGTERM, "", "")
 
 
-def _unused(_: Any) -> None:  # keeps the typing import honest
-    return None
+@pytest.mark.parametrize("name", ["no_rule", "all_disabled", "disabled", "unconfigured"])
+def test_send_dry_run_text_mode_is_identical_with_the_flag(rig: Rig, name: str) -> None:
+    NOOPS[name][0](rig)
+    argv = ("send", "--dry-run", "--message", "hi", "--source", "s")
+    code, out, err = rig.run(*argv)
+    code2, out2, err2 = rig.run(*argv, FLAG)
+    assert (code, code2) == (22, 0) and same(out2) == same(out) and err2 == err
