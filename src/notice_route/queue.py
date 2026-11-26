@@ -36,7 +36,7 @@ Public helpers over the one lease predicate (``_UNCLAIMED``), for ``flush`` (#23
 (#26): :func:`due_rows`, :func:`claim_row`, :func:`count_due`, :func:`expire_unclaimed`,
 :func:`drop_unclaimed` and :func:`postpone_unclaimed`. No caller needs its own copy of the
 predicate. ``release_claims`` takes one token (``flush`` claims one row per call).
-TODO(#26): ``prune`` expires unclaimed queue rows through :func:`expire_unclaimed`.
+``prune`` (#26) expires unclaimed queue rows through :func:`expire_unclaimed`.
 The outcome of a sent, failed or retried row is written to its ``deliveries`` row in the
 transaction that calls :func:`complete_row` or :func:`requeue_row`
 (:mod:`notice_route.outcome`, #20).
@@ -647,16 +647,19 @@ def count_due(conn: _Conn, destination: str, lease: Lease) -> dict[str, int]:
     return counts
 
 
-def count_expirable(conn: _Conn, destination: str, lease: Lease, *, max_age: int = EXPIRY_S) -> int:
-    """How many unclaimed rows of ``destination`` :func:`expire_unclaimed` would end now (due or
-    not). Changes nothing."""
+def count_expirable(
+    conn: _Conn, destination: str | None, lease: Lease, *, max_age: int = EXPIRY_S
+) -> int:
+    """How many unclaimed rows of ``destination`` (``None``: of all) :func:`expire_unclaimed`
+    would end now (due or not). Changes nothing."""
     _int(max_age, "max_age")
     found = conn.execute(
         "SELECT COUNT(*)"
         + _FROM
-        + " WHERE d.destination = ? AND q.created_at <= ? AND "
+        + " WHERE d.destination IS NOT NULL AND (? IS NULL OR d.destination = ?)"
+        + " AND q.created_at <= ? AND "
         + _UNCLAIMED,
-        (destination, lease.now - max_age, lease.now, lease.expires),
+        (destination, destination, lease.now - max_age, lease.now, lease.expires),
     ).fetchone()
     return int(found[0])
 
@@ -673,21 +676,36 @@ def claim_row(conn: _Conn, row_id: int, lease: Lease, token: str) -> QueueRow | 
 
 
 def expire_unclaimed(
-    conn: _Conn, lease: Lease, *, destination: str | None = None, max_age: int = EXPIRY_S
+    conn: _Conn,
+    lease: Lease,
+    *,
+    destination: str | None = None,
+    max_age: int = EXPIRY_S,
+    limit: int | None = None,
 ) -> tuple[Expired, ...]:
     """End every unclaimed row (of ``destination``, or of all) created ``max_age`` seconds ago
     or earlier: the queue row is deleted and its delivery becomes ``expired``, code ``expired``
     (the stored reason stays), ``deliver_after`` cleared, dedup records released. A row with a
-    live claim is never touched. Oldest (lowest id) first. TODO(#27): the caller surfaces them."""
+    live claim is never touched. Oldest (lowest id) first, at most ``limit`` of them when given
+    (``prune`` ends 1000 rows per transaction). TODO(#27): the caller surfaces them."""
     _int(max_age, "max_age")
+    if limit is not None and (type(limit) is not int or limit < 1):
+        raise ValueError("limit must be a positive integer")
     found = conn.execute(
         "SELECT q.id, q.delivery_id, d.destination, q.kind, q.level, q.source, d.attempts"
         + _FROM
         + " WHERE d.destination IS NOT NULL AND (? IS NULL OR d.destination = ?)"
         + " AND q.created_at <= ? AND "
         + _UNCLAIMED
-        + " ORDER BY q.id",
-        (destination, destination, lease.now - max_age, lease.now, lease.expires),
+        + " ORDER BY q.id LIMIT ?",
+        (
+            destination,
+            destination,
+            lease.now - max_age,
+            lease.now,
+            lease.expires,
+            -1 if limit is None else limit,
+        ),
     ).fetchall()
     out: list[Expired] = []
     for queue_id, delivery_id, dest, kind, level, source, attempts in found:

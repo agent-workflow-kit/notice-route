@@ -41,6 +41,8 @@ __all__ = [
     "open_store",
     "trim_deliveries",
     "TRIM_EVENT_IDS_SQL",
+    "count_prunable_deliveries",
+    "prune_deliveries",
     "trim_event_ids",
 ]
 
@@ -514,6 +516,39 @@ def trim_deliveries(
         ids += [r[0] for r in conn.execute(_OLDEST_OTHER, (keep_id, want - len(ids)))]
     conn.executemany("DELETE FROM deliveries WHERE id = ?", [(i,) for i in ids])
     return len(ids)
+
+
+_OLD_DELIVERIES = "d.ts < ? AND " + _ELIGIBLE
+
+
+def count_prunable_deliveries(conn: sqlite3.Connection, *, cutoff: int) -> int:
+    """How many ``deliveries`` rows :func:`prune_deliveries` would delete in total: ``ts`` before
+    ``cutoff`` (``now`` minus ``retention.history``) and eligible as for the cap (no queue row, no
+    unprocessed ``surfaced`` row). For ``prune --dry-run``."""
+    _cutoff(cutoff)
+    found = conn.execute(
+        "SELECT COUNT(*) FROM deliveries d WHERE " + _OLD_DELIVERIES, (cutoff,)
+    ).fetchone()
+    return int(found[0])
+
+
+def prune_deliveries(conn: sqlite3.Connection, *, cutoff: int, batch: int) -> int:
+    """Delete up to ``batch`` ``deliveries`` rows with ``ts`` before ``cutoff``, oldest id first,
+    never one that a queue row or an unprocessed ``surfaced`` row needs (the foreign key of
+    ``queue.delivery_id`` would refuse it). Returns the number deleted."""
+    _cutoff(cutoff)
+    if type(batch) is not int or batch < 1:
+        raise ValueError("batch must be a positive int")
+    return conn.execute(
+        "DELETE FROM deliveries WHERE id IN"
+        " (SELECT d.id FROM deliveries d WHERE " + _OLD_DELIVERIES + " ORDER BY d.id LIMIT ?)",
+        (cutoff, batch),
+    ).rowcount
+
+
+def _cutoff(cutoff: object) -> None:
+    if type(cutoff) is not int or not -(1 << 62) <= cutoff <= 1 << 62:
+        raise ValueError("cutoff must be an int")
 
 
 # Oldest first by row id (indexed: no sort). dedup.record_event_id gives a replaced record a
