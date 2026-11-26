@@ -33,9 +33,9 @@ Choices where the interface is silent (docs/design.md C-52 has the reasons):
 - ``not_started`` (an internal fault) records nothing, is not logged (``outcome`` has no word for
   it) and ends the command with exit 1.
 - Seams, injectable through :class:`Seams`: the retry schedule (:mod:`notice_route.retry` by
-  default); TODO(#27) surfacing a ``failed`` or ``unknown`` end
-  (:class:`SurfaceEvent`; ``rate_capped`` is already surfaced by ``decide``, ``env_missing`` and
-  ``overflow`` are not yet).
+  default) and the surfacing of a ``failed``, ``unknown``, escaped or evicted result
+  (:class:`SurfaceEvent`, default :func:`surface_event`; ``rate_capped`` and the evictions of a
+  decision are surfaced by ``decide``; docs/design.md C-57).
 """
 
 from __future__ import annotations
@@ -102,10 +102,12 @@ class SendOptions:
 
 @dataclass(frozen=True)
 class SurfaceEvent:
-    """A ``failed`` or ``unknown`` end, given to the surfacing seam inside the recording
-    transaction (TODO(#27): it inserts the ``surfaced`` row and marks the delivery). It may be
-    run again after a rolled-back failure (the recording is retried once), so it writes only
-    through the given connection (a rollback undoes it) and has no external effect."""
+    """A surfaced event (a ``failed`` or ``unknown`` end, a ``dropped``/``overflow`` eviction, an
+    ``expired`` row, a ``deferred``/``env_missing`` skip), given to the surfacing seam inside the
+    recording transaction (:func:`surface_event` inserts the ``surfaced`` row and marks the
+    delivery). ``outcome`` and ``code`` are the recorded ones; the seam keys on the outcome.
+    It may be run again after a rolled-back failure (the recording is retried once), so it
+    writes only through the given connection (a rollback undoes it) and has no external effect."""
 
     delivery_id: int
     destination: str

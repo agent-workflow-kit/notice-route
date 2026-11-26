@@ -49,8 +49,9 @@ and so does ``lock_busy`` (:data:`notice_route.outcome.LOCK_BUSY`);
 ``send.py`` (#22) renders, calls :func:`decide_and_record`, calls, prints and logs;
 TODO(#23) ``flush`` claims a due row with :func:`claim_call` (single rows) or :func:`count_call`
 (a digest); ``prune`` (#26) deletes ``rate`` rows of past hours older than 2 days;
-TODO(#27) surfacing ``env_missing`` and routing the alert (alerts skip the redelivery check,
-which :func:`dedup.is_redelivered` already does for source ``notice-route``).
+failure alerts are decided by :func:`decide_alert` (steps 1 to 6, then an unclaimed ``single`` row
+due now; the redelivery check never applies to source ``notice-route``), and ``rate_capped`` and
+the evictions of this transaction are surfaced here (:mod:`notice_route.surfacing`).
 """
 
 from __future__ import annotations

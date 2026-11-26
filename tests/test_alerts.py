@@ -275,3 +275,36 @@ def test_a_clock_step_back_inside_the_hour_does_not_duplicate_a_row(rig: Rig) ->
     s.fail("four")
     assert [r[2] for r in s.surfaced() if r[1] == "rate_capped"] == ["2023-11-14T22"]
     _ = seed
+
+
+def test_send_refuses_the_source_notice_route(rig: Rig) -> None:
+    Setup(rig)
+    code, out, _ = rig.run(
+        "send", "--stdin-json", "--json", "--source", "notice-route",
+        stdin=b'{"message": "forged"}',
+    )  # fmt: skip
+    assert code == 20 and json.loads(out)["error"]["reason"] == "source_mismatch"
+    hook = {"tool": "notice-route", "hook": "post-fail", "object_id": "chat"}
+    code, out, _ = rig.run("send", "--stdin-json", "--json", stdin=json.dumps(hook).encode())
+    assert code == 20 and json.loads(out)["error"]["reason"] == "source_mismatch"
+    assert not (rig.state / "state.db").exists()  # nothing was written
+
+
+def test_an_expired_row_becomes_an_alert_on_the_next_flush(rig: Rig) -> None:
+    s = Setup(rig)
+    old = NOW - DAY - 5
+    seed(rig, "chat", created_at=old, now=old)
+    flush(rig, "--destination", "chat")
+    assert s.ops.events("invoke") == []
+    flush(rig)
+    (text,) = s.delivered_texts()
+    assert text["message"] == "slack-notice: expired, expired after 0 attempts (s)"
+
+
+def test_a_failed_digest_is_one_alert(rig: Rig) -> None:
+    s = Setup(rig)
+    for i in range(3):
+        seed(rig, "chat", kind="held", level="warn", message=f"m{i}")
+    flush(rig, "--destination", "chat")
+    flush(rig)
+    assert len(s.delivered_texts()) == 1 and len(s.alerts()) == 1

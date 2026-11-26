@@ -48,7 +48,8 @@ def test_the_hook_gets_the_payload_on_stdin_and_the_documented_environment(
     }  # fmt: skip
     shell_added = {"PWD", "SHLVL", "_", "OLDPWD"}  # what sh itself puts in its children's env
     assert set(run["env"]) - shell_added == {
-        "PATH", "LANG", "LC_ALL", "NOTICE_ROUTE_HOOK", "NOTICE_ROUTE_ID", "NOTICE_ROUTE_OBJECT_TYPE",
+        "PATH", "LANG", "LC_ALL", "NOTICE_ROUTE_HOOK", "NOTICE_ROUTE_ID",
+        "NOTICE_ROUTE_OBJECT_TYPE",
     }  # fmt: skip
     assert run["env"]["NOTICE_ROUTE_HOOK"] == "post-fail"
     assert run["env"]["NOTICE_ROUTE_ID"] == "chat"

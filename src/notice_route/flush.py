@@ -47,7 +47,7 @@ reading:
 - The send lock being busy, a result whose claim was lost and a signal before a call are all
   handled as in ``send`` (``calling.py``, ``send.record_result``).
 - The retry schedule (:mod:`notice_route.retry` by default) and surfacing are seams:
-  ``send.Seams`` (``retry_schedule``, ``surface``; TODO(#27)).
+  ``send.Seams`` (``retry_schedule``, ``surface``).
 - Digest (docs/design.md C-54): ``digests`` counts the digests built and not released unsent in the
   run; the result counts (``sent``, ``failed``, ...) count member rows, as ``due_held`` does.
 """
