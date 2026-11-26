@@ -381,7 +381,6 @@ def _expire_batch(
                 expired = tuple(_clean(e) for e in found)
                 for e in expired:
                     # surfaced only for a destination that is configured and enabled (Hooks).
-                    # TODO(#27): the default seam does nothing until surfacing exists.
                     dest = None if config is None else config.destinations.get(e.destination)
                     if dest is not None and dest.enabled:
                         seams.surface(
@@ -395,6 +394,7 @@ def _expire_batch(
                                 "expired",
                                 "expired",
                                 e.attempts,
+                                lease.now,
                             ),
                         )
         except StoreError as exc:

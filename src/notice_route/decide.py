@@ -61,7 +61,6 @@ import math
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from . import dedup
@@ -69,6 +68,7 @@ from .gateway import Gateway
 from .queue import Lease, enqueue, insert_delivery, quiet_deliver_after
 from .report import env_unset, worst_case_s
 from .store import Store
+from .surfacing import surface_evictions, surface_hourly
 from .validate import LEVELS, Config, Destination
 from .window import in_window
 
@@ -103,7 +103,6 @@ _Conn = sqlite3.Connection
 Decision = Literal["send", "defer", "drop", "suppress", "disabled"]
 Outcome = Literal["sending", "deferred", "dropped", "suppressed", "disabled"]
 Kind = Literal["held", "single"]
-_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _RANK = {level: rank for rank, level in enumerate(LEVELS)}
 
 
@@ -259,10 +258,6 @@ def give_back(conn: _Conn, *, destination: str, level: str, hour: int) -> bool:
 
 
 # --- the decision order --------------------------------------------------------------------
-
-
-def _surface_period(hour: int) -> str:
-    return (_EPOCH + timedelta(seconds=hour)).strftime("%Y-%m-%dT%H")
 
 
 def _classify(
@@ -517,12 +512,13 @@ def _record(
         dedupe=notice.dedupe,
         claim_token=token,
     )
+    surface_evictions(conn, queued.evicted, now)  # the cap dropped rows (maybe this one)
     if queued.row_evicted:  # the cap dropped the row just queued
         return DestinationDecision(
             dest.name, "drop", "dropped", "overflow", None, delivery_id, queued.row_id
         )
-    if plan.surface and _surface(conn, dest.name, "rate_capped", hour_start(now), delivery_id):
-        conn.execute("UPDATE deliveries SET surfaced = 1 WHERE id = ?", (delivery_id,))
+    if plan.surface:
+        surface_hourly(conn, dest.name, "rate_capped", delivery_id, now)
     return DestinationDecision(
         dest.name,
         plan.decision,
@@ -535,13 +531,3 @@ def _record(
         lease.expires if token is not None else None,
         decided_at=now,
     )
-
-
-def _surface(conn: _Conn, destination: str, code: str, hour: int, delivery_id: int) -> bool:
-    """Insert the once-per-hour ``surfaced`` row; ``False`` when this hour already has one."""
-    cur = conn.execute(
-        "INSERT INTO surfaced (destination, code, period, delivery_id) VALUES (?, ?, ?, ?)"
-        " ON CONFLICT (destination, code, period) DO NOTHING",
-        (destination, code, _surface_period(hour), delivery_id),
-    )
-    return cur.rowcount == 1

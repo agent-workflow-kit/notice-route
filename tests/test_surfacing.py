@@ -99,7 +99,9 @@ def test_limit_is_per_destination(conn: sqlite3.Connection) -> None:
     assert rows(conn)[-1] == ("b", "c8", "2023-11-14")
 
 
-@pytest.mark.parametrize("code", [None, "expired", "overflow", "rate_capped", "env_missing", "BAD!"])
+@pytest.mark.parametrize(
+    "code", [None, "expired", "overflow", "rate_capped", "env_missing", "BAD!"]
+)
 def test_failed_with_a_reserved_or_missing_code_is_other(
     conn: sqlite3.Connection, code: str | None
 ) -> None:

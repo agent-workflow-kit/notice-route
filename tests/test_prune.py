@@ -329,6 +329,12 @@ def populate(rig: Rig) -> None:
     seed(rig, now=NOW - 10, created_at=NOW - 10)
 
 
+def process_surfaced(rig: Rig) -> None:
+    """What ``flush`` does to a surfaced row it takes."""
+    with open_store(rig.gateway()) as store, store.write() as conn:
+        conn.execute("UPDATE surfaced SET processed = 1")
+
+
 def test_dry_run_counts_exactly_what_the_real_run_deletes_and_writes_nothing(rig: Rig) -> None:
     populate(rig)
     before_counts = counts(rig)
@@ -347,7 +353,11 @@ def test_dry_run_counts_exactly_what_the_real_run_deletes_and_writes_nothing(rig
     assert code == 0 and real["dry_run"] is False
     assert real["deleted"] == dry["deleted"]
     assert dry["deleted"] == deleted(history=7, event_ids=5, dedup=3, surfaced=1, rate=1, queue=1)
-    # the delivery that this run expired is two days old: a history row for the next run
+    # the delivery that this run expired is two days old, but its surfaced row is pending (flush
+    # has not taken it): it pins the delivery. Once flush has processed it, it is a history row.
+    code, again, _ = prune(rig, "--dry-run")
+    assert again["deleted"] == deleted()
+    process_surfaced(rig)
     code, again, _ = prune(rig, "--dry-run")
     assert again["deleted"] == deleted(history=1)
 
@@ -357,6 +367,9 @@ def test_prune_converges_and_a_run_after_that_changes_nothing(rig: Rig) -> None:
     history rows only for the following run. After that every run deletes nothing."""
     populate(rig)
     prune(rig)
+    code, doc, _ = prune(rig)
+    assert (code, doc["deleted"]) == (0, deleted())  # pinned by its pending surfaced row
+    process_surfaced(rig)
     code, doc, _ = prune(rig)
     assert (code, doc["deleted"]) == (0, deleted(history=1))
     snapshot = counts(rig)

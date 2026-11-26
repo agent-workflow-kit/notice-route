@@ -32,6 +32,8 @@ import sqlite3
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
+from .queue import Evicted
+
 __all__ = [
     "DAILY_CODE_LIMIT",
     "HOURLY_CODES",
@@ -39,6 +41,7 @@ __all__ = [
     "day_period",
     "hour_period",
     "surface_daily",
+    "surface_evictions",
     "surface_hourly",
     "surface_outcome",
 ]
@@ -132,3 +135,13 @@ def surface_evicted(
     if not delivery_ids:
         return False
     return surface_hourly(conn, destination, "overflow", delivery_ids[0], now)
+
+
+def surface_evictions(conn: sqlite3.Connection, evicted: Sequence[Evicted], now: int) -> None:
+    """:func:`surface_evicted` for each destination that lost rows (a release of claims, which
+    has no destination of its own)."""
+    by_destination: dict[str, list[int]] = {}
+    for e in evicted:
+        by_destination.setdefault(e.destination, []).append(e.delivery_id)
+    for destination, ids in by_destination.items():
+        surface_evicted(conn, destination, ids, now)

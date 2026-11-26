@@ -57,6 +57,7 @@ from __future__ import annotations
 import math
 import sqlite3
 import threading
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
@@ -85,9 +86,10 @@ from .queue import (
     release_claims,
 )
 from .report import env_unset, worst_case_s
-from .send import Seams, SurfaceEvent, record_result, with_retry
+from .send import Seams, SurfaceEvent, escaped_surface, record_result, with_retry
 from .sendlock import flush_lock
 from .store import Store, StoreError, open_readonly, open_store
+from .surfacing import surface_evictions
 from .validate import Config, Destination
 from .window import in_window
 
@@ -388,7 +390,7 @@ def _skip_reason(run: _Run, dest: Destination, t: _Tally) -> bool:
         t.state = "disabled"
         return True
     if env_unset(dest.env, run.gateway.environ()):
-        t.state = "env_missing"  # TODO(#27): surfaced as env_missing (once per hour)
+        t.state = "env_missing"
         return True
     return False
 
@@ -448,6 +450,8 @@ def _destination(run: _Run, dest: Destination) -> _Tally:
     t = _Tally(dest.name)
     try:
         if _skip_reason(run, dest, t):
+            if t.state == "env_missing":
+                _surface_env_missing(run, dest, t)
             return t
         if run.trap.received is not None:
             t.skipped = True
@@ -470,6 +474,31 @@ def _destination(run: _Run, dest: Destination) -> _Tally:
     except Exception:  # a fault of the thread: its other destinations still report
         t.fault = _THREAD_FAULT
     return t
+
+
+def _surface_env_missing(run: _Run, dest: Destination, t: _Tally) -> None:
+    """The destination is skipped for an unset variable: surface ``env_missing`` (once per UTC
+    hour) for its oldest queued row. A destination with nothing queued has nothing waiting on
+    the credential, so it surfaces nothing."""
+    try:
+        with open_store(run.gateway) as store, store.write() as conn:
+            lease = Lease.at(run.gateway.wall(), run.worst)
+            found = conn.execute(
+                "SELECT q.delivery_id, q.source, q.level, d.attempts FROM queue q"
+                " JOIN deliveries d ON d.id = q.delivery_id WHERE d.destination = ?"
+                " ORDER BY q.id LIMIT 1",
+                (dest.name,),
+            ).fetchone()
+            if found is not None:
+                run.seams.surface(
+                    conn,
+                    SurfaceEvent(
+                        int(found[0]), dest.name, dest.kind, str(found[1]), str(found[2]),
+                        "deferred", "env_missing", int(found[3]), lease.now,
+                    ),
+                )  # fmt: skip
+    except StoreError:
+        t.error = True
 
 
 def _locked(run: _Run, store: Store, dest: Destination, t: _Tally) -> None:
@@ -501,8 +530,15 @@ def _prepare(run: _Run, store: Store, dest: Destination, t: _Tally) -> None:
         lease = Lease.at(run.gateway.wall(), run.worst)
         counts = count_due(conn, dest.name, lease)
         t.due_single, t.due_held = counts["single"], counts["held"]
-        # TODO(#27): surface each expired row (code expired, once per destination per UTC hour)
         expired = expire_unclaimed(conn, lease, destination=dest.name)
+        for e in expired[:1]:  # one ``expired`` surfacing per destination per UTC hour
+            run.seams.surface(
+                conn,
+                SurfaceEvent(
+                    e.delivery_id, dest.name, dest.kind, e.source, e.level,
+                    "expired", "expired", e.attempts, lease.now,
+                ),
+            )  # fmt: skip
         t.expired = len(expired)
         t.acted = bool(expired)
         window = _quiet_window(run, dest)
@@ -596,7 +632,7 @@ def _claim(
             )
             retry_at = run.seams.retry_schedule(dest.kind, lease.now)
             if prior >= 1 and retry_at(prior) is None:
-                _exhaust(conn, run, dest, claimed, token, prior, hour)
+                _exhaust(conn, run, dest, claimed, token, prior, hour, lease.now)
                 exhausted.append((claimed, prior))
                 break
             claim = _Claim(claimed, token, hour, prior)
@@ -618,6 +654,7 @@ def _exhaust(
     token: str,
     prior: int,
     hour: int | None,
+    now: int,
 ) -> None:
     """End a claimed row ``failed``/``retries_exhausted`` without a call; ``hour`` is where its
     hourly count is given back (``None``: it took none, a digest member)."""
@@ -641,6 +678,7 @@ def _exhaust(
             "failed",
             "retries_exhausted",
             prior,
+            now,
         ),
     )
 
@@ -707,7 +745,7 @@ def _claim_digest(
                 ).fetchone()[0]
             )
             if prior >= 1 and retry_at(prior) is None:
-                _exhaust(conn, run, dest, claimed, token, prior, None)
+                _exhaust(conn, run, dest, claimed, token, prior, None, lease.now)
                 spent.append((claimed, prior))
             else:
                 live.append(claimed)
@@ -723,7 +761,7 @@ def _claim_digest(
             )  # fmt: skip
             result = _DigestClaim(digest, token, hour_start(lease.now), sent_as, priors)
         else:
-            release_claims(conn, token, lease)
+            surface_evictions(conn, release_claims(conn, token, lease).evicted, lease.now)
     for row, prior in spent:
         t.failed += 1
         t.acted = True
@@ -765,7 +803,9 @@ def _call_digest(
             recorded = with_retry(
                 run.gateway,
                 claim.call_row,
-                lambda: record_escaped_digest(store, members, claim.token),
+                lambda: record_escaped_digest(
+                    store, members, claim.token, _digest_surface(run, dest)
+                ),
             )
         except StoreError:
             t.error = True
@@ -830,6 +870,30 @@ def _call_digest(
     run.say(t, f"digest {outcome.outcome or 'unknown'}")
 
 
+def _digest_surface(
+    run: _Run, dest: Destination
+) -> Callable[[sqlite3.Connection, QueueRow, int], None]:
+    """Surfacing for an escaped digest call: once, for the first member recorded."""
+
+    def surface(conn: sqlite3.Connection, member: QueueRow, attempts: int) -> None:
+        run.seams.surface(
+            conn,
+            SurfaceEvent(
+                member.delivery_id,
+                dest.name,
+                dest.kind,
+                member.source,
+                member.level,
+                "unknown",
+                "killed",
+                attempts,
+                instant(run.gateway.wall()),
+            ),  # fmt: skip
+        )
+
+    return surface
+
+
 def _attempts_of(
     store: Store, claim: _DigestClaim, row: QueueRow, counted: int, *, read: bool
 ) -> int:
@@ -874,7 +938,16 @@ def _call_and_record(run: _Run, store: Store, dest: Destination, t: _Tally, clai
         t.called = t.acted = True
         t.unknown += 1
         try:
-            with_retry(run.gateway, row, lambda: record_escaped(store, row=row, token=token))
+            with_retry(
+                run.gateway,
+                row,
+                lambda: record_escaped(
+                    store,
+                    row=row,
+                    token=token,
+                    surface=escaped_surface(run.gateway, run.seams, dest, row),
+                ),
+            )
         except StoreError:
             t.error = True
         run.say(t, f"row {row.id} unknown")
@@ -934,7 +1007,6 @@ def _others(applied: Applied, row: QueueRow) -> list[Any]:
 
 
 def _tally(t: _Tally, outcome: str, evicted_others: int) -> None:
-    # TODO(#27): surface overflow evictions (``applied.evicted``) once per destination per hour
     if outcome in ("sent", "queued_retry", "failed", "unknown", "dropped"):
         setattr(t, outcome, getattr(t, outcome) + 1)
     t.dropped += evicted_others
@@ -944,7 +1016,8 @@ def _give_back(run: _Run, store: Store, dest: Destination, claim: _Claim) -> Non
     """Release the claim of a row whose call was never made and return its hourly count."""
     try:
         with store.write() as conn:
-            release_claims(conn, claim.token, Lease.at(run.gateway.wall(), run.worst))
+            lease = Lease.at(run.gateway.wall(), run.worst)
+            surface_evictions(conn, release_claims(conn, claim.token, lease).evicted, lease.now)
             give_back(conn, destination=dest.name, level=claim.row.level, hour=claim.count_hour)
     except StoreError:
         pass  # the claim lapses by itself
