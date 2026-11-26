@@ -674,7 +674,7 @@ def record_result(
     (shared with ``flush``). Retried once after a busy database (:func:`with_retry`)."""
 
     def write() -> Applied:
-        # may run twice (see _with_retry): the whole transaction rolls back on a failure, so
+        # may run twice (see with_retry): the whole transaction rolls back on a failure, so
         # ``seams.surface`` must write only through ``conn`` and have no external effect
         with store.write() as conn:
             lease = Lease.at(gateway.wall(), worst)

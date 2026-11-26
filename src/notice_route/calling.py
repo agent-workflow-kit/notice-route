@@ -91,12 +91,14 @@ def call_row(
     dedupe: str | None,
     call: Callable[..., CallResult],
     gate: Gate,
+    cancel: Callable[[], bool] | None = None,
 ) -> CallEnd:
     call_started = False
     try:
-        with send_lock(gateway, state, dest.name, dest.kind, lock_wait) as held:
+        with send_lock(gateway, state, dest.name, dest.kind, lock_wait, cancel) as held:
             if not held.acquired:
-                return Busy()
+                # a wait that a signal ended (``flush`` only) made no call, like a gate refusal
+                return Skipped() if held.busy_reason == "cancelled" else Busy()
             if not gate.begin():
                 return Skipped()
             call_started = True

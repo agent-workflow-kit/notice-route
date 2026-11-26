@@ -13,12 +13,13 @@ from typing import Any
 import pytest
 
 from notice_route import calling, cli
-from notice_route.gateway import SYSTEM_TZ_DIRS
+from notice_route import flush as flush_mod
+from notice_route.gateway import SYSTEM_TZ_DIRS, Gateway, Interrupted
 from notice_route.notify import call_notifier
-from notice_route.queue import Lease, claim_row
+from notice_route.queue import Lease, claim_row, enqueue, insert_delivery
 from notice_route.send import Seams
 from notice_route.store import open_store
-from tests.flush_support import dest, flush, seed
+from tests.flush_support import checked_log, dest, flush, seed
 from tests.send_support import MORNING, NOW, Rig, log_errors
 
 _HAVE_ZONES = any((Path(d) / "America" / "New_York").is_file() for d in SYSTEM_TZ_DIRS)
@@ -70,7 +71,7 @@ def test_the_log_has_one_line_per_row_and_one_flush_summary(rig: Rig) -> None:
     seed(rig, message="one")
     seed(rig, message="two")
     flush(rig, "--actor", "auto:cron", "--decision-id", "d1")
-    lines = rig.log_lines()
+    lines = checked_log(rig)
     assert all(log_errors(x) == [] for x in lines)
     assert [x["record"] for x in lines] == ["delivery", "delivery", "flush"]
     assert {x["actor"] for x in lines} == {"auto:cron"} and {x["decision_id"] for x in lines} == {
@@ -136,12 +137,19 @@ def test_destination_limits_the_run_and_writes_no_heartbeat(rig: Rig) -> None:
 
 
 def test_destinations_run_in_parallel(rig: Rig) -> None:
-    a, b = rig.notifier("a", sleep=0.7), rig.notifier("b", sleep=0.7)
+    a, b = rig.notifier("a", sleep=2.0), rig.notifier("b", sleep=2.0)
     rig.configure({"a": {"notifier": a}, "b": {"notifier": b}})
-    seed(rig, "a")
-    seed(rig, "b")
-    code, doc, _ = flush(rig)
-    assert code == 0 and doc["duration_ms"] < 1300
+    t = real_now()
+    seed(rig, "a", now=t, deliver_after=t)
+    seed(rig, "b", now=t, deliver_after=t)
+    proc = rig.spawn("flush", "--json")
+    a.wait_for("invoke", timeout=30)
+    b.wait_for("invoke", timeout=30)
+    # both calls are in flight at once: neither notifier has finished yet
+    assert a.events("exit") == [] and b.events("exit") == []
+    out, err = proc.communicate(timeout=30)
+    assert proc.returncode == 0, err
+    doc = json.loads(out)
     assert (dest(doc, "a")["sent"], dest(doc, "b")["sent"]) == (1, 1)
 
 
@@ -205,12 +213,13 @@ def test_rows_24_hours_old_end_expired_and_younger_rows_are_sent(rig: Rig) -> No
     assert [json.loads(i)["message"] for i in invoked(n)] == ["young"]
     got = dict((r[0], r[1:]) for r in rig.query("SELECT id, outcome, code FROM deliveries"))
     assert got[old] == ("expired", "expired") and got[young][0] == "sent"
-    assert any(x["outcome"] == "expired" for x in rig.log_lines())
+    (line,) = [x for x in checked_log(rig) if x["outcome"] == "expired"]
+    assert (line["source"], line["attempts"], line["code"]) == ("s", 0, "expired")
 
 
 def test_a_claimed_row_is_not_expired_until_its_claim_lapses(rig: Rig) -> None:
     n = one(rig)
-    seed(rig, created_at=NOW - 2 * DAY, token="t", claim_expires=NOW + 50)
+    seed(rig, created_at=NOW - 2 * DAY, claim="t", claim_expires=NOW + 50)
     code, doc, _ = flush(rig)
     assert (code, dest(doc)["state"]) == (22, "nothing_due")
     assert rig.query("SELECT COUNT(*) FROM queue") == [(1,)] and n.events("invoke") == []
@@ -241,6 +250,9 @@ def test_while_quiet_info_is_dropped_warn_and_action_wait_for_the_window_end(rig
     assert got[info] == ("dropped", "quiet", None)
     assert got[err_id][0] == "sent"
     assert got[warn][2] == MORNING and got[action][2] == MORNING
+    assert sorted(x["outcome"] for x in checked_log(rig) if x["record"] == "delivery") == [
+        "dropped", "sent",
+    ]  # fmt: skip
     assert rig.query("SELECT id, kind, deliver_after FROM queue ORDER BY id") == [
         (w, "single", MORNING), (a, "held", MORNING),
     ]  # fmt: skip
@@ -294,6 +306,7 @@ def test_a_failed_result_stops_the_destination_and_the_other_rows_keep_their_del
         ("failed",), ("deferred",), ("deferred",),
     ]  # fmt: skip
     assert second > 0
+    assert [x["outcome"] or x["record"] for x in checked_log(rig)] == ["failed", "flush"]
 
 
 def test_a_retryable_result_stops_the_destination_and_exits_0(rig: Rig) -> None:
@@ -393,27 +406,73 @@ def test_a_second_flusher_on_a_destination_exits_already_running(rig: Rig) -> No
     assert dest(doc)["sent"] == 1
 
 
-def test_an_unusable_flush_lock_leaves_the_destination_untouched_with_a_warning(rig: Rig) -> None:
+def test_an_unusable_flush_lock_is_an_internal_error_and_the_destination_is_left_untouched(
+    rig: Rig,
+) -> None:
     n = one(rig)
     seed(rig)
     locks = rig.state / "locks"
     locks.mkdir(parents=True, exist_ok=True)
     locks.chmod(0o755)  # not private: unusable
-    code, doc, err = flush(rig)
+    code, out, err = rig.run("flush", "--json")
+    doc = json.loads(out)
+    assert code == 1 and doc["error"]["code"] == "internal"
+    assert "already_running" not in out
+    assert n.events("invoke") == [] and rig.query("SELECT COUNT(claimed_by) FROM queue") == [(0,)]
+
+
+def test_a_flush_lock_that_cannot_be_opened_is_an_internal_error_too(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    n = one(rig)
+    seed(rig)
+
+    def broken(*_a: Any, **_k: Any) -> bool:
+        raise OSError("LOCK-TEXT")
+
+    monkeypatch.setattr(Gateway, "try_lock", broken)
+    code, out, err = rig.run("flush", "--json")
+    assert code == 1 and json.loads(out)["error"]["code"] == "internal"
+    assert "LOCK-TEXT" not in out + err and n.events("invoke") == []
+
+
+def test_a_flush_that_finds_the_flush_lock_held_waits_for_nothing(rig: Rig) -> None:
+    n = one(rig)
+    seed(rig)
+    held = hold(rig, "chat.flush")
+    try:
+        started = time.monotonic()
+        code, doc, _ = flush(rig)
+        waited = time.monotonic() - started
+    finally:
+        held.close()
     assert (code, dest(doc)["state"]) == (0, "already_running")
-    assert "flush lock of chat cannot be used" in err and n.events("invoke") == []
+    assert waited < 5 and n.events("invoke") == []
 
 
-def test_a_running_flush_makes_another_one_wait_for_nothing(rig: Rig) -> None:
-    n = one(rig, sleep=1.5)
+def test_a_stopped_flusher_keeps_its_locks_so_no_second_call_is_made(rig: Rig) -> None:
+    n = one(rig, sleep=1.0)
     t = real_now()
     seed(rig, now=t, deliver_after=t)
     proc = rig.spawn("flush", "--json")
     n.wait_for("invoke", timeout=30)
-    code, doc, _ = flush(rig)  # the first holds the flush lock during its call
-    assert (code, dest(doc)["state"]) == (0, "already_running")
+    proc.send_signal(signal.SIGSTOP)  # the exact handle this test started
+    try:
+        conn = sqlite3.connect(rig.state / "state.db")
+        conn.execute("UPDATE queue SET claim_expires = ?", (t - 1,))  # the lease has lapsed
+        conn.commit()
+        conn.close()
+        code, doc, _ = flush(rig)  # the locks, not the lease, protect the row
+        assert (code, dest(doc)["state"]) == (0, "already_running")
+        assert len(n.events("invoke")) == 1
+    finally:
+        proc.send_signal(signal.SIGCONT)
     out, err = proc.communicate(timeout=30)
-    assert proc.returncode in (0, 22) and len(n.events("invoke")) == 1
+    assert proc.returncode == 0, err
+    assert json.loads(out)["destinations"][0]["sent"] == 1
+    assert rig.query("SELECT outcome FROM deliveries") == [("sent",)]
+    assert rig.query("SELECT COUNT(*) FROM queue") == [(0,)]
+    assert len(n.events("invoke")) == 1
 
 
 # --- processes ---------------------------------------------------------------------------------
@@ -431,9 +490,10 @@ def test_two_flushers_on_one_destination_with_40_due_rows_send_each_row_once(rig
         seed(rig, message=f"row{i:02}", now=t, deliver_after=t)
     procs = [rig.spawn("flush", "--json") for _ in range(2)]
     results = [p.communicate(timeout=120) for p in procs]
-    assert all(p.returncode == 0 for p in procs), results
+    assert all(p.returncode in (0, 22) for p in procs), results
     sent = [json.loads(i)["message"] for i in invoked(n)]
     assert sorted(sent) == [f"row{i:02}" for i in range(40)]
+    assert len(n.events("invoke")) == 40
     assert rig.query("SELECT COUNT(*) FROM queue") == [(0,)]
     assert rig.query("SELECT COUNT(*) FROM deliveries WHERE outcome = 'sent'") == [(40,)]
 
@@ -472,7 +532,7 @@ def test_a_flusher_killed_mid_call_leaves_a_claimed_row_that_lapses_and_is_resen
 def test_a_sigterm_during_a_call_lets_it_finish_makes_no_more_calls_and_exits_with_the_result(
     rig: Rig,
 ) -> None:
-    n = one(rig, sleep=1.0)
+    n = one(rig, sleep=3.0)
     t = real_now()
     for i in range(3):
         seed(rig, message=f"m{i}", now=t, deliver_after=t)
@@ -503,11 +563,43 @@ def test_a_sigterm_before_any_call_releases_the_claim_and_exits_128_plus_n(rig: 
         out, err = proc.communicate(timeout=30)
     finally:
         held.close()
+    after = real_now()
     assert proc.returncode == 128 + signal.SIGTERM and out == b""
     assert n.events("invoke") == []
     ((claimed, expires),) = rig.query("SELECT claimed_by, claim_expires FROM queue")
-    assert claimed is None or expires <= t + 5  # released or requeued: due again at once or soon
+    assert claimed is not None and expires <= after  # released: due again at once
     assert rig.query("SELECT count FROM rate") == [(0,)]
+
+
+def test_a_sigterm_during_the_send_lock_wait_ends_the_wait_and_gives_the_row_back(
+    rig: Rig,
+) -> None:
+    n = rig.notifier()
+    rig.configure({"chat": {"notifier": n}}, lock_wait="30s")
+    t = real_now()
+    seed(rig, now=t, deliver_after=t)
+    held = hold(rig, "chat.lock")
+    try:
+        proc = rig.spawn("flush", "--json")
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and not rig.query(
+            "SELECT 1 FROM queue WHERE claimed_by IS NOT NULL"
+        ):
+            time.sleep(0.02)
+        started = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=10)  # far below lock_wait
+        waited = time.monotonic() - started
+    finally:
+        held.close()
+    assert proc.returncode == 128 + signal.SIGTERM and out == b"", err
+    assert waited < 10 and n.events("invoke") == []
+    assert rig.query("SELECT outcome, reason, attempts FROM deliveries") == [
+        ("deferred", None, 0)
+    ]  # not requeued as lock_busy
+    assert rig.query("SELECT count FROM rate") == [(0,)]
+    ((claimed, expires),) = rig.query("SELECT claimed_by, claim_expires FROM queue")
+    assert claimed is not None and expires <= real_now()
 
 
 # --- faults ------------------------------------------------------------------------------------
@@ -536,7 +628,7 @@ def test_a_result_after_a_takeover_is_fenced_and_goes_to_the_log_only(
     assert "claim was lost" in err
     assert rig.query("SELECT claimed_by FROM queue") == [("other-claimant",)]
     assert rig.query("SELECT outcome, attempts FROM deliveries") == [("deferred", 0)]
-    assert len(n.events("invoke")) == 1 and any(x["outcome"] == "sent" for x in rig.log_lines())
+    assert len(n.events("invoke")) == 1 and any(x["outcome"] == "sent" for x in checked_log(rig))
 
 
 def test_an_exception_from_a_call_is_unknown_leaves_the_row_claimed_and_stops(
@@ -561,7 +653,7 @@ def test_an_exception_from_a_call_is_unknown_leaves_the_row_claimed_and_stops(
 
 def test_a_row_that_keeps_escaping_ends_failed_without_another_call(rig: Rig) -> None:
     n = one(rig)
-    seed(rig, attempts=5, outcome="unknown", token="old", claim_expires=NOW - 1)
+    seed(rig, attempts=5, outcome="unknown", claim="old", claim_expires=NOW - 1)
     code, doc, _ = flush(rig)
     assert (code, dest(doc)["failed"]) == (12, 1) and n.events("invoke") == []
     assert rig.query("SELECT outcome, code FROM deliveries") == [("failed", "retries_exhausted")]
@@ -571,7 +663,7 @@ def test_a_row_that_keeps_escaping_ends_failed_without_another_call(rig: Rig) ->
 
 def test_a_lapsed_claim_with_attempts_left_is_resent(rig: Rig) -> None:
     n = one(rig)
-    seed(rig, attempts=2, outcome="unknown", token="old", claim_expires=NOW - 1)
+    seed(rig, attempts=2, outcome="unknown", claim="old", claim_expires=NOW - 1)
     code, doc, _ = flush(rig)
     assert (code, dest(doc)["sent"], len(n.events("invoke"))) == (0, 1, 1)
     assert rig.query("SELECT attempts, outcome FROM deliveries") == [(3, "sent")]
@@ -610,6 +702,226 @@ def test_an_error_from_the_send_lock_before_a_call_releases_the_row_and_is_exit_
     assert rig.query("SELECT count FROM rate") == [(0,)]
     ((_, expires),) = rig.query("SELECT claimed_by, claim_expires FROM queue")
     assert expires <= NOW
+
+
+# --- review round 1 ----------------------------------------------------------------------------
+
+
+def test_quiet_omits_the_per_destination_lines_of_a_clean_run(rig: Rig) -> None:
+    one(rig)
+    seed(rig)
+    code, out, err = rig.run("flush", "--quiet")
+    assert (code, out, err) == (0, "", "")
+    code, out, err = rig.run("flush", "--quiet")  # nothing due: exit 22
+    assert (code, out, err) == (22, "", "")
+
+
+def test_quiet_keeps_the_lines_and_warnings_of_a_run_that_failed(rig: Rig) -> None:
+    one(rig, error={"code": "credential_invalid"})
+    seed(rig)
+    code, _, err = rig.run("flush", "--quiet")
+    assert code == 12 and "chat: done (failed=1)" in err
+
+
+def test_quiet_keeps_the_warnings_of_a_clean_run(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    one(rig)
+    seed(rig)
+
+    def takeover(*args: Any, **kwargs: Any) -> Any:
+        with open_store(rig.gateway()) as store, store.write() as conn:
+            conn.execute("UPDATE queue SET claim_expires = ?", (NOW - 1,))
+            claim_row(conn, 1, Lease(NOW, 50), "other-claimant")
+        return call_notifier(*args, **kwargs)
+
+    use_seams(monkeypatch, Seams(call=takeover))
+    code, _, err = rig.run("flush", "--quiet")
+    assert code == 0 and "claim was lost" in err and "chat: done" not in err
+
+
+def test_an_exhausted_row_makes_no_call_and_does_not_stop_the_destination(rig: Rig) -> None:
+    n = one(rig)
+    seed(rig, attempts=5, outcome="unknown", claim="old", claim_expires=NOW - 1, message="spent")
+    seed(rig, message="next")
+    code, doc, _ = flush(rig)
+    d = dest(doc)
+    assert (code, d["failed"], d["sent"]) == (12, 1, 1)
+    assert [json.loads(i)["message"] for i in invoked(n)] == ["next"]
+    assert [r[0] for r in rig.query("SELECT outcome FROM deliveries ORDER BY id")] == [
+        "failed", "sent",
+    ]  # fmt: skip
+    checked_log(rig)
+
+
+def test_the_attempts_of_an_escaped_call_and_of_a_lost_claim_follow_the_row(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    one(rig)
+    seed(rig, attempts=2, outcome="unknown", claim="old", claim_expires=NOW - 1)
+
+    def boom(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("BOOM-TEXT")
+
+    use_seams(monkeypatch, Seams(call=boom))
+    flush(rig)
+    assert rig.query("SELECT attempts FROM deliveries") == [(3,)]
+    (line,) = [x for x in checked_log(rig) if x["record"] == "delivery"]
+    assert (line["outcome"], line["attempts"]) == ("unknown", 3)
+
+
+def test_the_attempts_of_a_result_whose_claim_was_lost_follow_the_row(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    one(rig)
+    _, row_id = seed(rig, attempts=2, outcome="unknown", claim="old", claim_expires=NOW - 1)
+
+    def takeover(*args: Any, **kwargs: Any) -> Any:
+        with open_store(rig.gateway()) as store, store.write() as conn:
+            conn.execute("UPDATE queue SET claim_expires = ?", (NOW - 1,))
+            assert claim_row(conn, row_id, Lease(NOW, 50), "other-claimant") is not None
+        return call_notifier(*args, **kwargs)
+
+    use_seams(monkeypatch, Seams(call=takeover))
+    flush(rig)
+    (line,) = [x for x in checked_log(rig) if x["record"] == "delivery"]
+    assert (line["outcome"], line["attempts"]) == ("sent", 3)
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["two_held", "old_row_with_future_deliver_after", "old_due_row", "quiet_warn_only"],
+)
+def test_dry_run_reports_the_state_a_real_run_ends_in(rig: Rig, scenario: str) -> None:
+    if scenario == "quiet_warn_only":
+        quiet_config(rig)
+    else:
+        one(rig)
+    if scenario == "two_held":
+        seed(rig, level="warn", kind="held")
+        seed(rig, level="warn", kind="held")
+    elif scenario == "old_row_with_future_deliver_after":
+        seed(rig, created_at=NOW - 2 * DAY, deliver_after=NOW + 3600)
+    elif scenario == "old_due_row":
+        seed(rig, created_at=NOW - 2 * DAY)
+    else:
+        seed(rig, level="warn")
+    dry_code, dry, _ = flush(rig, "--dry-run")
+    real_code, real, _ = flush(rig)
+    assert (dry_code, dest(dry)["state"]) == (real_code, dest(real)["state"])
+
+
+def test_an_unknown_destination_with_no_config_is_exit_22_not_2(rig: Rig) -> None:
+    code, doc, _ = flush(rig, "--destination", "nope")
+    assert (code, doc["outcome"], doc["destinations"]) == (22, "no_op", [])
+
+
+def test_a_fault_in_one_destination_thread_is_an_internal_error_and_keeps_the_others(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    good, bad = rig.notifier("good"), rig.notifier("bad")
+    rig.configure({"bad": {"notifier": bad}, "good": {"notifier": good}})
+    seed(rig, "bad")
+    seed(rig, "good")
+    real = flush_mod._prepare  # pyright: ignore[reportPrivateUsage]
+
+    def prepare(run: Any, store: Any, dst: Any, t: Any) -> None:
+        if dst.name == "bad":
+            raise RuntimeError("BOOM-TEXT")
+        real(run, store, dst, t)
+
+    monkeypatch.setattr(flush_mod, "_prepare", prepare)
+    code, out, err = rig.run("flush")
+    assert code == 1 and "internal error" in err
+    assert "state database" not in err and "BOOM-TEXT" not in out + err
+    assert "good: done (sent=1)" in err and len(good.events("invoke")) == 1
+
+
+def test_a_row_with_an_invalid_level_is_skipped_with_a_warning_and_the_run_goes_on(
+    rig: Rig,
+) -> None:
+    n = one(rig)
+    _, junk = seed(rig, message="junk")
+    seed(rig, message="good")
+    conn = sqlite3.connect(rig.state / "state.db")
+    conn.execute("UPDATE queue SET level = 'JUNK-LEVEL' WHERE id = ?", (junk,))
+    conn.commit()
+    conn.close()
+    code, out, err = rig.run("flush", "--json")
+    assert code == 1 and json.loads(out)["error"]["code"] == "internal"
+    assert err.count("warning:") == 1 and "JUNK-LEVEL" not in out + err
+    assert [json.loads(i)["message"] for i in invoked(n)] == ["good"]
+    assert rig.query("SELECT id, claimed_by FROM queue") == [(junk, None)]
+    assert rig.query("SELECT count FROM rate") == [(1,)]
+
+
+def test_many_capped_rows_are_skipped_in_linear_time(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    n = one(rig)
+    rig.configure({"chat": {"notifier": n, "max_per_hour": 3}})
+    with open_store(rig.gateway()) as store, store.write() as conn:
+        for i in range(300):
+            did = insert_delivery(
+                conn, ts=NOW, source="s", level="info", outcome="deferred", destination="chat",
+                deliver_after=NOW,
+            )  # fmt: skip
+            enqueue(
+                conn, delivery_id=did, kind="single", message=f"m{i}", level="info", source="s",
+                deliver_after=NOW, created_at=NOW, lease=Lease(NOW, 100), cap=10_000,
+            )  # fmt: skip
+    read = 0
+    real = flush_mod.due_rows
+
+    def counting(*a: Any, **k: Any) -> Any:
+        nonlocal read
+        rows = real(*a, **k)
+        read += len(rows)
+        return rows
+
+    monkeypatch.setattr(flush_mod, "due_rows", counting)
+    code, doc, _ = flush(rig)
+    assert (code, dest(doc)["sent"], len(n.events("invoke"))) == (0, 3, 3)
+    assert read < 2000  # the scan was quadratic: about 45 000 rows
+
+
+def test_verbose_prints_one_fixed_line_per_decision(rig: Rig) -> None:
+    n = one(rig, error={"code": "rate_limited"})
+    seed(rig, message=f"{CANARY}-1")
+    seed(rig, message=f"{CANARY}-2")
+    code, _, err = rig.run("flush", "--verbose")
+    assert code == 0 and len(n.events("invoke")) == 1
+    lines = [x for x in err.splitlines() if x.startswith("notice-route: chat")]
+    assert "notice-route: chat: row 1 queued_retry" in lines
+    assert "notice-route: chat: stop after queued_retry" in lines
+    assert CANARY not in err
+    code, _, quiet = rig.run("flush")  # not verbose: no decision lines
+    assert "row " not in quiet and "stop after" not in quiet
+
+
+def test_a_signal_during_the_output_of_a_run_that_called_does_not_change_its_exit(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    n = one(rig)
+    seed(rig)
+
+    def interrupted(*_a: Any, **_k: Any) -> None:
+        raise Interrupted(signal.SIGTERM)
+
+    monkeypatch.setattr(cli, "_send_output", interrupted)
+    code, _, _ = rig.run("flush", "--json")
+    assert code == 0 and len(n.events("invoke")) == 1
+
+
+def test_a_signal_during_the_output_of_a_run_that_made_no_call_is_128_plus_n(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    one(rig)
+
+    def interrupted(*_a: Any, **_k: Any) -> None:
+        raise Interrupted(signal.SIGTERM)
+
+    monkeypatch.setattr(cli, "_send_output", interrupted)
+    code, _, _ = rig.run("flush", "--json")
+    assert code == 128 + signal.SIGTERM
 
 
 # --- heartbeat, dry run, usage -----------------------------------------------------------------
@@ -653,7 +965,7 @@ def test_dry_run_lists_what_is_due_and_changes_nothing(rig: Rig) -> None:
         (rig.state / "state.db-wal").read_bytes() if (rig.state / "state.db-wal").exists() else b""
     )
     assert after == wal and rig.query("SELECT COUNT(*) FROM queue") == [(3,)]
-    assert rig.log_lines() == []
+    assert checked_log(rig) == []
 
 
 def test_dry_run_without_a_database_creates_none(rig: Rig) -> None:
@@ -732,8 +1044,8 @@ def test_hostile_row_text_and_notifier_output_never_reach_stdout_stderr_or_the_l
     doc = json.loads(out)
     assert code == 0 and dest(doc)["sent"] == 1
     assert CANARY not in out + err and "\x1b" not in out + err
-    assert CANARY not in json.dumps(rig.log_lines())
-    assert all(log_errors(x) == [] for x in rig.log_lines())
+    assert CANARY not in json.dumps(checked_log(rig))
+    assert all(log_errors(x) == [] for x in checked_log(rig))
     assert len(n.events("invoke")) == 1
 
 
@@ -741,4 +1053,4 @@ def test_hostile_error_output_from_a_notifier_is_not_echoed(rig: Rig) -> None:
     one(rig, error={"code": "rate_limited", "message": CANARY, "details": {"x": CANARY}})
     seed(rig)
     code, out, err = rig.run("flush")
-    assert code == 0 and CANARY not in out + err + json.dumps(rig.log_lines())
+    assert code == 0 and CANARY not in out + err + json.dumps(checked_log(rig))

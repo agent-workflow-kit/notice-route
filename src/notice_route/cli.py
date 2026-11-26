@@ -429,7 +429,8 @@ def _run_flush(args: argparse.Namespace, gateway: Gateway) -> int:
         except Interrupted as exc:
             gateway.discard_stdout()
             gateway.discard_stderr()
-            return 128 + exc.signum
+            # 128+N only when no call started: after one, the exit is the run's result
+            return result.exit_code if result.called else 128 + exc.signum
         finally:
             trap.armed = False
     return result.exit_code
@@ -462,6 +463,13 @@ def _send_output(
     if args.verbose:
         for text in result.verbose:
             err(text)
+    # a clean ``flush`` under --quiet (a cron line) prints no per-destination line: only
+    # warnings and the lines of a run that failed
+    lines = (
+        []
+        if args.quiet and isinstance(result, FlushResult) and result.exit_code in (0, 22)
+        else result.lines
+    )
     if result.error is not None:
         code, message = result.error
         if args.json:
@@ -470,7 +478,7 @@ def _send_output(
             }
             _guarded(gateway, "out", lambda: _json(envelope))
         else:
-            for text in result.lines:
+            for text in lines:
                 err(text)
         _guarded(gateway, "err", lambda: _err(f"{PROG}: {code}: {message}\n"))
     elif result.document is not None:
@@ -478,7 +486,7 @@ def _send_output(
             document = result.document
             _guarded(gateway, "out", lambda: _json(document))
         else:
-            for text in result.lines:
+            for text in lines:
                 err(text)
 
 

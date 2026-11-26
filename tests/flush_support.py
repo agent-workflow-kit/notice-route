@@ -8,7 +8,7 @@ from typing import Any
 
 from notice_route.queue import Lease, enqueue, insert_delivery
 from notice_route.store import open_store
-from tests.send_support import NOW, Rig
+from tests.send_support import NOW, Rig, log_errors
 from tests.test_cli_rules_validate import schema_errors
 
 
@@ -24,7 +24,7 @@ def seed(
     title: str | None = None,
     link: str | None = None,
     attempts: int = 0,
-    token: str | None = None,
+    claim: str | None = None,
     claim_expires: int | None = None,
     source: str = "s",
     now: int = NOW,
@@ -57,10 +57,10 @@ def seed(
             title=title,
             link=link,
             dedupe="ab" * 32,
-            claim_token=token,
+            claim_token=claim,
             cap=10_000,
         )
-        if token is not None and claim_expires is not None:
+        if claim is not None and claim_expires is not None:
             conn.execute(
                 "UPDATE queue SET claim_expires = ? WHERE id = ?", (claim_expires, got.row_id)
             )
@@ -84,3 +84,11 @@ def flush(
 def dest(doc: dict[str, Any], name: str = "chat") -> dict[str, Any]:
     (found,) = [d for d in doc["destinations"] if d["name"] == name]
     return found
+
+
+def checked_log(rig: Rig) -> list[dict[str, Any]]:
+    """The lines of ``log.jsonl``, each validated against schemas/log.json."""
+    lines = rig.log_lines()
+    for line in lines:
+        assert log_errors(line) == [], line
+    return lines

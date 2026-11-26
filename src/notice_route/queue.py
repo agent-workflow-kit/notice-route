@@ -70,6 +70,7 @@ __all__ = [
     "claim_row",
     "complete_row",
     "count_due",
+    "count_expirable",
     "drop_unclaimed",
     "due_rows",
     "enforce_cap",
@@ -209,6 +210,8 @@ class Expired:
     destination: str
     kind: str
     level: str
+    source: str
+    attempts: int
 
 
 @dataclass(frozen=True)
@@ -259,7 +262,7 @@ _SELECT_DUE = (
     + _FROM
     + " WHERE d.destination = ? AND q.deliver_after <= ? AND "
     + _UNCLAIMED
-    + " AND (? IS NULL OR q.kind = ?) ORDER BY q.id LIMIT ?"
+    + " AND (? IS NULL OR q.kind = ?) AND q.id > ? ORDER BY q.id LIMIT ?"
 )
 _COUNT_UNCLAIMED = "SELECT COUNT(*)" + _FROM + " WHERE d.destination = ? AND " + _UNCLAIMED
 _SELECT_VICTIMS = (
@@ -492,6 +495,7 @@ def claim_due(
             lease.expires,
             kind,
             kind,
+            0,
             -1 if limit is None else limit,
         ),
     ).fetchall()
@@ -594,13 +598,18 @@ def due_rows(
     *,
     kind: Kind | None = None,
     limit: int | None = None,
+    after_id: int = 0,
 ) -> list[QueueRow]:
     """The due rows of ``destination`` (unclaimed, a lapsed claim included, ``deliver_after``
-    passed), lowest id first, optionally one ``kind`` and at most ``limit``. Changes nothing."""
+    passed), lowest id first, optionally one ``kind``, at most ``limit``, and only rows with an id
+    above ``after_id`` (so a caller that skips rows steps past them without reading them again).
+    Changes nothing."""
     if kind is not None and kind not in _KINDS:
         raise ValueError("kind must be held or single")
     if limit is not None and (type(limit) is not int or not 1 <= limit < (1 << 63)):
         raise ValueError("limit must be a positive integer within int64")
+    if type(after_id) is not int or not 0 <= after_id < (1 << 63):
+        raise ValueError("after_id must be a non-negative integer within int64")
     ids = conn.execute(
         _SELECT_DUE,
         (
@@ -610,6 +619,7 @@ def due_rows(
             lease.expires,
             kind,
             kind,
+            after_id,
             -1 if limit is None else limit,
         ),
     ).fetchall()
@@ -637,6 +647,20 @@ def count_due(conn: _Conn, destination: str, lease: Lease) -> dict[str, int]:
     return counts
 
 
+def count_expirable(conn: _Conn, destination: str, lease: Lease, *, max_age: int = EXPIRY_S) -> int:
+    """How many unclaimed rows of ``destination`` :func:`expire_unclaimed` would end now (due or
+    not). Changes nothing."""
+    _int(max_age, "max_age")
+    found = conn.execute(
+        "SELECT COUNT(*)"
+        + _FROM
+        + " WHERE d.destination = ? AND q.created_at <= ? AND "
+        + _UNCLAIMED,
+        (destination, lease.now - max_age, lease.now, lease.expires),
+    ).fetchone()
+    return int(found[0])
+
+
 def claim_row(conn: _Conn, row_id: int, lease: Lease, token: str) -> QueueRow | None:
     """Claim one unclaimed row for ``token`` (a lapsed claim is taken over; a fresh token fences
     the claimant before it). ``None`` when the row is missing or its claim is live."""
@@ -657,7 +681,7 @@ def expire_unclaimed(
     live claim is never touched. Oldest (lowest id) first. TODO(#27): the caller surfaces them."""
     _int(max_age, "max_age")
     found = conn.execute(
-        "SELECT q.id, q.delivery_id, d.destination, q.kind, q.level"
+        "SELECT q.id, q.delivery_id, d.destination, q.kind, q.level, q.source, d.attempts"
         + _FROM
         + " WHERE d.destination IS NOT NULL AND (? IS NULL OR d.destination = ?)"
         + " AND q.created_at <= ? AND "
@@ -666,7 +690,7 @@ def expire_unclaimed(
         (destination, destination, lease.now - max_age, lease.now, lease.expires),
     ).fetchall()
     out: list[Expired] = []
-    for queue_id, delivery_id, dest, kind, level in found:
+    for queue_id, delivery_id, dest, kind, level, source, attempts in found:
         conn.execute("DELETE FROM queue WHERE id = ?", (queue_id,))
         conn.execute(
             "UPDATE deliveries SET outcome = 'expired', code = 'expired', deliver_after = NULL"
@@ -674,7 +698,7 @@ def expire_unclaimed(
             (delivery_id,),
         )
         dedup.release(conn, delivery_id)
-        out.append(Expired(queue_id, delivery_id, dest, kind, level))
+        out.append(Expired(queue_id, delivery_id, dest, kind, level, source, attempts))
     return tuple(out)
 
 

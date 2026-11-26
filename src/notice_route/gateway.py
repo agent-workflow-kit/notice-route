@@ -626,7 +626,9 @@ class Gateway:
             os.close(fd)
             raise
 
-    def try_lock(self, file: io.FileIO, wait: float) -> bool:
+    def try_lock(
+        self, file: io.FileIO, wait: float, cancel: Callable[[], bool] | None = None
+    ) -> bool:
         """Take an exclusive ``flock`` on ``file`` without ever blocking.
 
         Tries at once, then every ``POLL_INTERVAL`` (50 ms) until ``wait`` seconds of the
@@ -635,7 +637,9 @@ class Gateway:
         the holder dies or closes the file; :meth:`unlock` releases it early. ``wait`` must be a
         finite number of seconds >= 0 (``ValueError`` otherwise, before anything is tried); the
         1 to 60 s range of ``lock_wait`` is enforced by the config loader (#7), not here. Any
-        ``OSError`` other than "would block" (``ENOLCK``, a closed file) propagates.
+        ``OSError`` other than "would block" (``ENOLCK``, a closed file) propagates. ``cancel``
+        (default ``None``: no effect) is asked after each failed try, and the wait ends at once,
+        not acquired, when it returns true (``flush`` ends the wait on a trapped signal).
 
         Lock files must never be renamed or unlinked while in use: a second process would
         create a new file and hold a different lock.
@@ -652,6 +656,8 @@ class Gateway:
                 return True
             except BlockingIOError:
                 pass
+            if cancel is not None and cancel():
+                return False
             remaining = deadline - self.clock.monotonic()
             if remaining <= 0:
                 return False

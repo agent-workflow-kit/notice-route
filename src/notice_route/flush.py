@@ -21,8 +21,9 @@ SQLite connection is not shared between threads. Per destination, in order:
 After a call ends ``queued_retry`` (``lock_busy`` included), ``failed``, ``unknown`` or is deferred
 (``env_missing`` found at call time) no further call is made to that destination in the run; its
 other rows keep their ``deliver_after``. A trapped signal lets the calls in progress finish, makes
-no further call, releases the claims that have not started a call and ends with the result, or
-128+N when no call had started (nothing is printed then).
+no further call (a send-lock wait ends at once), releases the claims that have not started a call
+and ends with the result, or 128+N when no call had started (nothing is printed then); once a call
+has started, a signal during the output no longer changes the exit.
 
 Choices where the interface is silent (docs/design.md C-53 has the reasons), all the narrower
 reading:
@@ -35,7 +36,9 @@ reading:
 - ``due_single`` and ``due_held`` count the due unclaimed rows at the start of the run, before
   step 4 (a row that then expires or is dropped is counted in both places).
 - A flush lock that cannot be used (``locks/`` unsafe, any ``OSError``) leaves the destination
-  untouched as ``already_running`` and adds one warning.
+  untouched and ends the run 1 (``internal``, fixed message); only a lock another flusher holds is
+  ``already_running``. A fault in a destination's thread, and a stored row with an invalid level
+  (skipped, one warning, the next row goes on), also end the run 1 with a fixed message.
 - A row that was already called ``prior`` times and for which the retry schedule has nothing
   after ``prior`` (a row whose call escaped again and again: ``record_escaped`` adds an attempt each
   time) ends ``failed``/``retries_exhausted`` without a call (the hourly count is given back).
@@ -62,11 +65,13 @@ from .gateway import DirHandle, Gateway, SignalTrap
 from .outcome import LOCK_BUSY, Applied, Outcome, classify, record_escaped
 from .payload import UsageError
 from .queue import (
+    EXPIRY_S,
     Lease,
     QueueRow,
     claim_row,
     complete_row,
     count_due,
+    count_expirable,
     drop_unclaimed,
     due_rows,
     expire_unclaimed,
@@ -84,6 +89,9 @@ from .window import in_window
 __all__ = ["FlushOptions", "FlushResult", "run_flush"]
 
 _STOPPING = ("sent", "disabled")  # the classified outcomes after which the run goes on
+_ROW_FAULT = "a queue row could not be used"  # fixed texts of an exit 1 (never an exception's)
+_LOCK_FAULT = "a flush lock cannot be used"
+_THREAD_FAULT = "internal error"
 
 
 @dataclass(frozen=True)
@@ -107,6 +115,7 @@ class FlushResult:
     advisories: list[str] = field(default_factory=list[str])
     warnings: list[str] = field(default_factory=list[str])
     verbose: list[str] = field(default_factory=list[str])
+    called: bool = False  # a notifier call started: a signal then no longer changes the exit
 
 
 @dataclass
@@ -128,6 +137,7 @@ class _Tally:
     called: bool = False
     skipped: bool = False
     error: bool = False
+    fault: str | None = None  # a fixed message: the run ends 1 (internal)
     warnings: list[str] = field(default_factory=list[str])
     verbose: list[str] = field(default_factory=list[str])
 
@@ -160,6 +170,15 @@ class _Run:
     state: DirHandle | None = None
     writer: logmod.LogWriter | None = None
     log_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def cancelled(self) -> bool:
+        """Asked while a send-lock wait is going: a trapped signal ends the wait."""
+        return self.trap.received is not None
+
+    def say(self, t: _Tally, text: str) -> None:
+        """One ``--verbose`` line: fixed words, a destination name and a row id, nothing else."""
+        if self.opts.verbose:
+            t.verbose.append(f"{t.name}: {text}")
 
     def log(self, **fields: Any) -> None:
         if self.writer is None:
@@ -303,6 +322,7 @@ def _finish(run: _Run, tallies: list[_Tally], result: FlushResult) -> FlushResul
         result.verbose += t.verbose
     if run.trap.received is not None and not run.gate.started and not run.opts.dry_run:
         return FlushResult(128 + run.trap.received, warnings=result.warnings)  # nothing was called
+    result.called = run.gate.started
     shown = [t for t in tallies if not t.skipped]
     entries = [t.entry() for t in shown]
     failed = any(t.failed or t.unknown for t in shown)
@@ -319,6 +339,11 @@ def _finish(run: _Run, tallies: list[_Tally], result: FlushResult) -> FlushResul
     result.lines = [_line(e) for e in entries]
     if result.error is None and any(t.error for t in tallies):
         result.error = ("internal", "state database cannot be written")
+    if result.error is None:
+        for t in tallies:
+            if t.fault is not None:
+                result.error = ("internal", t.fault)
+                break
     if result.error is not None:
         result.exit_code = 1
     elif failed:
@@ -379,14 +404,25 @@ def _dry_run(run: _Run, selected: list[Destination]) -> list[_Tally]:
             lease = Lease.at(run.gateway.wall(), run.worst)
             counts = count_due(store.conn, dest.name, lease)
             t.due_single, t.due_held = counts["single"], counts["held"]
-            if not (t.due_single or t.due_held):
+            acts = count_expirable(store.conn, dest.name, lease) > 0  # step 4 (due or not)
+            if not (acts or t.due_single or t.due_held):
                 continue
             window = _quiet_window(run, dest)
             quiet = window is not None and in_window(window, lease.now)
-            levels = {r.level for r in due_rows(store.conn, dest.name, lease)}
-            would_act = not quiet or bool(levels & {"info", "error"})
-            t.state = "done" if would_act else "quiet"
+            left = [r for r in due_rows(store.conn, dest.name, lease) if _unexpired(r, lease)]
+            if quiet:  # step 5: info is dropped, warn and action wait for the window's end
+                acts = acts or any(r.level == "info" for r in left)
+                left = [r for r in left if r.level not in ("info", "warn", "action")]
+            held = [r for r in left if r.kind == "held"]
+            # steps 6 and 7: a due single row is sent; one due held row is sent as itself, two
+            # or more wait for the digest (TODO(#24))
+            acts = acts or any(r.kind == "single" for r in left) or len(held) == 1
+            t.state = "done" if acts else ("quiet" if quiet else "nothing_due")
     return tallies
+
+
+def _unexpired(row: QueueRow, lease: Lease) -> bool:
+    return row.created_at > lease.now - EXPIRY_S
 
 
 class _read_only:  # noqa: N801 - a context manager that tolerates "no database"
@@ -417,13 +453,17 @@ def _destination(run: _Run, dest: Destination) -> _Tally:
             flush_lock(run.gateway, run.state, dest.name) as held,
         ):
             if not held.acquired:
-                t.state = "already_running"
-                if held.busy_reason != "timeout":
-                    t.warnings.append(f"the flush lock of {dest.name} cannot be used")
+                if held.busy_reason == "timeout":  # another flusher holds it
+                    t.state = "already_running"
+                    run.say(t, "already_running")
+                else:  # the lock cannot be used: the destination is left untouched, exit 1
+                    t.fault = _LOCK_FAULT
                 return t
             _locked(run, store, dest, t)
-    except Exception:  # StoreError or a fault: the text of an exception is never kept
+    except StoreError:  # the text of an exception is never kept
         t.error = True
+    except Exception:  # a fault of the thread: its other destinations still report
+        t.fault = _THREAD_FAULT
     return t
 
 
@@ -435,7 +475,9 @@ def _locked(run: _Run, store: Store, dest: Destination, t: _Tally) -> None:
         claim = _claim(run, store, dest, "single", skipped, t)
         if claim is None:
             break
-        stop = isinstance(claim, _Exhausted) or _call_and_record(run, store, dest, t, claim)
+        if isinstance(claim, _Exhausted):  # no call was made: the next row is still due
+            continue
+        stop = _call_and_record(run, store, dest, t, claim)
     if not stop and run.trap.received is None:
         _send_held(run, store, dest, t)
     if t.acted:
@@ -467,16 +509,26 @@ def _prepare(run: _Run, store: Store, dest: Destination, t: _Tally) -> None:
                     if drop_unclaimed(conn, row.id, lease, reason="quiet"):
                         dropped += 1
                         log_rows.append((row, "dropped", "quiet", None))
+                        run.say(t, f"row {row.id} dropped (quiet)")
                 elif row.level in ("warn", "action"):
                     if end is None:
                         end = quiet_deliver_after(window, lease.now)  # None is an error
                     postpone_unclaimed(conn, row.id, lease, end)
+                    run.say(t, f"row {row.id} postponed (quiet)")
         t.dropped = dropped
         t.acted = t.acted or dropped > 0
     for row, outcome, reason, code in log_rows:
         run.log_row(row, outcome=outcome, reason=reason, code=code, attempts=0)
     for e in expired:
-        run.log(destination=e.destination, level=e.level, outcome="expired", code="expired")
+        run.say(t, f"row {e.queue_id} expired")
+        run.log(
+            source=e.source,
+            destination=e.destination,
+            level=e.level,
+            outcome="expired",
+            code="expired",
+            attempts=e.attempts,
+        )
 
 
 @dataclass(frozen=True)
@@ -484,6 +536,7 @@ class _Claim:
     row: QueueRow
     token: str
     count_hour: int
+    prior: int  # the attempts the row had before this call
 
 
 @dataclass(frozen=True)
@@ -501,20 +554,31 @@ def _claim(
     claim: _Claim | None = None
     with store.write() as conn:
         lease = Lease.at(run.gateway.wall(), run.worst)
+        after = max(skipped, default=0)  # rows are read in id order: step past the skipped ones
         while True:
-            rows = due_rows(conn, dest.name, lease, kind=kind, limit=len(skipped) + 1)  # type: ignore[arg-type]
-            fresh = [r for r in rows if r.id not in skipped]
-            if not fresh:
+            rows = due_rows(conn, dest.name, lease, kind=kind, limit=1, after_id=after)  # type: ignore[arg-type]
+            if not rows:
                 break
-            row = fresh[0]
-            if not claim_call(
-                conn,
-                destination=dest.name,
-                level=row.level,
-                now=lease.now,
-                cap=dest.max_per_hour,
-            ):
+            row = rows[0]
+            after = row.id
+            try:
+                counted = claim_call(
+                    conn,
+                    destination=dest.name,
+                    level=row.level,
+                    now=lease.now,
+                    cap=dest.max_per_hour,
+                )
+            except ValueError:  # a stored level that is none of the four: leave the row alone
+                skipped.add(row.id)
+                if _ROW_FAULT not in t.warnings:
+                    t.warnings.append(_ROW_FAULT)
+                t.fault = t.fault or _ROW_FAULT
+                run.say(t, f"row {row.id} skipped (invalid level)")
+                continue
+            if not counted:
                 skipped.add(row.id)  # at the cap: waits for the next UTC hour
+                run.say(t, f"row {row.id} skipped (rate_capped)")
                 continue
             token = run.gateway.new_token()
             claimed = claim_row(conn, row.id, lease, token)
@@ -530,11 +594,12 @@ def _claim(
                 _exhaust(conn, run, dest, claimed, token, prior, hour)
                 exhausted.append((claimed, prior))
                 break
-            claim = _Claim(claimed, token, hour)
+            claim = _Claim(claimed, token, hour, prior)
             break
     for row, prior in exhausted:
         t.failed += 1
         t.acted = True
+        run.say(t, f"row {row.id} failed (retries_exhausted)")
         run.log_row(row, outcome="failed", reason=None, code="retries_exhausted", attempts=prior)
         return _Exhausted()
     return claim
@@ -603,9 +668,11 @@ def _call_and_record(run: _Run, store: Store, dest: Destination, t: _Tally, clai
         row.dedupe,
         run.seams.call,
         run.gate,
+        run.cancelled,
     )
     if isinstance(end, (Skipped, NotRun)):  # no call was made: give the row and the count back
         _give_back(run, store, dest, claim)
+        run.say(t, f"row {row.id} not called (released)")
         t.error = t.error or isinstance(end, NotRun)
         return True
     if isinstance(end, Escaped):
@@ -615,7 +682,9 @@ def _call_and_record(run: _Run, store: Store, dest: Destination, t: _Tally, clai
             with_retry(run.gateway, row, lambda: record_escaped(store, row=row, token=token))
         except StoreError:
             t.error = True
-        run.log_row(row, outcome="unknown", reason=None, code="killed", attempts=1)
+        run.say(t, f"row {row.id} unknown")
+        run.say(t, "stop after unknown")
+        run.log_row(row, outcome="unknown", reason=None, code="killed", attempts=claim.prior + 1)
         return True
     outcome: Outcome = (
         LOCK_BUSY
@@ -645,7 +714,7 @@ def _call_and_record(run: _Run, store: Store, dest: Destination, t: _Tally, clai
             outcome=outcome.outcome or "unknown",
             reason=outcome.reason,
             code=outcome.code,
-            attempts=1 if outcome.counted else 0,
+            attempts=claim.prior + (1 if outcome.counted else 0),
         )
     else:
         assert applied.outcome is not None
@@ -657,7 +726,11 @@ def _call_and_record(run: _Run, store: Store, dest: Destination, t: _Tally, clai
             code=applied.code,
             attempts=applied.attempts,
         )
-    return outcome.outcome not in _STOPPING
+    run.say(t, f"row {row.id} {outcome.outcome or 'unknown'}")
+    stop = outcome.outcome not in _STOPPING
+    if stop:
+        run.say(t, f"stop after {outcome.outcome or 'unknown'}")
+    return stop
 
 
 def _others(applied: Applied, row: QueueRow) -> list[Any]:

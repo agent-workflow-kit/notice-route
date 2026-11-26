@@ -123,6 +123,35 @@ def test_different_destinations_do_not_block_each_other(
         assert fake.monotonic() == start  # no waiting at all
 
 
+def test_a_cancel_callback_ends_the_wait_early_and_is_named_in_busy_reason(
+    gw: Gateway, state: object, fake: FakeClock
+) -> None:
+    with lock(gw, state, "d") as first:
+        assert first.acquired
+        start = fake.monotonic()
+        asked: list[int] = []
+
+        def cancel() -> bool:
+            asked.append(1)
+            return len(asked) >= 3
+
+        with send_lock(gw, state, "d", "generic", 30.0, cancel) as second:  # type: ignore[arg-type]
+            assert second.acquired is False
+            assert second.busy_reason == "cancelled"
+        assert fake.monotonic() - start < 1.0  # three polls, far below the 30 s wait
+
+
+def test_a_cancel_callback_that_never_fires_changes_nothing(
+    gw: Gateway, state: object, fake: FakeClock
+) -> None:
+    with lock(gw, state, "d") as first:
+        assert first.acquired
+        start = fake.monotonic()
+        with send_lock(gw, state, "d", "generic", 1.0, lambda: False) as second:  # type: ignore[arg-type]
+            assert second.busy_reason == "timeout"
+        assert fake.monotonic() - start == pytest.approx(1.0, abs=1e-6)
+
+
 def test_wsl_destinations_share_one_lock_and_the_second_waits(
     gw: Gateway, state: object, fake: FakeClock
 ) -> None:
