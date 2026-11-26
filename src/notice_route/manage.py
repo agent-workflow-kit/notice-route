@@ -492,10 +492,12 @@ def run_set(
         doc = _set_document(action, name, dry_run, "no_op", None, reason, None, None)
         return SetResult(EXIT_NOOP, doc)
 
-    if config is None or not config.destinations:
+    if config is None:
         return noop("unconfigured")
     if not config.enabled:
         return noop("disabled")
+    if not config.destinations:
+        return noop("unconfigured")
     dest = config.destinations.get(name)
     if dest is None:
         raise UsageError("destination")

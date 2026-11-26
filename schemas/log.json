@@ -264,7 +264,7 @@
           "type": "null"
         }
       ],
-      "description": "An override record: the new state of the destination's override (disabled: set; cleared: deleted)."
+      "description": "An override record: the new state of the destination's override (disabled: set; cleared: deleted). Required on an override record; null on every other record, and absent in lines written before this field existed (1.0), which consumers accept."
     }
   },
   "additionalProperties": false,
@@ -297,8 +297,7 @@
     "expired",
     "duration_ms",
     "mode",
-    "result",
-    "override"
+    "result"
   ],
   "allOf": [
     {

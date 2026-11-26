@@ -161,3 +161,30 @@ def test_a_short_write_leaves_no_partial_line_for_the_next_record(
         assert w.write(delivery(source="last"))
     lines = (home / ".local" / "state" / "notice-route" / log.LOG_NAME).read_text().splitlines()
     assert [json.loads(x)["source"] for x in lines] == ["first", "last"]
+
+
+def _hook_record() -> dict[str, object]:
+    return log.record(
+        "hook", wall=1.0, actor="auto:x", decision_id=None, hook="post-fail", destination="d",
+        mode="sync", result="ok", duration_ms=1,
+    )  # fmt: skip
+
+
+def test_a_1_0_line_without_the_override_key_still_validates() -> None:
+    flush_rec = log.record(
+        "flush", wall=1.0, actor="auto:x", decision_id="id1",
+        due=1, sent=1, queued_retry=0, failed=0, unknown=0, dropped=0, expired=0, duration_ms=3,
+    )  # fmt: skip
+    for rec in (delivery(), flush_rec, _hook_record()):
+        assert rec["override"] is None  # new code still writes the null
+        old = {k: v for k, v in rec.items() if k != "override"}
+        assert log_errors(old) == [], rec["record"]
+
+
+def test_an_override_record_still_requires_its_override() -> None:
+    rec = log.record(
+        "override", wall=1.0, actor="auto:x", decision_id=None, destination="d",
+        override="disabled", duration_ms=1,
+    )  # fmt: skip
+    assert log_errors(rec) == []
+    assert log_errors({k: v for k, v in rec.items() if k != "override"}) != []

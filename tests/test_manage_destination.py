@@ -209,6 +209,14 @@ def test_no_config_and_a_disabled_router_are_exit_22(rig: Rig) -> None:
     assert not rig.state.exists()
 
 
+def test_a_disabled_router_without_destinations_is_disabled_not_unconfigured(rig: Rig) -> None:
+    rig.configure({}, rules=[], enabled=False)
+    for action in ("enable", "disable"):
+        code, doc, _ = toggle(rig, action, "chat")
+        assert code == 22 and doc["reason"] == "disabled"
+    assert not rig.state.exists()
+
+
 @pytest.mark.parametrize(
     "name",
     ["nobody", "Chat", "../chat", "chat;x", "a" * 33, "-chat", "chat\n", "ch at", "é", "CHAT-x"],

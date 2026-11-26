@@ -560,7 +560,7 @@
         "lapsed",
         "none"
       ],
-      "description": "live: the one lease predicate says the row is claimed; lapsed: a claim is recorded but the predicate says it is not (expired, missing claimant or expiry, an expiry beyond now plus the lease length); none: never claimed or released."
+      "description": "live: the one lease predicate says the row is claimed; lapsed: a claim is recorded (a released one included) but the predicate says it is not live (expired, missing claimant or expiry, an expiry beyond now plus the lease length); none: no claim is recorded (never claimed, or the claim was cleared by a retry). A released claim is recorded, so it reads lapsed."
     },
     "queue_row": {
       "type": "object",

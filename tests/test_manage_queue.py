@@ -528,7 +528,9 @@ def test_read_only_commands_refuse_an_older_schema_and_leave_it_alone(rig: Rig) 
         ["destination", "enable", "chat", "--dry-run"],
     ):
         code, out, err = rig.run(*argv, "--json")
-        assert code == 1 and json.loads(out)["error"]["code"] == "internal", argv
+        error = json.loads(out)["error"]
+        assert code == 1 and error["code"] == "internal", argv
+        assert "needs a migration" in error["message"], argv
     assert seed_v1.read_bytes() == before
 
 

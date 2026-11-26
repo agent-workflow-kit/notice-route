@@ -1050,7 +1050,16 @@ def _main(argv: Sequence[str] | None, gateway: Gateway | None) -> int:
     except (StateError, StoreError) as exc:
         # a prune that ran out of lock waits says so (a cron line is then worth a rerun)
         busy = args.command == "prune" and isinstance(exc, StoreError) and exc.reason == "busy"
-        message = "state database is busy" if busy else "state database cannot be read"
+        older = isinstance(exc, StoreError) and exc.reason == "older"
+        if busy:
+            message = "state database is busy"
+        elif older:
+            message = (
+                "state database needs a migration by a writing command "
+                "(send, flush, prune, destination disable)"
+            )
+        else:
+            message = "state database cannot be read"
         _error("internal", message, None, as_json=args.json)
         return EXIT_INTERNAL
     except _OutputClosed:
