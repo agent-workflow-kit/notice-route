@@ -54,7 +54,8 @@ def test_the_alert_is_logged_without_text(rig: Rig) -> None:
         (None, "alerts", "ops", "warn"),  # delivered (a flush line carries no hook)
     ]
     assert [x["outcome"] for x in lines] == ["deferred", "sent"]
-    assert "Channel chat failed" not in rig.state_text()
+    assert "Channel chat failed" not in (rig.state / "log.jsonl").read_text()
+    assert "credential_invalid, failed" not in rig.state_text()  # message text is never stored
 
 
 def test_a_surfaced_row_is_taken_once(rig: Rig) -> None:
