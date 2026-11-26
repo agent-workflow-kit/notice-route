@@ -39,9 +39,9 @@ Safety reminders specific to this tool: config and state are found only from the
 
 ## Workflow
 
-1. Start with a design session that resolves the open topics in `docs/design.md` and records
-   decisions there.
-2. Write `docs/interface.md` and `schemas/` (the interface spec), and register it in
+1. Read the stage in `docs/plan.md` and the rules in `docs/interface.md` before changing code.
+   Record any design decision in `docs/design.md`.
+2. For an interface change, update `docs/interface.md` and `schemas/` first, and register it in
    `../awkit-docs/interface-registry.md`.
 3. Implement test-first.
 

@@ -4,7 +4,7 @@ Routes notifications to channel notifiers by source, labels, level and time, wit
 
 ## Status
 
-Designed, not yet implemented: the contract is [docs/interface.md](docs/interface.md) (0.1.0-design) and the reasoning is in [docs/design.md](docs/design.md).
+Implemented: the contract is [docs/interface.md](docs/interface.md) (see [CHANGELOG.md](CHANGELOG.md) for the version history), and the reasoning is in [docs/design.md](docs/design.md).
 
 ## Layer
 
