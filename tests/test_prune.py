@@ -12,6 +12,7 @@ import pytest
 from notice_route import cli
 from notice_route import prune as prune_mod
 from notice_route.send import Seams, SurfaceEvent
+from notice_route.store import StoreError
 from tests.flush_support import checked_log, seed
 from tests.prune_support import (
     DAY,
@@ -489,3 +490,42 @@ def test_the_state_dir_may_exist_without_a_database(rig: Rig) -> None:
     code, doc, _ = prune(rig)
     assert (code, doc["deleted"]) == (0, deleted())
     assert not (rig.state / "state.db").exists()
+
+
+# --- a busy database -------------------------------------------------------------------------
+
+
+def test_a_batch_whose_lock_wait_ran_out_is_tried_again(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(rig)
+    add_window(rig, NOW - 500, 100, "a")
+    real = prune_mod.dedup.prune_windows
+    calls: list[int] = []
+
+    def flaky(*a: Any, **k: Any) -> int:
+        calls.append(1)
+        if len(calls) == 1:
+            raise StoreError("busy")
+        return real(*a, **k)
+
+    monkeypatch.setattr(prune_mod.dedup, "prune_windows", flaky)
+    code, doc, _ = prune(rig)
+    assert (code, doc["deleted"]) == (0, deleted(dedup=1))
+    assert len(calls) == 2
+
+
+def test_a_database_that_stays_busy_is_exit_1_internal(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure(rig)
+    add_window(rig, NOW - 500, 100, "a")
+
+    def busy(*a: Any, **k: Any) -> int:
+        raise StoreError("busy")
+
+    monkeypatch.setattr(prune_mod.dedup, "prune_windows", busy)
+    code, out, _ = rig.run("prune", "--json")
+    assert code == 1
+    assert json.loads(out)["error"]["code"] == "internal"
+    assert counts(rig)["dedup"] == 1

@@ -300,7 +300,8 @@ def _expire_batch(
                 lease = _lease(gateway, config)
                 expired = expire_unclaimed(conn, lease, limit=BATCH, max_age=EXPIRY_S)
                 for e in expired:
-                    # surfaced only for a destination that is configured and enabled (Hooks)
+                    # surfaced only for a destination that is configured and enabled (Hooks).
+                    # TODO(#27): the default seam does nothing until surfacing exists.
                     dest = None if config is None else config.destinations.get(e.destination)
                     if dest is not None and dest.enabled:
                         seams.surface(
