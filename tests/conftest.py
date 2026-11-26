@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from notice_route.gateway import DirHandle, Gateway
-from tests.fakes import Notifier, build_notifier
+from tests.fakes import Hook, Notifier, build_hook, build_notifier
 from tests.send_support import Rig
 
 
@@ -67,6 +67,21 @@ def make_notifier(tmp_path: Path) -> Iterator[Callable[..., Notifier]]:
     yield make
     for notifier in built:
         notifier.kill_tracked()
+
+
+@pytest.fixture
+def make_hook(tmp_path: Path) -> Iterator[Callable[..., Hook]]:
+    """Build fake hook commands; at teardown signal exactly the processes they recorded."""
+    built: list[Hook] = []
+
+    def make(name: str = "hook", **behavior: Any) -> Hook:
+        h = build_hook(tmp_path / "hooks", name, **behavior)
+        built.append(h)
+        return h
+
+    yield make
+    for h in built:
+        h.kill_tracked()
 
 
 @pytest.fixture
