@@ -367,8 +367,30 @@ def test_a_forced_leak_prints_no_value_in_the_failure_output(tmp_path: Path) -> 
 def assert_problems(source: str) -> list[str]:
     """Assertions of a live test that can print an output or a value: a ``leaks`` call inside the
     test of an ``assert``, a membership test of an output or log text, or a message that holds a
-    raw ``out`` or ``err`` (it must pass through ``clip``)."""
+    raw ``out`` or ``err`` (it must pass through ``clip``), a ``schema_errors`` call (its messages
+    quote the offending values), a ``json.loads`` of an output, and a bare name that holds parsed
+    output or schema errors (a mismatch prints its value; compute a bool first)."""
     problems: list[str] = []
+    tree = ast.parse(source)
+
+    def parsed_output(node: ast.AST) -> bool:
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call):
+                func = sub.func
+                called = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+                if called in {"schema_errors", "loads"} or (called == "json" and not sub.args):
+                    return True
+        return False
+
+    holders = {
+        t.id
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        and not isinstance(n.value, ast.Compare)  # a bool, not the output
+        and parsed_output(n.value)
+        for t in n.targets
+        if isinstance(t, ast.Name)
+    }
 
     def raw_output(node: ast.AST, under_clip: bool = False) -> bool:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
@@ -377,9 +399,23 @@ def assert_problems(source: str) -> list[str]:
             return True
         return any(raw_output(c, under_clip) for c in ast.iter_child_nodes(node))
 
-    for node in ast.walk(ast.parse(source)):
+    for node in ast.walk(tree):
         if not isinstance(node, ast.Assert):
             continue
+        # a scalar read out of a parsed document, or a type/length check, prints only that scalar
+        exempt: set[int] = set()
+        for n in ast.walk(node.test):
+            if isinstance(n, ast.Subscript):
+                exempt.update(id(c) for c in ast.walk(n.value))
+            if isinstance(n, ast.Call) and getattr(n.func, "id", "") in {"isinstance", "len"}:
+                exempt.update(id(c) for c in ast.walk(n))
+        for n in ast.walk(node.test):
+            if id(n) in exempt:
+                continue
+            if isinstance(n, ast.Call) and parsed_output(n):
+                problems.append(f"line {node.lineno}: schema_errors or parsed output in an assert")
+            if isinstance(n, ast.Name) and n.id in holders:
+                problems.append(f"line {node.lineno}: a name holding parsed output ({n.id})")
         for sub in ast.walk(node.test):
             if isinstance(sub, ast.Call):
                 func = sub.func
@@ -395,7 +431,7 @@ def assert_problems(source: str) -> list[str]:
                     problems.append(f"line {node.lineno}: membership test of an output")
         if node.msg is not None and raw_output(node.msg):
             problems.append(f"line {node.lineno}: a message holds a raw output")
-    return problems
+    return list(dict.fromkeys(problems))
 
 
 def test_no_live_assertion_can_print_an_output() -> None:
@@ -412,6 +448,11 @@ def test_no_live_assertion_can_print_an_output() -> None:
         "assert msg not in r.out",
         "assert r.code == 0, r.err[:300]",
         "assert x, (rows, follow.out[:300])",
+        "assert schema_errors(doc, 'a.json') == []",
+        "assert json.loads(r.out) == {'outcome': 'disabled'}",
+        "bad = [schema_errors([x], 'h.json') for x in rows]\nassert not any(bad)",
+        "d = json.loads(r.out)\nassert d == {}",
+        "d = r.json()\nassert d",
     ],
 )
 def test_the_assertion_check_flags_each_shape_that_leaked(source: str) -> None:
@@ -420,7 +461,10 @@ def test_the_assertion_check_flags_each_shape_that_leaked(source: str) -> None:
 
 def test_the_assertion_check_accepts_the_safe_shapes() -> None:
     safe = (
-        "assert r.code == 0, f'exit {r.code}'\nassert x, report.clip(r.err, 30)\nassert a in (1, 2)"
+        "assert r.code == 0, f'exit {r.code}'\nassert x, report.clip(r.err, 30)\n"
+        "assert a in (1, 2)\n"
+        "errors = schema_errors(d, 'a.json')\nok = not errors\nassert ok, 'schema mismatch'\n"
+        "d = json.loads(r.out)\nassert d['outcome'] == 'ok'\nassert isinstance(d['checks'], list)"
     )
     assert assert_problems(safe) == []
 
@@ -542,7 +586,7 @@ def banned_import_problems(source: str) -> list[str]:
             called = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
             if called in {"__import__", "import_module"}:
                 problems.append(f"dynamic import at line {n.lineno}")
-    return problems
+    return list(dict.fromkeys(problems))
 
 
 def test_no_live_module_imports_a_network_library() -> None:

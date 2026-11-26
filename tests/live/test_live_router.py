@@ -108,7 +108,8 @@ def test_send_reaches_the_real_notifier(name: str, make_tool: Callable[..., Tool
     assert [x["outcome"] for x in rows] == ["sent"]
     bad_rows = [schema_errors([x], "history.json") for x in rows]  # each row against its schema
     report.record(f"history_schema/{name}", problems=[b for b in bad_rows if b])
-    assert not any(bad_rows), "a history row does not match schemas/cli/history.json"
+    rows_valid = not any(bad_rows)
+    assert rows_valid, "a history row does not match schemas/cli/history.json"
     log_text = (router.state / "log.jsonl").read_text("utf-8")
     db_bytes = b"".join(
         p.read_bytes() for p in sorted(router.state.glob("state.db*")) if p.is_file()
@@ -127,7 +128,10 @@ def test_send_reaches_the_real_notifier(name: str, make_tool: Callable[..., Tool
     pr = router.run("prune", "--dry-run", "--json")
     report.record(f"prune_dry_run/{name}", code=pr.code, stdout=report.clip(pr.out, 800))
     assert pr.code == 0, f"prune --dry-run exit code {pr.code}"
-    assert schema_errors(pr.json(), "prune.json") == [], "prune output does not match its schema"
+    prune_errors = schema_errors(pr.json(), "prune.json")
+    report.record(f"prune_schema/{name}", problems=prune_errors)
+    prune_valid = not prune_errors
+    assert prune_valid, "prune output does not match its schema"
     assert pr.json()["dry_run"] is True
     assert len(history(router)) == rows_before
     assert state_files(router) - {"state.db-wal", "state.db-shm"} == before - {
@@ -224,7 +228,8 @@ def test_bad_credential_fails_surfaces_and_alerts(name: str, make_tool: Callable
                   stderr=report.clip(f.err, 300))  # fmt: skip
     assert (scratch / "alert.json").exists(), "the failure alert did not reach its destination"
     alert = json.loads((scratch / "alert.json").read_text())
-    assert set(alert) <= {"title", "message", "level"}
+    alert_shape_ok = set(alert) <= {"title", "message", "level"}
+    assert alert_shape_ok, "the alert holds a field other than title, message and level"
     present = found_in(msg, json.dumps(alert))
     assert not present, "text that must not be present was found in the alert"
     present = found_in(BAD_VALUE, json.dumps(alert))
@@ -346,7 +351,8 @@ def test_flusher_signals_with_a_real_notifier(sig: str, make_tool: Callable[...,
         report.record("flusher/SIGSTOP/second", code=second.code,
                       stdout=report.clip(second.out, 800))  # fmt: skip
         states = [d["state"] for d in second.json()["destinations"]]
-        assert states == ["already_running"]
+        only_running = states == ["already_running"]
+        assert only_running, "the second flush did not report already_running"
         proc.send_signal(signal.SIGCONT)
     out, err, timed_out = communicate_bounded(proc, timeout=120.0)
     group_gone = wait_group_gone(proc.pid)

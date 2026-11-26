@@ -77,8 +77,8 @@ def test_sync_hook_environment_and_payload(
     payload = json.loads((scratch / "payload.json").read_text())
     assert payload["hook"] == "post-fail" and payload["object_id"] == "broken"
     assert payload["code"] == "generic_failed"
-    for text in ("TEST MESSAGE", "notice-route live test"):
-        assert text not in json.dumps(payload)  # no title, message or link
+    carried = any(t in json.dumps(payload) for t in ("TEST MESSAGE", "notice-route live test"))
+    assert not carried, "the hook payload carries the title or message"  # no title, message, link
 
 
 def test_async_hook_outlives_flush_and_hits_its_timeout(router: LiveRouter, scratch: Path,
@@ -87,7 +87,9 @@ def test_async_hook_outlives_flush_and_hits_its_timeout(router: LiveRouter, scra
     hook at its timeout. The hook traps SIGTERM, writes `termed` and exits; it loops in short
     steps for at most 20 s on its own. `termed` appearing after `flush` returned proves the
     supervisor outlived `flush` and sent the TERM at the hook's 2 s timeout. The order is
-    recorded (flush return time against the mtime of `termed`); no other timing is asserted."""
+    recorded (flush return time against the mtime of `termed`). Asserted: `termed` did not exist
+    when `flush` returned, and its mtime is at least 1 s after the mtime of `started` (the
+    hook's timeout is 2 s); no other timing is asserted."""
     started = scratch / "started"
     termed = scratch / "termed"
     body = (
@@ -97,8 +99,8 @@ def test_async_hook_outlives_flush_and_hits_its_timeout(router: LiveRouter, scra
     )
     setup_failing(router, scratch, body, async_=True, timeout="2s")
     f = router.run("flush", "--json")
+    already_termed = termed.exists()  # taken at once: flush must not have waited for the hook
     flush_returned = time.time()
-    already_termed = termed.exists()
     assert f.code in (0, 12), f"flush exit code {f.code}"
     assert wait_for(started, 10), "the async hook never started"
     appeared = wait_for(termed, 25)
@@ -106,6 +108,9 @@ def test_async_hook_outlives_flush_and_hits_its_timeout(router: LiveRouter, scra
                   termed_before_flush_returned=already_termed, flush_returned_at=flush_returned,
                   termed_mtime=termed.stat().st_mtime if appeared else None)  # fmt: skip
     assert appeared, "the hook was never terminated at its timeout"
+    assert not already_termed, "flush waited for the async hook (`termed` existed on return)"
+    lived = termed.stat().st_mtime - started.stat().st_mtime
+    assert lived >= 1.0, f"the hook ended {lived:.2f} s after it started; its timeout is 2 s"
 
 
 def test_hook_recursion_guard_with_the_real_environment(router: LiveRouter, scratch: Path,

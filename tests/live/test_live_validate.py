@@ -31,7 +31,8 @@ def test_validate_json_real_output(name: str, make_tool: Callable[..., ToolConfi
                   stdout_lines=r.out.count("\n"),
                   stdout_ends_newline=r.out.endswith("\n"))  # fmt: skip
     if r.code == 22:
-        assert json.loads(r.out) == {"outcome": "disabled"}
+        disabled_ok = json.loads(r.out) == {"outcome": "disabled"}
+        assert disabled_ok, "exit 22 without the document {'outcome': 'disabled'}"
         return
     assert r.code in (0, 2, 12), r.code
     doc = json.loads(r.out)
@@ -71,6 +72,11 @@ def test_validate_rejects_probe_grammar(name: str, make_tool: Callable[..., Tool
         assert r.code == 2, f"slack-notice validate --probe exit code {r.code}, expected 2"
         assert code == "usage", "slack-notice did not answer with a usage envelope"
     else:
+        if r.code == 2 and code != "usage":  # a config fault: a normal check document, no envelope
+            pytest.skip(
+                f"ha-notice exited 2 with a config fault, not a usage envelope; see "
+                f"docs/live-testing.md and set {cfg.spec.config_var}"
+            )
         assert r.code in (0, 12, 22), f"ha-notice validate --probe exit code {r.code}"
         assert code != "usage", "ha-notice answered with a usage envelope"
 
