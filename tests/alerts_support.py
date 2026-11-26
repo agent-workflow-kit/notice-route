@@ -20,7 +20,8 @@ ALERT_RULE: dict[str, Any] = {
     "notify": ["ops"],
     "level": "warn",
     "title": "Channel {{object_id}} failed",
-    "message": "{{kind}}: {{code}}, {{outcome}} after {{attempts}} attempts ({{notification_source}})",
+    "message": "{{kind}}: {{code}}, {{outcome}} after {{attempts}} attempts"
+    " ({{notification_source}})",
 }
 SEND_RULE: dict[str, Any] = {"name": "pt", "match": {"level_min": "info"}, "notify": ["chat"]}
 
@@ -44,11 +45,12 @@ class Setup:
             "chat": {"notifier": self.bad},
             "ops": {"notifier": self.ops},
         }
-        dests.update(top.pop("destinations", {}))
+        for name, keys in top.pop("destinations", {}).items():
+            dests[name] = {**dests.get(name, {}), **keys}
         rig.configure(dests, rules, **top)
 
     def behave(self, code: str, *, retryable: bool = False, unknown: bool = False) -> None:
-        """``chat`` answers every call with the error envelope of ``code`` (any well-shaped code)."""
+        """``chat`` answers every call with the error envelope of ``code`` (any code)."""
         body = {"error": {"code": code, "retryable": retryable, "unknown_outcome": unknown}}
         self.bad.set(exit=12, stdout=json.dumps(body))
 
