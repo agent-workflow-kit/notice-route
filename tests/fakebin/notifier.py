@@ -783,6 +783,9 @@ class Run:
             args = parse_argv(argv)
         except Usage:
             return self.emit_error({"code": "usage"}, None)
+        if args.command == "validate" and "--probe" in args.flags and self.tool == "slack-notice":
+            # the real slack-notice grammar is ``validate [--test-message]``
+            return self.emit_error({"code": "usage"}, None)
         self.key = args.values.get("--dedupe-key")
         if args.early == "--version":
             write_fd(1, f"{self.tool} {VERSION}\n".encode())
@@ -790,6 +793,8 @@ class Run:
         if args.early == "--help":
             write_fd(1, f"usage: {self.tool} [flags] send|clear|validate\n".encode())
             return 0
+        if args.command == "validate":
+            return self.go_validate(args)
         if args.command != "send" or "--dry-run" in args.flags:
             return self.emit_error({"code": "fake_unsupported"}, 1)
         if "--stdin-json" not in args.flags and args.values.get("--file") != "-":
@@ -838,6 +843,11 @@ class Run:
         code = self.answer(args, payload)
         if "linger" in b:
             self.pause(float(b["linger"]))
+        self.maybe_die()
+        return code
+
+    def maybe_die(self) -> None:
+        b = self.b
         if "die_by_signal" in b:
             num = SIGNALS[b["die_by_signal"]]
             if num != signal.SIGKILL:
@@ -852,7 +862,85 @@ class Run:
             os.kill(os.getpid(), num)
             time.sleep(5)
             raise Setup("the process survived its own signal")
+
+    def go_validate(self, args: Args) -> int:
+        """``validate [--probe] [--json]``: reads no stdin, sends nothing. The scripted effects
+        (hang, sleep, grandchild, output, exit, signal death) apply as for ``send``."""
+        b = self.b
+        self.drain_stdin()
+        if b.get("disabled") and self.answers_disabled_with_22(args):
+            write_fd(1, dumps({"outcome": "disabled"})) if self.json_mode else write_fd(
+                2, b"disabled in config\n"
+            )
+            return 22
+        if "grandchild" in b:
+            self.spawn_grandchild()
+        if b.get("hang"):
+            self.log.write("hang_started", before_read=False)
+            self.pause(0, hang=True)
+        if "sleep" in b:
+            self.pause(float(b["sleep"]))
+        code = self.answer_validate(args)
+        if "linger" in b:
+            self.pause(float(b["linger"]))
+        self.maybe_die()
         return code
+
+    def answers_disabled_with_22(self, args: Args) -> bool:
+        """A disabled tool answers ``validate`` with exit 22 only for ``--probe`` or
+        ``--test-message``, or when it is not slack-notice; plain slack-notice ``validate`` is
+        exit 0 with ``enabled`` false and its checks."""
+        return self.tool != "slack-notice" or bool({"--probe", "--test-message"} & args.flags)
+
+    def drain_stdin(self) -> None:
+        """Read whatever is already on fd 0 without ever waiting (validate takes no input) and
+        log it as a ``stdin`` event, so a test can tell that a caller wrote to it."""
+        chunks: list[bytes] = []
+        size = 0
+        os.set_blocking(0, False)
+        try:
+            while size <= MAX_STDIN:
+                data = os.read(0, 65536)
+                if not data:
+                    break
+                chunks.append(data)
+                size += len(data)
+        except OSError:  # nothing more to read right now (or no usable fd 0)
+            pass
+        raw = b"".join(chunks)
+        fields: dict[str, Any] = {"size": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+        if len(raw) <= 65536:
+            fields["text"] = raw.decode("utf-8", errors="replace")
+        self.log.write("stdin", **fields)
+
+    def answer_validate(self, args: Args) -> int:
+        b = self.b
+        exit_code: int | None = b.get("exit")
+        if "stdout_bytes" in b:
+            write_padding(1, b["stdout_bytes"])
+        elif "stdout_b64" in b:
+            write_fd(1, base64.b64decode(b["stdout_b64"]))
+        elif "stdout" in b:
+            write_fd(1, text_bytes(b["stdout"]))
+        elif b.get("no_output"):
+            pass
+        elif "error" in b:
+            code = self.emit_error(b["error"], exit_code)
+            return self.finish_stderr(code if exit_code is None else exit_code)
+        else:
+            body: dict[str, Any] = {
+                "ok": True,
+                "enabled": not b.get("disabled"),
+                "checks": [{"name": "config", "ok": True, "message": "configuration is valid"}],
+            }
+            if self.tool == "ha-notice" and "--probe" in args.flags:
+                body["probe"] = {"api_ok": True}
+            body.update(b.get("result", {}))
+            if self.json_mode:
+                write_fd(1, dumps(body))
+            else:
+                write_fd(2, b"config: ok (configuration is valid)\n")
+        return self.finish_stderr(0 if exit_code is None else exit_code)
 
     def answer(self, args: Args, payload: dict[str, Any]) -> int:
         b = self.b

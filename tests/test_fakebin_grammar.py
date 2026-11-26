@@ -367,3 +367,61 @@ def test_disabled_without_json_prints_the_message_on_stderr_only(
     result = run(n, home, args=["send", "--stdin-json"])
     assert (result.returncode, result.stdout) == (22, b"")
     assert result.stderr == b"disabled in config\n"
+
+
+def test_validate_prints_its_document_reads_no_stdin_and_sends_nothing(
+    make_notifier: Make, home: Path
+) -> None:
+    n = make_notifier("ha-notice", tool="ha-notice")
+    result = run(n, home, stdin=b"", args=["validate", "--json", "--probe"])
+    doc = last_json(result)
+    assert result.returncode == 0
+    assert (doc["ok"], doc["enabled"], doc["probe"]) == (True, True, {"api_ok": True})
+    (stdin,) = n.events("stdin")  # validate reads fd 0 and logs it: here, nothing
+    assert stdin["size"] == 0
+    plain = run(make_notifier("s"), home, stdin=b"", args=["validate", "--json"])
+    assert "probe" not in last_json(plain)
+
+
+def test_validate_records_whatever_arrives_on_stdin(make_notifier: Make, home: Path) -> None:
+    n = make_notifier("ha-notice", tool="ha-notice")
+    run(n, home, stdin=b"junk", args=["validate", "--json"])
+    (stdin,) = n.events("stdin")
+    assert (stdin["size"], stdin["text"]) == (4, "junk")
+
+
+def test_slack_notice_rejects_probe_and_ha_notice_accepts_it(
+    make_notifier: Make, home: Path
+) -> None:
+    slack = run(make_notifier("s"), home, stdin=b"", args=["validate", "--json", "--probe"])
+    assert slack.returncode == 2 and last_json(slack)["error"]["code"] == "usage"
+    ha = make_notifier("h", tool="ha-notice")
+    assert run(ha, home, stdin=b"", args=["validate", "--json", "--probe"]).returncode == 0
+
+
+def test_validate_honors_disabled_and_scripted_exits(make_notifier: Make, home: Path) -> None:
+    off = run(
+        make_notifier("o", tool="ha-notice", disabled=True),
+        home,
+        stdin=b"",
+        args=["validate", "--json", "--probe"],
+    )
+    assert (off.returncode, last_json(off)) == (22, {"outcome": "disabled"})
+    ha_plain = run(
+        make_notifier("p", tool="ha-notice", disabled=True),
+        home,
+        stdin=b"",
+        args=["validate", "--json"],
+    )
+    assert ha_plain.returncode == 22  # not slack-notice: plain validate is 22 too
+    slack = run(make_notifier(disabled=True), home, stdin=b"", args=["validate", "--json"])
+    doc = last_json(slack)
+    assert (slack.returncode, doc["enabled"], doc["ok"]) == (0, False, True)
+    assert doc["checks"]
+    bad = run(
+        make_notifier("b", error={"code": "credential_invalid"}),
+        home,
+        stdin=b"",
+        args=["validate", "--json"],
+    )
+    assert (bad.returncode, last_json(bad)["error"]["code"]) == (12, "credential_invalid")

@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Literal
 
@@ -62,15 +62,18 @@ __all__ = [
     "DEADLINE_EXTRA",
     "DEFAULT_PATH",
     "FIXED_NAMES",
+    "PROBED_KINDS",
     "CallResult",
     "CallStatus",
     "EnvBuild",
     "base_env",
     "build_argv",
     "build_env",
+    "build_probe_argv",
     "call_deadline",
     "call_notifier",
     "notification_json",
+    "probe_notifier",
 ]
 
 ACTOR = "auto:notice-route"
@@ -79,6 +82,8 @@ DEFAULT_PATH = "/usr/bin:/bin"
 FIXED_NAMES = ("PATH", "LANG", "LC_ALL", "WSL_INTEROP", "WSL_DISTRO_NAME")
 _WSL_NAMES = ("WSL_INTEROP", "WSL_DISTRO_NAME")
 _DEFAULT_LOCALE = "C.UTF-8"
+PROBED_KINDS = ("slack-notice", "ha-notice", "wsl-notice")  # ``generic`` is never probed
+_PROBE_FLAGS = ("validate", "--json")
 _FIXED_FLAGS = ("send", "--stdin-json", "--json", "--actor", ACTOR)
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 _UTF8_LOCALE = re.compile(r"[A-Za-z0-9_]{1,32}\.[Uu][Tt][Ff]-?8(?:@[A-Za-z0-9]{1,32})?")
@@ -234,6 +239,55 @@ def call_notifier(
         built = build_env(gateway, destination)
     except ValueError:
         return CallResult("not_started")
+    return _spawn(
+        gateway,
+        destination,
+        built,
+        lambda executable: build_argv(executable, destination.cmd, dedupe_key),
+        stdin,
+    )
+
+
+def build_probe_argv(executable: str, cmd: Sequence[str], kind: str) -> list[str]:
+    """The probe of ``validate --probe`` (#29): ``executable``, ``cmd[1:]``, ``validate``,
+    ``--json`` and, for ``ha-notice`` and ``wsl-notice``, ``--probe``. Only configuration and
+    fixed words: never ``--test-message``, no actor, no payload."""
+    if not cmd:
+        raise ValueError("cmd must not be empty")
+    if kind not in PROBED_KINDS:
+        raise ValueError("only the known notifier kinds are probed")
+    argv = [executable, *cmd[1:], *_PROBE_FLAGS]
+    if kind != "slack-notice":
+        argv.append("--probe")
+    return argv
+
+
+def probe_notifier(gateway: Gateway, destination: Destination) -> CallResult:
+    """The one probe call to ``destination``: ``<cmd> validate --json [--probe]`` with the
+    environment, process group, deadline and output caps of a send and nothing on stdin. The
+    caller holds the send lock. Never raises for a refusal, a failed spawn, ``SigchldIgnoredError``
+    (``not_started``) or ``ChildLostError`` (``lost``)."""
+    try:
+        built = build_env(gateway, destination)
+        build_probe_argv("/", ("/",), destination.kind)
+    except ValueError:
+        return CallResult("not_started")
+    return _spawn(
+        gateway,
+        destination,
+        built,
+        lambda executable: build_probe_argv(executable, destination.cmd, destination.kind),
+        None,
+    )
+
+
+def _spawn(
+    gateway: Gateway,
+    destination: Destination,
+    built: EnvBuild,
+    argv_for: Callable[[str], list[str]],
+    stdin: str | None,
+) -> CallResult:
     if built.missing:
         return CallResult("env_missing", missing=built.missing)
     executable = gateway.resolve_exec(destination.cmd[0]) if destination.cmd else None
@@ -241,7 +295,7 @@ def call_notifier(
         return CallResult("exec_failed")
     try:
         run = gateway.run(
-            build_argv(executable, destination.cmd, dedupe_key),
+            argv_for(executable),
             env=built.env,
             timeout=call_deadline(destination),
             stdin=stdin,

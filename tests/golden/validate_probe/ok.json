@@ -1,0 +1,77 @@
+{
+  "outcome": "ok",
+  "probe": true,
+  "destinations": [
+    {
+      "name": "chat",
+      "cmd_ok": true,
+      "env_unset": [],
+      "probe": {
+        "status": "ok",
+        "exit": 0,
+        "enabled": true
+      },
+      "surfaced_today": []
+    },
+    {
+      "name": "phone",
+      "cmd_ok": true,
+      "env_unset": [],
+      "probe": {
+        "status": "ok",
+        "exit": 0,
+        "enabled": true
+      },
+      "surfaced_today": []
+    },
+    {
+      "name": "off",
+      "cmd_ok": true,
+      "env_unset": [],
+      "probe": {
+        "status": "disabled",
+        "exit": 22,
+        "enabled": false
+      },
+      "surfaced_today": []
+    },
+    {
+      "name": "plain",
+      "cmd_ok": true,
+      "env_unset": [],
+      "probe": null,
+      "surfaced_today": []
+    },
+    {
+      "name": "nocred",
+      "cmd_ok": true,
+      "env_unset": [
+        "CRED_ONE"
+      ],
+      "probe": null,
+      "surfaced_today": []
+    }
+  ],
+  "warnings": [
+    {
+      "code": "level_from_notice",
+      "rule": "pt",
+      "destination": null,
+      "message": "the rule sets no level, so the sender chooses it above level_min"
+    },
+    {
+      "code": "flush_stale",
+      "rule": null,
+      "destination": null,
+      "message": "no flush started in the last 5 minutes"
+    },
+    {
+      "code": "alert_unrouted",
+      "rule": null,
+      "destination": null,
+      "message": "no rule routes a post-fail alert and no post-fail hook exists"
+    }
+  ],
+  "send_worst_case_s": 29,
+  "flush_age_s": null
+}

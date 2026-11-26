@@ -31,6 +31,7 @@ from typing import Any
 
 from .gateway import Gateway
 from .match import rule_covers, wildcard_matches
+from .probe import ProbeResult
 from .validate import DAYS, Config, Match, Rule
 
 __all__ = ["env_unset", "rules_document", "validate_document"]
@@ -229,15 +230,27 @@ def _warnings(
     return out
 
 
-def validate_document(config: Config | None, gateway: Gateway) -> tuple[dict[str, Any], int]:
+def _probe_field(probes: Mapping[str, ProbeResult] | None, name: str) -> dict[str, Any] | None:
+    found = None if probes is None else probes.get(name)
+    return None if found is None else found.as_dict()
+
+
+def validate_document(
+    config: Config | None,
+    gateway: Gateway,
+    probes: Mapping[str, ProbeResult] | None = None,
+) -> tuple[dict[str, Any], int]:
     """The ``validate --json`` document and its exit code (0, 12 or 22).
+
+    ``probes`` is None without ``--probe``; with it, the result of each probed destination (a
+    destination that was not probed has no entry and reports null).
 
     Raises :class:`HomeError` and :class:`StateError` from the state read.
     """
     if config is None:
         doc: dict[str, Any] = {
             "outcome": "no_op",
-            "probe": False,
+            "probe": probes is not None,
             "destinations": [],
             "warnings": [],
             "send_worst_case_s": 0,
@@ -256,16 +269,19 @@ def validate_document(config: Config | None, gateway: Gateway) -> tuple[dict[str
                 "name": d.name,
                 "cmd_ok": gateway.check_exec(d.cmd[0]),
                 "env_unset": env_unset(d.env, environ),
-                "probe": None,  # TODO(#29): validate --probe fills this
+                "probe": _probe_field(probes, d.name),
                 "surfaced_today": list(state.surfaced_today.get(d.name, ())),
             }
         )
     env_file_ok = config.cron_env_file is None or gateway.check_env_file(config.cron_env_file)
     worst = worst_case_s(config)
-    failed = any(not d["cmd_ok"] for d in destinations)
+    failed = any(
+        not d["cmd_ok"] or (d["probe"] is not None and d["probe"]["status"] == "failed")
+        for d in destinations
+    )
     doc = {
         "outcome": "failed" if failed else "ok",
-        "probe": False,
+        "probe": probes is not None,
         "destinations": destinations,
         "warnings": _warnings(
             config,
