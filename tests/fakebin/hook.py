@@ -42,7 +42,14 @@ def main(argv: list[str], behavior_path: str) -> int:
     log = b["log"]
     limit = float(b.get("max_seconds", 30))
     stdin = sys.stdin.read() if not b.get("no_read") else ""
-    fds = sorted(int(x) for x in os.listdir("/proc/self/fd") if x.isdigit())
+    names = [x for x in os.listdir("/proc/self/fd") if x.isdigit()]
+    fds = sorted(int(x) for x in names)
+    targets: dict[str, str] = {}
+    for x in names:
+        try:
+            targets[x] = os.readlink(f"/proc/self/fd/{x}")
+        except OSError:
+            targets[x] = "?"
     _log(
         log,
         {
@@ -56,6 +63,7 @@ def main(argv: list[str], behavior_path: str) -> int:
             "env": dict(os.environ),
             "stdin": stdin,
             "fds": fds,
+            "fd_targets": targets,
         },
     )
     if b.get("ignore_term"):

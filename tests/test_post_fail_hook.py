@@ -55,7 +55,12 @@ def test_the_hook_gets_the_payload_on_stdin_and_the_documented_environment(
     assert run["env"]["NOTICE_ROUTE_ID"] == "chat"
     assert run["env"]["NOTICE_ROUTE_OBJECT_TYPE"] == "destination"
     assert run["argv"] == []  # nothing of the payload on the command line
-    assert run["cwd"] == "/" and set(run["fds"]) <= {0, 1, 2, 3}
+    assert run["cwd"] == "/"
+    # nothing but stdin, stdout, stderr, the directory the fake itself lists and what the
+    # interpreter opens for itself (3.12 holds a transparent-hugepage probe)
+    own = ("/proc/", "/sys/kernel/mm/", "?")
+    leaked = {k: v for k, v in run["fd_targets"].items() if int(k) > 2 and not v.startswith(own)}
+    assert leaked == {}, leaked
     assert run["pgid"] == run["sid"] != os.getsid(0)  # a session and group of its own
     assert "credential_invalid" not in json.dumps(run["env"])
 
