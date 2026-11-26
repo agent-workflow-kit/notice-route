@@ -1,0 +1,20 @@
+{
+  "outcome": "ok",
+  "reason": null,
+  "row": {
+    "id": 2,
+    "delivery_id": 2,
+    "destination": "chat",
+    "kind": "single",
+    "level": "info",
+    "source": "s",
+    "rule": null,
+    "title": null,
+    "deliver_after": 1700000000,
+    "created_at": 1700000000,
+    "attempts": 0,
+    "reason": null,
+    "claim": "live",
+    "claim_expires": 1700000020
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "outcome": "no_op",
+  "dry_run": false,
+  "destination": "off",
+  "action": null,
+  "reason": "config_disabled",
+  "config_enabled": false,
+  "override": null,
+  "enabled": false
+}

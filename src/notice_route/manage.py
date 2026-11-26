@@ -484,7 +484,7 @@ def run_set(
     decision_id: str | None,
 ) -> SetResult:
     """``destination enable|disable``. ``UsageError('destination')`` for a name that is not
-    configured (once a config with destinations exists); ``StoreError`` and ``HomeError``
+    configured (once an enabled config with destinations exists); ``StoreError`` and ``HomeError``
     propagate."""
     started = gateway.monotonic()
 
@@ -494,11 +494,11 @@ def run_set(
 
     if config is None or not config.destinations:
         return noop("unconfigured")
+    if not config.enabled:
+        return noop("disabled")
     dest = config.destinations.get(name)
     if dest is None:
         raise UsageError("destination")
-    if not config.enabled:
-        return noop("disabled")
     write = not dry_run and dest.enabled and (action == "disable" or _database_exists(gateway))
     if not write:
         return _preview_set(gateway, action, dest.name, dest.enabled, dry_run)
