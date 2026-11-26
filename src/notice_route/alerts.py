@@ -7,7 +7,9 @@ through the rules as a hook payload of source ``notice-route`` (decisions (1) to
 then an unclaimed ``single`` row due now: :func:`notice_route.decide.decide_alert`). Reading the
 delivery and marking the row processed happen in the same transaction (``prune`` may delete the
 delivery right after). The hook jobs it returns are started by ``flush`` after the transaction:
-a crash in between loses the hook (best effort, at most once).
+the synchronous hooks are also written to the outbox in that transaction
+(:mod:`notice_route.outbox`, design C-62), which the flush runs and retries, so a crash in
+between loses only an ``async`` hook (best effort, at most once).
 
 Choices where the interface is silent (the narrower reading):
 
@@ -36,11 +38,17 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import log as logmod
-from .decide import _object_id, decide_alert, labels_text  # pyright: ignore[reportPrivateUsage]
+from .decide import (  # pyright: ignore[reportPrivateUsage]
+    _object_id,
+    decide_alert,
+    instant,
+    labels_text,
+)
 from .dryrun import make_notice
 from .gateway import Gateway
 from .links import build_links
 from .match import decide as match_decide
+from .outbox import MAX_PAYLOAD, enqueue, hook_keys
 from .payload import alert_notification
 from .queue import Lease, insert_delivery
 from .render import render
@@ -48,7 +56,7 @@ from .store import Store, StoreError
 from .surfacing import HOURLY_CODES
 from .validate import LEVELS, Config
 
-__all__ = ["HookJob", "Taken", "build_payload", "take_surfaced"]
+__all__ = ["HookJob", "Taken", "build_payload", "stored_payload", "take_surfaced"]
 
 MAX_ROWS = 1000  # surfaced rows one flush takes: the rest wait for the next run
 _SOURCE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
@@ -144,6 +152,70 @@ def build_payload(
     }
 
 
+_PAYLOAD_KEYS = frozenset(
+    {
+        "tool",
+        "hook",
+        "object_type",
+        "object_id",
+        "event_id",
+        "labels",
+        "code",
+        "outcome",
+        "attempts",
+        "notification_source",
+        "notification_level",
+        "kind",
+    }
+)
+
+
+def stored_payload(config: Config, destination: str, text: object) -> dict[str, Any] | None:
+    """The payload of an outbox row, or ``None`` when it is not exactly what
+    :func:`build_payload` makes from its own fields for this destination (the database is a file
+    anyone with write access can edit, so a stored payload is checked like a fresh one)."""
+    if not isinstance(text, str) or len(text) > MAX_PAYLOAD:
+        return None
+    try:
+        found = json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(found, dict) or set(found) != _PAYLOAD_KEYS:  # pyright: ignore[reportUnknownArgumentType]
+        return None
+    p: dict[str, Any] = found  # pyright: ignore[reportUnknownVariableType]
+    event_id, labels, code = p["event_id"], p["labels"], p["code"]
+    if (
+        p["object_id"] != destination
+        or type(event_id) is not int
+        or not isinstance(labels, list)
+        or not isinstance(code, str)
+    ):
+        return None
+    rebuilt = build_payload(
+        config,
+        destination,
+        code,
+        event_id,
+        (
+            p["notification_source"],
+            p["notification_level"],
+            p["attempts"],
+            p["outcome"],
+            json.dumps(labels),
+        ),
+    )
+    return p if rebuilt == p else None
+
+
+def _enqueue_hooks(
+    conn: Any, config: Config, surfaced_id: int, payload: dict[str, Any], now: int
+) -> None:
+    text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+    for key in hook_keys(config.hooks_post_fail):
+        if key is not None:
+            enqueue(conn, surfaced_id, payload["object_id"], key, payload["event_id"], text, now)
+
+
 def take_surfaced(gateway: Gateway, store: Store, config: Config, worst: float) -> Taken:
     """Take the pending ``surfaced`` rows, oldest first, one transaction each (at most
     :data:`MAX_ROWS`). A ``StoreError`` ends the run with ``error`` set: the jobs and log lines
@@ -193,6 +265,7 @@ def _take_one(gateway: Gateway, store: Store, config: Config, worst: float) -> T
             if payload is None:
                 return one
             one.jobs.append(HookJob(str(row[1]), payload))
+            _enqueue_hooks(conn, config, row_id, payload, instant(gateway.wall()))
             if payload["notification_source"] == "notice-route":
                 return one  # an alert's own failure: hooks only
             lease = Lease.at(gateway.wall(), worst)
@@ -206,6 +279,8 @@ def _take_one(gateway: Gateway, store: Store, config: Config, worst: float) -> T
         one.faults = 1
         with store.write() as conn:
             conn.execute("UPDATE surfaced SET processed = 1 WHERE id = ?", (row_id,))
+            for job in one.jobs:  # the rollback took the outbox rows with the alert
+                _enqueue_hooks(conn, config, row_id, job.payload, instant(gateway.wall()))
     return one
 
 

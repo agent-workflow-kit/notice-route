@@ -61,6 +61,7 @@ def make_v1_database(rig: Rig) -> None:
     conn = sqlite3.connect(rig.state / "state.db")
     try:
         conn.execute("DROP TABLE destination_overrides")
+        conn.execute("DROP TABLE hook_outbox")
         conn.execute("PRAGMA user_version=1")
         conn.commit()
     finally:

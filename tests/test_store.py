@@ -80,7 +80,7 @@ def test_first_open_creates_a_private_versioned_wal_database(
 ) -> None:
     with open_store(gw) as store:
         assert store is not None
-        assert pragma(store.conn, "user_version") == SCHEMA_VERSION == 2
+        assert pragma(store.conn, "user_version") == SCHEMA_VERSION == 3
         assert pragma(store.conn, "application_id") == APPLICATION_ID
         assert str(pragma(store.conn, "journal_mode")).lower() == "wal"
     assert mode(state) == 0o700
@@ -433,9 +433,10 @@ def test_a_flipped_page_is_refused(gw: Gateway, db: Path) -> None:
             add_delivery(store)
     c = raw(db)
     c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    first_data_page = c.execute("SELECT MAX(rootpage) FROM sqlite_master").fetchone()[0] + 1
     c.close()
     data = bytearray(db.read_bytes())
-    for i in range(4096 * 2, len(data), 97):
+    for i in range(4096 * first_data_page, len(data), 97):  # the schema pages stay readable
         data[i] ^= 0xFF
     db.write_bytes(bytes(data))
     try:
@@ -904,7 +905,7 @@ def test_read_state_reads_an_older_database(gw: Gateway, monkeypatch: pytest.Mon
                 " VALUES ('dest', 'failed', ?, ?, 0)",
                 (time.strftime("%Y-%m-%d", time.gmtime(gw.wall())), d),
             )
-    monkeypatch.setattr(gateway_module, "SCHEMA_VERSION", 2)
+    monkeypatch.setattr(gateway_module, "SCHEMA_VERSION", SCHEMA_VERSION + 1)
     view = gw.read_state()
     assert view.exists is True
     assert view.surfaced_today == {"dest": ("failed",)}
@@ -925,9 +926,10 @@ def test_a_read_of_a_trashed_page_is_a_store_error(gw: Gateway, db: Path) -> Non
             add_delivery(store)
     c = raw(db)
     c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    first_data_page = c.execute("SELECT MAX(rootpage) FROM sqlite_master").fetchone()[0] + 1
     c.close()
     data = bytearray(db.read_bytes())
-    for i in range(4096 * 2, len(data), 97):
+    for i in range(4096 * first_data_page, len(data), 97):  # the schema pages stay readable
         data[i] ^= 0xFF
     db.write_bytes(bytes(data))
     with open_store(gw) as store:

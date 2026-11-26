@@ -127,10 +127,11 @@ def test_a_kill_inside_the_taking_transaction_leaves_the_row_for_the_next_flush(
     assert len(s.ops.events("invoke")) == 1
 
 
-def test_a_kill_after_the_commit_loses_the_hook_but_not_the_alert(
+def test_a_kill_after_the_commit_loses_neither_the_alert_nor_a_sync_hook(
     rig: Rig, make_hook: MakeHook
 ) -> None:
-    """Best effort, at most once: the hook of a row taken by a killed flush never runs."""
+    """At least once (the outbox, #37): the hook of a row taken by a killed flush runs in the next
+    flush, once."""
     h = make_hook()
     s = Setup(rig, **hooks_config(h))
     s.fail("boom")
@@ -138,11 +139,15 @@ def test_a_kill_after_the_commit_loses_the_hook_but_not_the_alert(
     kill_when_announced(child(rig, _AFTER_COMMIT, marker), marker)
     assert [r[4] for r in s.surfaced()] == [1]
     assert rig.query("SELECT COUNT(*) FROM queue") == [(1,)]  # the alert is queued
+    assert rig.query("SELECT COUNT(*) FROM hook_outbox") == [(1,)]  # and the hook is kept
     assert h.runs() == []
     rig.clock.jump_wall(time.time() - NOW + 60)  # the child queued the alert at the real time
     s.flush()
     assert len(s.ops.events("invoke")) == 1  # the alert is delivered by the next flush
-    assert h.runs() == []  # the hook is not rerun: at most once
+    assert len(h.runs()) == 1  # the hook ran
+    s.flush()
+    assert len(h.runs()) == 1  # and only once
+    assert rig.query("SELECT COUNT(*) FROM hook_outbox") == [(0,)]
 
 
 def test_two_flushers_taking_one_row_per_run_split_sixty_rows_exactly(rig: Rig) -> None:
