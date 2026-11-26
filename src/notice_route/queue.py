@@ -30,8 +30,9 @@ Seams, owned by later issues:
 
 A dedup or event-id record of an evicted delivery is deleted with it, in the same transaction
 (:func:`notice_route.dedup.release`, #17).
-TODO(#27): an ``overflow`` eviction is surfaced once per destination per UTC hour (the caller
-gets the evicted rows back and inserts the ``surfaced`` row in the same transaction).
+An ``overflow`` eviction is surfaced once per destination per UTC hour (the caller gets the
+evicted rows back and inserts the ``surfaced`` row in the same transaction:
+:mod:`notice_route.surfacing`).
 Public helpers over the one lease predicate (``_UNCLAIMED``), for ``flush`` (#23) and ``prune``
 (#26): :func:`due_rows`, :func:`claim_row`, :func:`count_due`, :func:`expire_unclaimed`,
 :func:`drop_unclaimed` and :func:`postpone_unclaimed`. No caller needs its own copy of the
@@ -687,7 +688,7 @@ def expire_unclaimed(
     or earlier: the queue row is deleted and its delivery becomes ``expired``, code ``expired``
     (the stored reason stays), ``deliver_after`` cleared, dedup records released. A row with a
     live claim is never touched. Oldest (lowest id) first, at most ``limit`` of them when given
-    (``prune`` ends 1000 rows per transaction). TODO(#27): the caller surfaces them."""
+    (``prune`` ends 1000 rows per transaction). The caller surfaces them."""
     _int(max_age, "max_age")
     if limit is not None and (type(limit) is not int or limit < 1):
         raise ValueError("limit must be a positive integer")

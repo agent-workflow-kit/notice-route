@@ -1,7 +1,9 @@
 """The public log, ``log.jsonl`` (docs/interface.md, Log; schemas/log.json).
 
-One line per destination outcome (``record`` ``delivery``) and per ``flush`` (``record``
-``flush``, built by #23 with :func:`record`). A line holds only fixed words, validated names, the
+One line per destination outcome (``record`` ``delivery``), per ``flush`` (``record``
+``flush``, built by #23 with :func:`record`) and per ``post-fail`` hook run (``record`` ``hook``:
+``destination``, ``hook``, ``mode`` ``sync`` or ``async`` and a fixed-word ``result``).
+A line holds only fixed words, validated names, the
 first 16 hex characters of two SHA-256 digests of the rendered text and of the dedupe digest, and
 numbers: never a title, a message, a link or a credential. It is written ASCII-only, so no
 character of a payload can change its shape.
@@ -71,6 +73,8 @@ _FIELDS = (
     "dropped",
     "expired",
     "duration_ms",
+    "mode",
+    "result",
 )
 
 

@@ -220,3 +220,73 @@ def run(
 
 def last_json(result: subprocess.CompletedProcess[bytes]) -> Any:
     return json.loads(result.stdout.decode("utf-8"))
+
+
+_HOOK_STUB = """#!{python} -I
+import sys
+
+sys.path.insert(0, {fakebin!r})
+import hook
+
+sys.exit(hook.main(sys.argv[1:], {behavior!r}))
+"""
+
+
+@dataclass
+class Hook:
+    """A fake hook command: ``cmd`` is the stub's path (run through ``sh -c``)."""
+
+    stub: Path
+    behavior_path: Path
+    log_path: Path
+
+    @property
+    def cmd(self) -> str:
+        return str(self.stub)
+
+    def set(self, **behavior: Any) -> None:
+        tmp = self.behavior_path.with_name(self.behavior_path.name + ".new")
+        tmp.write_text(json.dumps({"log": str(self.log_path), **behavior}), "utf-8")
+        tmp.replace(self.behavior_path)
+
+    def records(self) -> list[dict[str, Any]]:
+        if not self.log_path.exists():
+            return []
+        return [json.loads(x) for x in self.log_path.read_text("utf-8").splitlines()]
+
+    def runs(self) -> list[dict[str, Any]]:
+        return [r for r in self.records() if r["event"] == "run"]
+
+    def wait_for(self, event: str, *, count: int = 1, timeout: float = 10.0) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            found = [r for r in self.records() if r["event"] == event]
+            if len(found) >= count:
+                return found[-1]
+            time.sleep(0.02)
+        raise AssertionError(f"no {event!r} record x{count} within {timeout}s: {self.records()}")
+
+    def kill_tracked(self) -> None:
+        """SIGKILL the hook processes and grandchildren it recorded, by PID plus start time."""
+        for r in self.records():
+            if r["event"] in ("run", "grandchild") and r.get("start") is not None:
+                if alive(r["pid"], r["start"]):
+                    try:
+                        os.kill(r["pid"], signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+
+def build_hook(directory: Path, name: str = "hook", **behavior: Any) -> Hook:
+    directory.mkdir(parents=True, exist_ok=True)
+    stub = directory / name
+    behavior_path = directory / f"{name}.behavior.json"
+    log_path = directory / f"{name}.log.jsonl"
+    stub.write_text(
+        _HOOK_STUB.format(python=sys.executable, fakebin=str(FAKEBIN), behavior=str(behavior_path)),
+        "utf-8",
+    )
+    stub.chmod(0o755)
+    made = Hook(stub, behavior_path, log_path)
+    made.set(**behavior)
+    return made

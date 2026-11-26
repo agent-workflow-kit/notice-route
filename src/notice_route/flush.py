@@ -47,7 +47,7 @@ reading:
 - The send lock being busy, a result whose claim was lost and a signal before a call are all
   handled as in ``send`` (``calling.py``, ``send.record_result``).
 - The retry schedule (:mod:`notice_route.retry` by default) and surfacing are seams:
-  ``send.Seams`` (``retry_schedule``, ``surface``; TODO(#27)).
+  ``send.Seams`` (``retry_schedule``, ``surface``).
 - Digest (docs/design.md C-54): ``digests`` counts the digests built and not released unsent in the
   run; the result counts (``sent``, ``failed``, ...) count member rows, as ``due_held`` does.
 """
@@ -57,16 +57,19 @@ from __future__ import annotations
 import math
 import sqlite3
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
 from . import dedup
 from . import log as logmod
+from .alerts import HookJob, take_surfaced
 from .calling import Busy, Called, CallEnd, Escaped, Gate, NotRun, Skipped, call_row
 from .decide import claim_call, count_call, give_back, hour_start, instant
 from .digest import Digest, build, record_digest, record_escaped_digest
 from .gateway import DirHandle, Gateway, SignalTrap
+from .hooks import run_hook, start_detached
 from .outcome import LOCK_BUSY, Applied, Outcome, classify, record_escaped
 from .payload import LEVELS, UsageError
 from .queue import (
@@ -85,18 +88,21 @@ from .queue import (
     release_claims,
 )
 from .report import env_unset, worst_case_s
-from .send import Seams, SurfaceEvent, record_result, with_retry
+from .send import Seams, SurfaceEvent, escaped_surface, record_result, with_retry
 from .sendlock import flush_lock
 from .store import Store, StoreError, open_readonly, open_store
-from .validate import Config, Destination
+from .surfacing import ALERT_SOURCE, surface_evictions
+from .validate import Config, Destination, Hook
 from .window import in_window
 
 __all__ = ["FlushOptions", "FlushResult", "run_flush"]
 
 _STOPPING = ("sent", "disabled")  # the classified outcomes after which the run goes on
 _ROW_FAULT = "a queue row could not be used"  # fixed texts of an exit 1 (never an exception's)
+_ROUTING_FAULT = "a failure alert could not be routed"
 _LOCK_FAULT = "a flush lock cannot be used"
 _THREAD_FAULT = "internal error"
+_HOOK_THREADS = 4  # hooks that run at the same time
 
 
 @dataclass(frozen=True)
@@ -200,6 +206,24 @@ class _Run:
                 )
             )
 
+    def log_hook(self, destination: str, mode: str, result: str) -> None:
+        if self.writer is None:
+            return
+        with self.log_lock:
+            self.writer.write(
+                logmod.record(
+                    "hook",
+                    wall=self.gateway.wall(),
+                    actor=self.opts.actor,
+                    decision_id=self.opts.decision_id,
+                    duration_ms=_elapsed_ms(self.gateway, self.started),
+                    hook="post-fail",
+                    destination=destination,
+                    mode=mode,
+                    result=result,
+                )
+            )
+
     def log_flush(self, **fields: Any) -> None:
         if self.writer is None:
             return
@@ -284,10 +308,36 @@ def run_flush(
         run.writer = logmod.LogWriter(gateway, state if config.log else None)
         if full:
             _meta(store, "flush_last", wall)
-        with ThreadPoolExecutor(max_workers=len(selected)) as pool:
+        taken = _take_surfaced(run, store)
+        sync_jobs = [
+            (job, hook)
+            for job in taken.jobs
+            for hook in config.hooks_post_fail
+            if not hook.is_async
+        ]
+        with (
+            ThreadPoolExecutor(max_workers=len(selected)) as pool,
+            ThreadPoolExecutor(max_workers=_HOOK_THREADS) as hook_pool,
+        ):
+            hook_futures = [
+                hook_pool.submit(_run_sync_hook, run, hook, job) for job, hook in sync_jobs
+            ]
             futures = [pool.submit(_destination, run, d) for d in selected]
             tallies = [f.result() for f in futures]
+            words = [_hook_word(f) for f in hook_futures]
+        hook_records: list[tuple[str, str, str]] = []  # destination, mode, result
+        hook_failures: list[str] = []
+        late: list[tuple[HookJob, Hook]] = []  # a signal came first: started detached instead
+        for (job, hook), word in zip(sync_jobs, words, strict=True):
+            if word is _NOT_STARTED:
+                late.append((job, hook))
+                continue
+            hook_records.append((job.destination, "sync", word or "ok"))
+            if word is not None:
+                hook_failures.append(word)
         result = FlushResult(0)
+        if taken.error:
+            result.error = ("internal", "state database cannot be written")
         if full:
             missing = any(t.state == "env_missing" for t in tallies)
             try:
@@ -296,9 +346,59 @@ def run_flush(
                 result.error = ("internal", "state database cannot be written")
         finished = _finish(run, tallies, result)
         _log_summary(run, tallies)
+        # detached: nobody waits for these, and no thread is running now; the supervisor closes
+        # every descriptor, so it holds neither the flush lock nor the database
+        detached = [(j, h) for j in taken.jobs for h in config.hooks_post_fail if h.is_async]
+        for job, hook in detached + late:
+            failed = start_detached(gateway, hook, job.payload)
+            # a sync hook that a signal kept from starting is still logged as mode sync
+            mode = "sync" if (job, hook) in late else "async"
+            hook_records.append((job.destination, mode, failed or "started"))
+            if failed is not None:
+                hook_failures.append(failed)
+        for destination, mode, word in hook_records:
+            run.log_hook(destination, mode, word)
+    for word in dict.fromkeys(hook_failures):
+        finished.warnings.append(f"a post-fail hook failed ({word})")
+    if taken.faults:
+        finished.warnings.append(_ROUTING_FAULT)
     if run.writer.problems:
         finished.warnings.append("the log could not be written")
     return finished
+
+
+_NOT_STARTED: Any = object()  # a sync hook that a signal kept from starting
+
+
+def _run_sync_hook(run: _Run, hook: Hook, job: HookJob) -> str | None:
+    """One synchronous hook: not started once a signal was trapped (a hook already running is
+    like a call in progress and finishes within its timeout)."""
+    if run.trap.received is not None:
+        return _NOT_STARTED
+    return run_hook(run.gateway, hook, job.payload)
+
+
+def _hook_word(future: Future[str | None]) -> str | None:
+    try:
+        return future.result()
+    except Exception:  # a hook never changes the result
+        return "lost"
+
+
+@dataclass
+class _TakenRows:
+    jobs: list[HookJob]
+    error: bool = False
+    faults: int = 0
+
+
+def _take_surfaced(run: _Run, store: Store) -> _TakenRows:
+    """Every run (but a dry run) first takes the new ``surfaced`` rows: alerts are routed (rows
+    due now, which the destinations' step 6 delivers in this run) and the hook jobs returned."""
+    taken = take_surfaced(run.gateway, store, run.config, run.worst)
+    for record in taken.log:
+        run.log(**record)
+    return _TakenRows(taken.jobs, taken.error, taken.faults)
 
 
 def _meta(store: Store, key: str, value: int | None) -> None:
@@ -388,7 +488,7 @@ def _skip_reason(run: _Run, dest: Destination, t: _Tally) -> bool:
         t.state = "disabled"
         return True
     if env_unset(dest.env, run.gateway.environ()):
-        t.state = "env_missing"  # TODO(#27): surfaced as env_missing (once per hour)
+        t.state = "env_missing"
         return True
     return False
 
@@ -448,6 +548,8 @@ def _destination(run: _Run, dest: Destination) -> _Tally:
     t = _Tally(dest.name)
     try:
         if _skip_reason(run, dest, t):
+            if t.state == "env_missing":
+                _surface_env_missing(run, dest, t)
             return t
         if run.trap.received is not None:
             t.skipped = True
@@ -470,6 +572,31 @@ def _destination(run: _Run, dest: Destination) -> _Tally:
     except Exception:  # a fault of the thread: its other destinations still report
         t.fault = _THREAD_FAULT
     return t
+
+
+def _surface_env_missing(run: _Run, dest: Destination, t: _Tally) -> None:
+    """The destination is skipped for an unset variable: surface ``env_missing`` (once per UTC
+    hour) for its oldest unclaimed due row, one that is not a failure alert when there is one. A
+    destination with nothing due and unclaimed has nothing waiting on the credential, so it
+    surfaces nothing."""
+    try:
+        with open_store(run.gateway) as store, store.write() as conn:
+            lease = Lease.at(run.gateway.wall(), run.worst)
+            due = due_rows(conn, dest.name, lease)
+            picked = next((r for r in due if r.source != ALERT_SOURCE), due[0] if due else None)
+            if picked is not None:
+                attempts = conn.execute(
+                    "SELECT attempts FROM deliveries WHERE id = ?", (picked.delivery_id,)
+                ).fetchone()
+                run.seams.surface(
+                    conn,
+                    SurfaceEvent(
+                        picked.delivery_id, dest.name, dest.kind, picked.source, picked.level,
+                        "deferred", "env_missing", int(attempts[0]) if attempts else 0, lease.now,
+                    ),
+                )  # fmt: skip
+    except StoreError:
+        t.error = True
 
 
 def _locked(run: _Run, store: Store, dest: Destination, t: _Tally) -> None:
@@ -501,8 +628,16 @@ def _prepare(run: _Run, store: Store, dest: Destination, t: _Tally) -> None:
         lease = Lease.at(run.gateway.wall(), run.worst)
         counts = count_due(conn, dest.name, lease)
         t.due_single, t.due_held = counts["single"], counts["held"]
-        # TODO(#27): surface each expired row (code expired, once per destination per UTC hour)
         expired = expire_unclaimed(conn, lease, destination=dest.name)
+        if expired:  # one ``expired`` surfacing per destination per UTC hour, no alert's if any
+            e = next((x for x in expired if x.source != ALERT_SOURCE), expired[0])
+            run.seams.surface(
+                conn,
+                SurfaceEvent(
+                    e.delivery_id, dest.name, dest.kind, e.source, e.level,
+                    "expired", "expired", e.attempts, lease.now,
+                ),
+            )  # fmt: skip
         t.expired = len(expired)
         t.acted = bool(expired)
         window = _quiet_window(run, dest)
@@ -596,7 +731,7 @@ def _claim(
             )
             retry_at = run.seams.retry_schedule(dest.kind, lease.now)
             if prior >= 1 and retry_at(prior) is None:
-                _exhaust(conn, run, dest, claimed, token, prior, hour)
+                _exhaust(conn, run, dest, claimed, token, prior, hour, lease.now)
                 exhausted.append((claimed, prior))
                 break
             claim = _Claim(claimed, token, hour, prior)
@@ -618,6 +753,7 @@ def _exhaust(
     token: str,
     prior: int,
     hour: int | None,
+    now: int,
 ) -> None:
     """End a claimed row ``failed``/``retries_exhausted`` without a call; ``hour`` is where its
     hourly count is given back (``None``: it took none, a digest member)."""
@@ -641,6 +777,7 @@ def _exhaust(
             "failed",
             "retries_exhausted",
             prior,
+            now,
         ),
     )
 
@@ -707,7 +844,7 @@ def _claim_digest(
                 ).fetchone()[0]
             )
             if prior >= 1 and retry_at(prior) is None:
-                _exhaust(conn, run, dest, claimed, token, prior, None)
+                _exhaust(conn, run, dest, claimed, token, prior, None, lease.now)
                 spent.append((claimed, prior))
             else:
                 live.append(claimed)
@@ -723,7 +860,7 @@ def _claim_digest(
             )  # fmt: skip
             result = _DigestClaim(digest, token, hour_start(lease.now), sent_as, priors)
         else:
-            release_claims(conn, token, lease)
+            surface_evictions(conn, release_claims(conn, token, lease).evicted, lease.now)
     for row, prior in spent:
         t.failed += 1
         t.acted = True
@@ -765,7 +902,9 @@ def _call_digest(
             recorded = with_retry(
                 run.gateway,
                 claim.call_row,
-                lambda: record_escaped_digest(store, members, claim.token),
+                lambda: record_escaped_digest(
+                    store, members, claim.token, _digest_surface(run, dest)
+                ),
             )
         except StoreError:
             t.error = True
@@ -830,6 +969,30 @@ def _call_digest(
     run.say(t, f"digest {outcome.outcome or 'unknown'}")
 
 
+def _digest_surface(
+    run: _Run, dest: Destination
+) -> Callable[[sqlite3.Connection, QueueRow, int], None]:
+    """Surfacing for an escaped digest call: once, for the first member recorded."""
+
+    def surface(conn: sqlite3.Connection, member: QueueRow, attempts: int) -> None:
+        run.seams.surface(
+            conn,
+            SurfaceEvent(
+                member.delivery_id,
+                dest.name,
+                dest.kind,
+                member.source,
+                member.level,
+                "unknown",
+                "killed",
+                attempts,
+                instant(run.gateway.wall()),
+            ),  # fmt: skip
+        )
+
+    return surface
+
+
 def _attempts_of(
     store: Store, claim: _DigestClaim, row: QueueRow, counted: int, *, read: bool
 ) -> int:
@@ -874,7 +1037,16 @@ def _call_and_record(run: _Run, store: Store, dest: Destination, t: _Tally, clai
         t.called = t.acted = True
         t.unknown += 1
         try:
-            with_retry(run.gateway, row, lambda: record_escaped(store, row=row, token=token))
+            with_retry(
+                run.gateway,
+                row,
+                lambda: record_escaped(
+                    store,
+                    row=row,
+                    token=token,
+                    surface=escaped_surface(run.gateway, run.seams, dest, row),
+                ),
+            )
         except StoreError:
             t.error = True
         run.say(t, f"row {row.id} unknown")
@@ -934,7 +1106,6 @@ def _others(applied: Applied, row: QueueRow) -> list[Any]:
 
 
 def _tally(t: _Tally, outcome: str, evicted_others: int) -> None:
-    # TODO(#27): surface overflow evictions (``applied.evicted``) once per destination per hour
     if outcome in ("sent", "queued_retry", "failed", "unknown", "dropped"):
         setattr(t, outcome, getattr(t, outcome) + 1)
     t.dropped += evicted_others
@@ -944,7 +1115,8 @@ def _give_back(run: _Run, store: Store, dest: Destination, claim: _Claim) -> Non
     """Release the claim of a row whose call was never made and return its hourly count."""
     try:
         with store.write() as conn:
-            release_claims(conn, claim.token, Lease.at(run.gateway.wall(), run.worst))
+            lease = Lease.at(run.gateway.wall(), run.worst)
+            surface_evictions(conn, release_claims(conn, claim.token, lease).evicted, lease.now)
             give_back(conn, destination=dest.name, level=claim.row.level, hour=claim.count_hour)
     except StoreError:
         pass  # the claim lapses by itself

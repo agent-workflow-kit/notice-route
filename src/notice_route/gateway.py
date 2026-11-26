@@ -18,6 +18,7 @@ import math
 import os
 import pwd
 import re
+import resource
 import secrets
 import select
 import selectors
@@ -412,6 +413,25 @@ def _open_checked_dir(path: str, dir_fd: int | None, shown: str) -> DirHandle:
     return DirHandle(fd, shown)
 
 
+def _close_beyond_stdio() -> None:
+    """Close every descriptor beyond 0 to 2, whatever its number: the open ones are listed from
+    ``/proc/self/fd`` (or ``/dev/fd``); without a listing, a range up to the hard limit."""
+    for directory in ("/proc/self/fd", "/dev/fd"):
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            continue
+        for name in names:
+            if name.isdigit() and int(name) > 2:
+                try:
+                    os.close(int(name))
+                except OSError:
+                    pass  # the listing's own descriptor, already closed
+        return
+    hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+    os.closerange(3, 65536 if hard == resource.RLIM_INFINITY else min(hard, 1 << 20))
+
+
 @dataclass
 class Gateway:
     """The injectable boundary. Build one at startup and pass it down."""
@@ -518,6 +538,49 @@ class Gateway:
                 error=f"{type(exc).__name__}: {exc}",
             )
         return _Supervisor(self.clock, proc, payload, started + timeout, started).run()
+
+    def run_detached(
+        self,
+        argv: Sequence[str],
+        *,
+        env: Mapping[str, str],
+        timeout: float,
+        stdin: str | bytes | None = None,
+    ) -> bool:
+        """Start ``argv`` as :meth:`run` does, detached: a double fork leaves a supervisor (a
+        session of its own, every descriptor beyond 0 to 2 closed and those three on
+        ``/dev/null``, so it holds no lock of this process) that runs :meth:`run` with the same
+        deadline and exits. Returns once the supervisor is started; ``False`` when a fork failed.
+        The arguments are checked first (``ValueError``). The caller must have no other thread
+        running and no output pending."""
+        if not list(argv) or not all(isinstance(a, str) and "\x00" not in a for a in argv):
+            raise ValueError("argv must be a non-empty list of strings without NUL")
+        try:
+            pid = os.fork()
+        except OSError:
+            return False
+        if pid != 0:
+            try:
+                _, status = os.waitpid(pid, 0)
+            except ChildProcessError:
+                return True  # reaped elsewhere: the status is unknown, the start is not denied
+            return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+        try:  # the first child: leave the caller's session, fork again, vanish
+            for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                signal.signal(signum, signal.SIG_DFL)  # not the caller's flag-setting handlers
+            os.setsid()
+            null = os.open(os.devnull, os.O_RDWR)
+            if os.fork() != 0:
+                os._exit(0)
+            for fd in (0, 1, 2):
+                os.dup2(null, fd)
+            _close_beyond_stdio()
+            try:
+                self.run(argv, env=env, timeout=timeout, stdin=stdin)
+            finally:
+                os._exit(0)
+        except BaseException:  # nothing may return into the caller's code from a forked child
+            os._exit(1)
 
     def home_dir(self) -> Path:
         """The home directory from the password database; ``HOME`` and ``XDG_*`` are never read.

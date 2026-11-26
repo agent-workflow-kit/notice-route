@@ -439,7 +439,9 @@ def test_the_first_rate_capped_deferral_per_hour_is_surfaced(store: Store, gw: G
     assert rows == [("2023-11-14T12", first.delivery_id), ("2023-11-14T13", third.delivery_id)]
 
 
-def test_a_rate_capped_row_evicted_at_once_is_not_surfaced(store: Store, gw: Gateway) -> None:
+def test_a_rate_capped_row_evicted_at_once_is_surfaced_as_overflow_not_rate_capped(
+    store: Store, gw: Gateway
+) -> None:
     at(gw, NIGHT)
     d = dest(quiet="night", max_per_hour=1)
     for i in range(100):  # a full queue of action rows, held through the night
@@ -448,14 +450,18 @@ def test_a_rate_capped_row_evicted_at_once_is_not_surfaced(store: Store, gw: Gat
     assert one(store, gw, d, notice("warn", "a")).decision == "send"
     evicted = one(store, gw, d, notice("warn", "b"))  # capped, and the lowest row: dropped
     assert (evicted.decision, evicted.reason) == ("drop", "overflow")
-    assert count(store, "surfaced") == 0
+    assert q(store, "SELECT code, delivery_id FROM surfaced") == [
+        ("overflow", evicted.delivery_id)
+    ]  # the hour's rate_capped slot is not used
     assert q(store, "SELECT surfaced FROM deliveries WHERE id = ?", (evicted.delivery_id,)) == [
-        (0,)
+        (1,)
     ]
     assert one(store, gw, d, notice("error", "c")).decision == "send"
     kept = one(store, gw, d, notice("error", "e"))  # capped, and kept: the hour's first surfaced
     assert (kept.decision, kept.reason) == ("defer", "rate_capped")
-    assert q(store, "SELECT delivery_id FROM surfaced") == [(kept.delivery_id,)]
+    assert q(store, "SELECT delivery_id FROM surfaced WHERE code = 'rate_capped'") == [
+        (kept.delivery_id,)
+    ]
     assert q(store, "SELECT surfaced FROM deliveries WHERE id = ?", (kept.delivery_id,)) == [(1,)]
 
 

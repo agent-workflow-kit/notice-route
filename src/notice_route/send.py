@@ -33,16 +33,16 @@ Choices where the interface is silent (docs/design.md C-52 has the reasons):
 - ``not_started`` (an internal fault) records nothing, is not logged (``outcome`` has no word for
   it) and ends the command with exit 1.
 - Seams, injectable through :class:`Seams`: the retry schedule (:mod:`notice_route.retry` by
-  default); TODO(#27) surfacing a ``failed`` or ``unknown`` end
-  (:class:`SurfaceEvent`; ``rate_capped`` is already surfaced by ``decide``, ``env_missing`` and
-  ``overflow`` are not yet).
+  default) and the surfacing of a ``failed``, ``unknown``, escaped or evicted result
+  (:class:`SurfaceEvent`, default :func:`surface_event`; ``rate_capped`` and the evictions of a
+  decision are surfaced by ``decide``; docs/design.md C-57).
 """
 
 from __future__ import annotations
 
 import math
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
@@ -65,11 +65,12 @@ from .match import decide as match_decide
 from .notify import CallResult, call_notifier
 from .outcome import LOCK_BUSY, Applied, Outcome, apply_outcome, classify, record_escaped
 from .payload import Notification
-from .queue import Lease, QueueRow, insert_delivery, release_claims
+from .queue import Evicted, Lease, QueueRow, insert_delivery, release_claims
 from .render import render
 from .report import worst_case_s
 from .retry import retry_schedule as default_retry_schedule
 from .store import SEND_BUSY_S, Store, StoreError, open_store
+from .surfacing import surface_evictions, surface_outcome
 from .validate import Config, Destination
 
 __all__ = [
@@ -79,7 +80,10 @@ __all__ = [
     "SendOptions",
     "SendResult",
     "SurfaceEvent",
+    "escaped_surface",
+    "evicted_events",
     "record_result",
+    "surface_event",
     "run_send",
     "with_retry",
 ]
@@ -98,10 +102,12 @@ class SendOptions:
 
 @dataclass(frozen=True)
 class SurfaceEvent:
-    """A ``failed`` or ``unknown`` end, given to the surfacing seam inside the recording
-    transaction (TODO(#27): it inserts the ``surfaced`` row and marks the delivery). It may be
-    run again after a rolled-back failure (the recording is retried once), so it writes only
-    through the given connection (a rollback undoes it) and has no external effect."""
+    """A surfaced event (a ``failed`` or ``unknown`` end, a ``dropped``/``overflow`` eviction, an
+    ``expired`` row, a ``deferred``/``env_missing`` skip), given to the surfacing seam inside the
+    recording transaction (:func:`surface_event` inserts the ``surfaced`` row and marks the
+    delivery). ``outcome`` and ``code`` are the recorded ones; the seam keys on the outcome.
+    It may be run again after a rolled-back failure (the recording is retried once), so it
+    writes only through the given connection (a rollback undoes it) and has no external effect."""
 
     delivery_id: int
     destination: str
@@ -111,10 +117,68 @@ class SurfaceEvent:
     outcome: str
     code: str | None
     attempts: int
+    now: int  # the recording transaction's clock (UTC epoch seconds): it picks the period
 
 
-def _no_surface(conn: sqlite3.Connection, event: SurfaceEvent) -> None:
-    """TODO(#27): insert the ``surfaced`` row for ``event`` and mark its delivery."""
+def surface_event(conn: sqlite3.Connection, event: SurfaceEvent) -> None:
+    """The default surfacing seam: insert the ``surfaced`` row for ``event`` when the limits
+    allow and mark its delivery (:mod:`notice_route.surfacing`)."""
+    surface_outcome(
+        conn, event.destination, event.outcome, event.code, event.delivery_id, event.now
+    )
+
+
+def escaped_surface(
+    gateway: Gateway, seams: Seams, dest: Destination, row: QueueRow
+) -> Callable[[sqlite3.Connection, int], None]:
+    """The ``surface`` argument of :func:`notice_route.outcome.record_escaped`: the call that
+    escaped ends ``unknown``/``killed``, which is surfaced like any other ``unknown``."""
+
+    def surface(conn: sqlite3.Connection, attempts: int) -> None:
+        seams.surface(
+            conn,
+            SurfaceEvent(
+                row.delivery_id,
+                dest.name,
+                dest.kind,
+                row.source,
+                row.level,
+                "unknown",
+                "killed",
+                attempts,
+                instant(gateway.wall()),
+            ),  # fmt: skip
+        )
+
+    return surface
+
+
+def evicted_events(
+    conn: sqlite3.Connection, dest: Destination, evicted: Sequence[Evicted], now: int
+) -> list[SurfaceEvent]:
+    """The ``dropped``/``overflow`` events of rows the cap evicted from ``dest``'s queue (the
+    source and the attempts are read from the delivery inside the transaction)."""
+    out: list[SurfaceEvent] = []
+    for e in evicted:
+        found = conn.execute(
+            "SELECT source, attempts FROM deliveries WHERE id = ?", (e.delivery_id,)
+        ).fetchone()
+        if found is None:
+            continue
+        out.append(
+            SurfaceEvent(
+                e.delivery_id,
+                dest.name,
+                dest.kind,
+                str(found[0]),
+                e.level,
+                "dropped",
+                "overflow",
+                int(found[1]),
+                now,
+            )  # fmt: skip
+        )
+    return out
 
 
 @dataclass(frozen=True)
@@ -123,7 +187,7 @@ class Seams:
 
     call: Callable[..., CallResult] = call_notifier
     retry_schedule: Callable[[str, int], Callable[[int], int | None]] = default_retry_schedule
-    surface: Callable[[sqlite3.Connection, SurfaceEvent], None] = _no_surface
+    surface: Callable[[sqlite3.Connection, SurfaceEvent], None] = surface_event
 
 
 @dataclass
@@ -417,7 +481,7 @@ def _release(
         lease = Lease.at(gateway.wall(), worst)
         for d in sending:
             assert d.claim_token is not None
-            release_claims(conn, d.claim_token, lease)
+            surface_evictions(conn, release_claims(conn, d.claim_token, lease).evicted, lease.now)
 
 
 def _advisory(store: Store, gateway: Gateway, result: SendResult) -> None:
@@ -568,7 +632,8 @@ def _fallback_entry(
 
 def _release_row(store: Store, gateway: Gateway, worst: float, token: str) -> None:
     with store.write() as conn:
-        release_claims(conn, token, Lease.at(gateway.wall(), worst))
+        lease = Lease.at(gateway.wall(), worst)
+        surface_evictions(conn, release_claims(conn, token, lease).evicted, lease.now)
 
 
 def _record_one(
@@ -601,7 +666,13 @@ def _record_one(
         return
     if isinstance(what, Escaped):
         try:
-            held = with_retry(gateway, row, lambda: record_escaped(store, row=row, token=token))
+            held = with_retry(
+                gateway,
+                row,
+                lambda: record_escaped(
+                    store, row=row, token=token, surface=escaped_surface(gateway, seams, dest, row)
+                ),
+            )
         except StoreError:
             held = None
         entry = _entry(dest.name, "unknown", code="killed", attempts=1)
@@ -681,8 +752,12 @@ def record_result(
                         applied.outcome,
                         applied.code,
                         applied.attempts,
+                        lease.now,
                     ),
                 )
+            if applied.applied:  # rows the cap dropped when this result was requeued
+                for event in evicted_events(conn, dest, applied.evicted, lease.now):
+                    seams.surface(conn, event)
             return applied
 
     return with_retry(gateway, row, write)

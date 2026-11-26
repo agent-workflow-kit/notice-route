@@ -40,7 +40,7 @@ Choices where the interface is silent (the narrower reading):
   ``quiet`` keeps ``quiet``), which also keeps "already link_refused" true on later calls.
 
 The retry schedule and attempt caps are :mod:`notice_route.retry`; ``retry_at`` is the seam.
-TODO(#27): the caller inserts the ``surfaced`` row for ``failed`` and ``unknown`` ends.
+The caller inserts the ``surfaced`` row for ``failed`` and ``unknown`` ends (``surfacing.py``).
 ``send.py`` (#22) logs the result of a call that was not applied, and treats an exception escaping
 ``call_notifier`` through :func:`record_escaped`.
 """
@@ -430,10 +430,18 @@ def record_outcome(
         )
 
 
-def record_escaped(store: Store, *, row: QueueRow, token: str) -> bool:
+def record_escaped(
+    store: Store,
+    *,
+    row: QueueRow,
+    token: str,
+    surface: Callable[[_Conn, int], None] | None = None,
+) -> bool:
     """An exception escaped ``call_notifier``: the child's fate is unknown. Mark the delivery
     ``unknown``/``killed`` with one more attempt and keep the queue row claimed (it lapses and
-    ``flush`` resends: at least once). Dedup records stay. False when the claim is gone."""
+    ``flush`` resends: at least once). Dedup records stay. False when the claim is gone.
+    ``surface(conn, attempts)`` runs inside the transaction when the row was recorded (it may run
+    twice: it writes only through ``conn``)."""
     with store.write() as conn:
         cur = conn.execute(
             "UPDATE deliveries SET outcome = 'unknown', code = 'killed', attempts = attempts + 1,"
@@ -441,4 +449,11 @@ def record_escaped(store: Store, *, row: QueueRow, token: str) -> bool:
             " (SELECT 1 FROM queue WHERE id = ? AND claimed_by = ?)",
             (row.delivery_id, row.id, token),
         )
-        return cur.rowcount == 1
+        if cur.rowcount != 1:
+            return False
+        if surface is not None:
+            found = conn.execute(
+                "SELECT attempts FROM deliveries WHERE id = ?", (row.delivery_id,)
+            ).fetchone()
+            surface(conn, int(found[0]))
+        return True

@@ -17,7 +17,7 @@ stays literal. Cuts count code points, and the text is stripped of trailing spac
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
 from .decide import give_back
@@ -26,7 +26,7 @@ from .outcome import Applied, Outcome, apply_outcome
 from .payload import LEVELS
 from .queue import Lease, QueueRow
 from .render import sanitize
-from .send import Seams, SurfaceEvent, with_retry
+from .send import Seams, SurfaceEvent, evicted_events, with_retry
 from .store import Store
 from .validate import Destination
 
@@ -182,9 +182,14 @@ def record_digest(
                                 a.outcome,
                                 a.code,
                                 a.attempts,
+                                lease.now,
                             ),
                         )
                 applied.append(a)
+            for a in applied:  # rows the cap dropped when members went back
+                if a.applied:
+                    for event in evicted_events(conn, dest, a.evicted, lease.now):
+                        seams.surface(conn, event)
             if any(a.applied for a in applied) and (
                 outcome.outcome == "deferred" or outcome.reason == "lock_busy"
             ):  # no call was made: the digest's one count goes back, in the digest's class
@@ -229,13 +234,18 @@ def _reason_digest(
 
 
 def record_escaped_digest(
-    store: Store, members: Sequence[QueueRow], token: str
+    store: Store,
+    members: Sequence[QueueRow],
+    token: str,
+    surface: Callable[[sqlite3.Connection, QueueRow, int], None] | None = None,
 ) -> list[int | None]:
     """An exception escaped the call: every member is ``unknown``/``killed``, reason ``digest``,
     with one more attempt and stays claimed (it lapses and ``flush`` resends: at least once). One
     transaction; the result is each member's new attempts, or ``None`` for a member whose claim is
-    gone (skipped)."""
+    gone (skipped). ``surface(conn, member, attempts)`` runs once, inside the transaction, for the
+    first member that was recorded."""
     out: list[int | None] = []
+    done = False
     with store.write() as conn:
         for m in members:
             cur = conn.execute(
@@ -251,4 +261,7 @@ def record_escaped_digest(
                 "SELECT attempts FROM deliveries WHERE id = ?", (m.delivery_id,)
             ).fetchone()
             out.append(int(row[0]))
+            if surface is not None and not done:
+                done = True
+                surface(conn, m, int(row[0]))
     return out

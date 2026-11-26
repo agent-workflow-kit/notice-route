@@ -47,10 +47,11 @@ The notifier call (``notify.py``) and the recording of its outcome (``outcome.py
 and ``give_back`` for a call never made) exist,
 and so does ``lock_busy`` (:data:`notice_route.outcome.LOCK_BUSY`);
 ``send.py`` (#22) renders, calls :func:`decide_and_record`, calls, prints and logs;
-TODO(#23) ``flush`` claims a due row with :func:`claim_call` (single rows) or :func:`count_call`
+``flush`` (#23) claims a due row with :func:`claim_call` (single rows) or :func:`count_call`
 (a digest); ``prune`` (#26) deletes ``rate`` rows of past hours older than 2 days;
-TODO(#27) surfacing ``env_missing`` and routing the alert (alerts skip the redelivery check,
-which :func:`dedup.is_redelivered` already does for source ``notice-route``).
+failure alerts are decided by :func:`decide_alert` (steps 1 to 6, then an unclaimed ``single`` row
+due now; the redelivery check never applies to source ``notice-route``), and ``rate_capped`` and
+the evictions of this transaction are surfaced here (:mod:`notice_route.surfacing`).
 """
 
 from __future__ import annotations
@@ -61,7 +62,6 @@ import math
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from . import dedup
@@ -69,6 +69,7 @@ from .gateway import Gateway
 from .queue import Lease, enqueue, insert_delivery, quiet_deliver_after
 from .report import env_unset, worst_case_s
 from .store import Store
+from .surfacing import surface_evictions, surface_hourly
 from .validate import LEVELS, Config, Destination
 from .window import in_window
 
@@ -80,6 +81,7 @@ __all__ = [
     "Notice",
     "claim_call",
     "count_call",
+    "decide_alert",
     "decide_and_record",
     "env_unset",
     "give_back",
@@ -103,7 +105,6 @@ _Conn = sqlite3.Connection
 Decision = Literal["send", "defer", "drop", "suppress", "disabled"]
 Outcome = Literal["sending", "deferred", "dropped", "suppressed", "disabled"]
 Kind = Literal["held", "single"]
-_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _RANK = {level: rank for rank, level in enumerate(LEVELS)}
 
 
@@ -261,10 +262,6 @@ def give_back(conn: _Conn, *, destination: str, level: str, hour: int) -> bool:
 # --- the decision order --------------------------------------------------------------------
 
 
-def _surface_period(hour: int) -> str:
-    return (_EPOCH + timedelta(seconds=hour)).strftime("%Y-%m-%dT%H")
-
-
 def _classify(
     state: Callable[[], _Conn | None],
     *,
@@ -275,9 +272,13 @@ def _classify(
     now: int,
     environ: Mapping[str, str],
     retention: int,
+    alert: bool = False,
 ) -> _Plan:
     """Steps 1 to 9. ``state`` yields the connection (``None``: no database, so no records);
-    with ``write`` the repeat check and the counter write, otherwise they only read."""
+    with ``write`` the repeat check and the counter write, otherwise they only read. An ``alert``
+    (a failure alert, :func:`decide_alert`) stops after step 6: a destination that would be sent
+    now gets an unclaimed ``single`` row due now (``flush`` claims it, so the credential and the
+    cap apply there)."""
     level = notice.level
     if level not in LEVELS:
         raise ValueError("level must be one of info, warn, action, error")
@@ -321,6 +322,8 @@ def _classify(
     if quiet and level in ("warn", "action"):
         assert window is not None
         return _Plan("defer", "deferred", "quiet", "held", quiet_deliver_after(window, now))
+    if alert:
+        return _Plan("defer", "deferred", None, "single", now)
     if env_unset(dest.env, environ):
         return _Plan("defer", "deferred", "env_missing", "single", now)
     next_hour = hour_start(now) + HOUR
@@ -415,39 +418,69 @@ def decide_and_record(
     there (docs/design.md C-46). Any exception rolls the whole transaction back: nothing is
     half decided. A send-now result carries a fresh claim token; the notifier call (#19) must
     use it to record its outcome."""
-    retention = math.ceil(config.retention_event_ids)
     with store.write() as conn:
         lease = Lease.at(gateway.wall(), worst_case_s(config))
-        now = lease.now
-        environ = dict(gateway.environ())
-        out: list[DestinationDecision] = []
-        for name in dict.fromkeys(destinations):
-            dest = config.destinations[name]
-            plan = _classify(
-                lambda: conn,
-                write=True,
-                config=config,
-                dest=dest,
-                notice=notice,
-                now=now,
-                environ=environ,
-                retention=retention,
+        return _decide_all(
+            conn, gateway, config, notice, destinations, lease, dict(gateway.environ()), False
+        )
+
+
+def decide_alert(
+    conn: _Conn,
+    gateway: Gateway,
+    config: Config,
+    notice: Notice,
+    destinations: Sequence[str],
+    lease: Lease,
+) -> list[DestinationDecision]:
+    """The decision of a failure alert for every destination of its rule, inside the caller's
+    ``Store.write`` transaction: steps 1 to 6 and then an unclaimed ``single`` row due now (no
+    claim, no counter, no ``env`` check: ``flush`` does those when it calls). The redelivery check
+    never applies to the router's own source (:func:`dedup.is_redelivered`)."""
+    return _decide_all(conn, gateway, config, notice, destinations, lease, {}, True)
+
+
+def _decide_all(
+    conn: _Conn,
+    gateway: Gateway,
+    config: Config,
+    notice: Notice,
+    destinations: Sequence[str],
+    lease: Lease,
+    environ: Mapping[str, str],
+    alert: bool,
+) -> list[DestinationDecision]:
+    retention = math.ceil(config.retention_event_ids)
+    now = lease.now
+    out: list[DestinationDecision] = []
+    for name in dict.fromkeys(destinations):
+        dest = config.destinations[name]
+        plan = _classify(
+            lambda: conn,
+            write=True,
+            config=config,
+            dest=dest,
+            notice=notice,
+            now=now,
+            environ=environ,
+            retention=retention,
+            alert=alert,
+        )
+        if plan.decision == "suppress":
+            repeats = None
+            if plan.reason == "repeat":
+                found = conn.execute(
+                    "SELECT d.count FROM dedup x JOIN deliveries d ON d.id = x.delivery_id"
+                    " WHERE x.destination = ? AND x.key_digest = ?",
+                    (name, notice.dedupe),
+                ).fetchone()
+                repeats = None if found is None else int(found[0])
+            out.append(
+                DestinationDecision(name, "suppress", "suppressed", plan.reason, count=repeats)
             )
-            if plan.decision == "suppress":
-                repeats = None
-                if plan.reason == "repeat":
-                    found = conn.execute(
-                        "SELECT d.count FROM dedup x JOIN deliveries d ON d.id = x.delivery_id"
-                        " WHERE x.destination = ? AND x.key_digest = ?",
-                        (name, notice.dedupe),
-                    ).fetchone()
-                    repeats = None if found is None else int(found[0])
-                out.append(
-                    DestinationDecision(name, "suppress", "suppressed", plan.reason, count=repeats)
-                )
-                continue
-            out.append(_record(conn, gateway, plan, dest, notice, lease, retention))
-        return out
+            continue
+        out.append(_record(conn, gateway, plan, dest, notice, lease, retention))
+    return out
 
 
 def _record(
@@ -517,12 +550,13 @@ def _record(
         dedupe=notice.dedupe,
         claim_token=token,
     )
+    surface_evictions(conn, queued.evicted, now)  # the cap dropped rows (maybe this one)
     if queued.row_evicted:  # the cap dropped the row just queued
         return DestinationDecision(
             dest.name, "drop", "dropped", "overflow", None, delivery_id, queued.row_id
         )
-    if plan.surface and _surface(conn, dest.name, "rate_capped", hour_start(now), delivery_id):
-        conn.execute("UPDATE deliveries SET surfaced = 1 WHERE id = ?", (delivery_id,))
+    if plan.surface:
+        surface_hourly(conn, dest.name, "rate_capped", delivery_id, now)
     return DestinationDecision(
         dest.name,
         plan.decision,
@@ -535,13 +569,3 @@ def _record(
         lease.expires if token is not None else None,
         decided_at=now,
     )
-
-
-def _surface(conn: _Conn, destination: str, code: str, hour: int, delivery_id: int) -> bool:
-    """Insert the once-per-hour ``surfaced`` row; ``False`` when this hour already has one."""
-    cur = conn.execute(
-        "INSERT INTO surfaced (destination, code, period, delivery_id) VALUES (?, ?, ?, ?)"
-        " ON CONFLICT (destination, code, period) DO NOTHING",
-        (destination, code, _surface_period(hour), delivery_id),
-    )
-    return cur.rowcount == 1
