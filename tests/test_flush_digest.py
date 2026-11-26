@@ -359,7 +359,7 @@ def test_a_busy_send_lock_returns_the_members_held_and_gives_back_one_count(rig:
     )
 
 
-def test_an_unset_variable_found_at_call_time_defers_the_members_held_and_gives_back_one_count(
+def test_an_unset_variable_found_at_call_time_defers_the_members_single_and_gives_back_one_count(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     one(rig)
@@ -376,8 +376,33 @@ def test_an_unset_variable_found_at_call_time_defers_the_members_held_and_gives_
             "SELECT d.outcome, d.reason, d.attempts, q.kind, q.deliver_after FROM deliveries d"
             " JOIN queue q ON q.delivery_id = d.id ORDER BY d.id"
         )
-        == [("deferred", "env_missing", 0, "held", NOW)] * 3
+        == [("deferred", "env_missing", 0, "single", NOW)] * 3
     )
+
+
+@pytest.mark.parametrize("stored", ["lock_busy", "link_refused", "keyword_refused"])
+def test_a_plain_retry_of_members_stored_with_another_reason_sets_digest(
+    rig: Rig, stored: str
+) -> None:
+    one(rig, error={"code": "rate_limited"})
+    for _ in range(2):
+        seed(rig, kind="held", outcome="queued_retry", reason=stored)
+    code, doc, _ = flush(rig)
+    assert (code, dest(doc)["queued_retry"]) == (0, 2)
+    assert states(rig) == [(i, "queued_retry", "digest", "rate_limited", 1) for i in (1, 2)]
+
+
+def test_a_lock_busy_result_of_this_call_keeps_its_reason_over_a_stored_one(rig: Rig) -> None:
+    n = rig.notifier()
+    rig.configure({"chat": {"notifier": n}}, lock_wait="1s")
+    for _ in range(2):
+        seed(rig, kind="held", outcome="queued_retry", reason="rate_limited")
+    lock = hold(rig, "chat.lock")
+    try:
+        flush(rig)
+    finally:
+        lock.close()
+    assert [s[1:3] for s in states(rig)] == [("queued_retry", "lock_busy")] * 2
 
 
 # --- the hourly counters -----------------------------------------------------------------------
@@ -499,9 +524,30 @@ def test_an_exception_from_the_call_leaves_every_member_unknown_and_claimed(
     use_seams(monkeypatch, Seams(call=boom))
     code, doc, err = flush(rig)
     assert (code, dest(doc)["unknown"], dest(doc)["digests"]) == (12, 3, 1)
-    assert states(rig) == [(i, "unknown", None, "killed", 1) for i in (1, 2, 3)]
+    assert states(rig) == [(i, "unknown", "digest", "killed", 1) for i in (1, 2, 3)]
     assert rig.query("SELECT COUNT(claimed_by) FROM queue") == [(3,)]
     assert "BOOM-TEXT" not in err + json.dumps(doc) + rig.state_text()
+    lines = [x for x in checked_log(rig) if x["record"] == "delivery"]
+    assert [(x["outcome"], x["reason"], x["attempts"]) for x in lines] == [
+        ("unknown", "digest", 1)
+    ] * 3
+
+
+def test_the_attempts_of_an_escaped_digest_follow_each_member(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    one(rig)
+    for attempts in (0, 2, 3):
+        seed(rig, kind="held", attempts=attempts, outcome="unknown" if attempts else "deferred")
+
+    def boom(*_a: Any, **_k: Any) -> Any:
+        raise RuntimeError("BOOM-TEXT")
+
+    use_seams(monkeypatch, Seams(call=boom))
+    flush(rig)
+    assert [s[4] for s in states(rig)] == [1, 3, 4]
+    lines = [x for x in checked_log(rig) if x["record"] == "delivery"]
+    assert [x["attempts"] for x in lines] == [1, 3, 4]
 
 
 def test_a_digest_whose_recording_fails_leaves_all_members_claimed_then_resends_them(
@@ -595,3 +641,93 @@ def test_a_stored_row_with_an_invalid_level_is_left_out_of_the_digest(rig: Rig) 
     (body,) = payloads(n)
     assert body["title"] == "2 held notifications"
     assert rig.query("SELECT id FROM queue") == [(ids[0],)]
+
+
+def test_the_attempts_of_a_lost_member_follow_its_row(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    one(rig)
+    first = seed(rig, kind="held", attempts=2, outcome="queued_retry")[1]
+    held(rig, 2)
+
+    def takeover(*args: Any, **kwargs: Any) -> Any:
+        with open_store(rig.gateway()) as store, store.write() as conn:
+            conn.execute("UPDATE queue SET claim_expires = ? WHERE id = ?", (NOW - 1, first))
+            assert claim_row(conn, first, Lease(NOW, 50), "other-claimant") is not None
+        return call_notifier(*args, **kwargs)
+
+    use_seams(monkeypatch, Seams(call=takeover))
+    flush(rig)
+    lines = [x for x in checked_log(rig) if x["record"] == "delivery"]
+    assert sorted(x["attempts"] for x in lines) == [1, 1, 2]
+
+
+def test_a_member_whose_rows_vanished_during_the_call_does_not_stop_the_others_recording(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    n = one(rig, error={"code": "rate_limited"})
+    first, *_ = held(rig, 3)
+
+    def vanish(*args: Any, **kwargs: Any) -> Any:
+        conn = sqlite3.connect(rig.state / "state.db")
+        conn.execute("DELETE FROM queue WHERE id = ?", (first,))
+        conn.execute("DELETE FROM deliveries WHERE id = ?", (first,))
+        conn.commit()
+        conn.close()
+        return call_notifier(*args, **kwargs)
+
+    use_seams(monkeypatch, Seams(call=vanish))
+    code, doc, _ = flush(rig)
+    assert len(n.events("invoke")) == 1 and code == 0
+    assert states(rig) == [(i, "queued_retry", "digest", "rate_limited", 1) for i in (2, 3)]
+    assert rig.query("SELECT kind, claimed_by FROM queue ORDER BY id") == [("held", None)] * 2
+
+
+def test_the_give_back_of_a_digest_lands_in_the_digests_class_not_the_first_claimed_members(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    one(rig)
+    first = held(rig, 1, level="error")[0]
+    held(rig, 2, level="warn")
+    set_rate(rig, "error", 5)
+    set_rate(rig, "other", 5)
+
+    def takeover_then_env_missing(*_a: Any, **_k: Any) -> Any:
+        with open_store(rig.gateway()) as store, store.write() as conn:
+            conn.execute("UPDATE queue SET claim_expires = ? WHERE id = ?", (NOW - 1, first))
+            assert claim_row(conn, first, Lease(NOW, 50), "other-claimant") is not None
+        return CallResult("env_missing", missing=("X",))
+
+    use_seams(monkeypatch, Seams(call=takeover_then_env_missing))
+    flush(rig)
+    assert rate(rig) == [("error", 5), ("other", 5)]
+
+
+# --- the 100-row cap ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("seeded", "dropped"), [(100, 3), (98, 1), (97, 0)])
+def test_a_digest_requeue_meets_the_100_row_cap(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, seeded: int, dropped: int
+) -> None:
+    one(rig, error={"code": "rate_limited"})
+    held(rig, 3)
+
+    def fill_then_call(*args: Any, **kwargs: Any) -> Any:
+        for _ in range(seeded):
+            seed(rig, level="action", deliver_after=NOW + 9999)
+        return call_notifier(*args, **kwargs)
+
+    use_seams(monkeypatch, Seams(call=fill_then_call))
+    code, doc, _ = flush(rig)
+    d = dest(doc)
+    assert (d["dropped"], d["queued_retry"]) == (dropped, 3 - dropped)
+    got = states(rig)[:3]
+    for i, (_id, outcome, reason, _code, attempts) in enumerate(got):
+        if i < dropped:
+            assert (outcome, reason, attempts) == ("dropped", "overflow", 1)
+        else:
+            assert (outcome, reason, attempts) == ("queued_retry", "digest", 1)
+    assert rig.query("SELECT COUNT(*) FROM queue") == [(min(100, seeded + 3 - dropped),)]
+    lines = [x["outcome"] for x in checked_log(rig) if x["record"] == "delivery"]
+    assert (lines.count("dropped"), lines.count("queued_retry")) == (dropped, 3 - dropped)

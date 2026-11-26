@@ -48,8 +48,8 @@ reading:
   handled as in ``send`` (``calling.py``, ``send.record_result``).
 - The retry schedule and surfacing are seams: ``send.Seams`` (``retry_schedule``, ``surface``;
   TODO(#25), TODO(#27)).
-- Digest (docs/design.md C-54): ``digests`` counts the digests built and claimed in the run; the
-  result counts (``sent``, ``failed``, ...) count member rows, as ``due_held`` does.
+- Digest (docs/design.md C-54): ``digests`` counts the digests built and not released unsent in the
+  run; the result counts (``sent``, ``failed``, ...) count member rows, as ``due_held`` does.
 """
 
 from __future__ import annotations
@@ -669,6 +669,7 @@ class _DigestClaim:
     token: str
     count_hour: int
     call_row: QueueRow  # what the call sends: the digest's text under the first member's ids
+    priors: dict[int, int]  # each member's attempts before the call, by delivery id
 
 
 def _claim_digest(
@@ -696,6 +697,7 @@ def _claim_digest(
         token = run.gateway.new_token()
         retry_at = run.seams.retry_schedule(dest.kind, lease.now)
         live: list[QueueRow] = []
+        priors: dict[int, int] = {}
         for row in usable:
             claimed = claim_row(conn, row.id, lease, token)
             assert claimed is not None  # inside BEGIN IMMEDIATE
@@ -709,6 +711,7 @@ def _claim_digest(
                 spent.append((claimed, prior))
             else:
                 live.append(claimed)
+                priors[claimed.delivery_id] = prior
         if len(live) >= 2:
             digest = build(live)
             count_call(conn, destination=dest.name, level=digest.level, now=lease.now)
@@ -718,7 +721,7 @@ def _claim_digest(
                 None, digest.level, first.source, None, None, lease.now, lease.now, token,
                 lease.expires,
             )  # fmt: skip
-            result = _DigestClaim(digest, token, hour_start(lease.now), sent_as)
+            result = _DigestClaim(digest, token, hour_start(lease.now), sent_as, priors)
         else:
             release_claims(conn, token, lease)
     for row, prior in spent:
@@ -757,8 +760,9 @@ def _call_digest(
     t.digests += 1  # built, claimed and not released unsent by a signal
     if isinstance(end, Escaped):
         t.called = t.acted = True
+        recorded: list[int | None] | None = None
         try:
-            with_retry(
+            recorded = with_retry(
                 run.gateway,
                 claim.call_row,
                 lambda: record_escaped_digest(store, members, claim.token),
@@ -767,9 +771,11 @@ def _call_digest(
             t.error = True
         t.unknown += len(members)
         run.say(t, "digest unknown")
-        for m in members:
-            attempts = _attempts_of(store, m)
-            run.log_row(m, outcome="unknown", reason=None, code="killed", attempts=attempts)
+        for i, m in enumerate(members):
+            new = None if recorded is None else recorded[i]
+            if new is None:  # nothing recorded (a failed write) or the claim was lost
+                new = _attempts_of(store, claim, m, 1, read=recorded is not None)
+            run.log_row(m, outcome="unknown", reason="digest", code="killed", attempts=new)
         return
     outcome: Outcome = (
         LOCK_BUSY
@@ -804,7 +810,7 @@ def _call_digest(
                 outcome=name,
                 reason=outcome.reason or "digest",
                 code=outcome.code,
-                attempts=_attempts_of(store, m),
+                attempts=_attempts_of(store, claim, m, 1 if outcome.counted else 0, read=True),
             )
             continue
         assert a.outcome is not None
@@ -824,16 +830,20 @@ def _call_digest(
     run.say(t, f"digest {outcome.outcome or 'unknown'}")
 
 
-def _attempts_of(store: Store, row: QueueRow) -> int:
-    """The attempts a delivery has now (for a log line after a result that was not recorded)."""
-    try:
-        with store.write() as conn:
-            found = conn.execute(
-                "SELECT attempts FROM deliveries WHERE id = ?", (row.delivery_id,)
-            ).fetchone()
-        return 0 if found is None else int(found[0])
-    except StoreError:
-        return 0
+def _attempts_of(
+    store: Store, claim: _DigestClaim, row: QueueRow, counted: int, *, read: bool
+) -> int:
+    """The attempts of a digest member whose result was not recorded, for its log line: what the
+    delivery has now (a read, no write transaction) when ``read`` and the row is still there,
+    else the attempts it had before the call plus ``counted``, as for a single row."""
+    if read:
+        try:
+            found = store.read("SELECT attempts FROM deliveries WHERE id = ?", (row.delivery_id,))
+        except StoreError:
+            found = []
+        if found:
+            return int(str(found[0][0]))
+    return claim.priors[row.delivery_id] + counted
 
 
 # --- one call --------------------------------------------------------------------------------

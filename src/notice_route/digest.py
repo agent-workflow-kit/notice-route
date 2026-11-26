@@ -2,9 +2,10 @@
 
 :func:`build` is pure: queue rows in, the notification out. Title ``N held notifications``; one
 line per row ``<level> <source>: <head>``, ``<head>`` being the stored title (or the rule name when
-the row has none), `` - `` and the first line of the stored message, cut together to
-:data:`HEAD_CHARS` code points; lines ordered by level from the highest, then oldest (lowest row
-id: ids are never reused and do not follow the wall clock) first; at most :data:`MAX_LINES` lines,
+the row has none), `` - `` and the first non-empty line of the stored message, cut together to
+:data:`HEAD_CHARS` code points (a cut leaves no trailing space, dangling `` -`` or U+200D); lines
+ordered by level from the highest, then oldest (lowest row id: ids are never reused and do not
+follow the wall clock) first; at most :data:`MAX_LINES` lines,
 then ``and K more``; the highest level; no link (a digest has two rows or more, and the row's link
 is kept only for exactly one row); no dedupe key.
 
@@ -19,6 +20,7 @@ import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
+from .decide import give_back
 from .gateway import Gateway
 from .outcome import Applied, Outcome, apply_outcome
 from .payload import LEVELS
@@ -56,10 +58,28 @@ class Digest:
     link: None = None
 
 
+def _first_line(message: str) -> str:
+    """The first line of ``message`` that is not blank once sanitized (empty when none is)."""
+    return next((x for x in sanitize(message, True).split("\n") if x), "")
+
+
+def _cut_head(head: str) -> str:
+    """Cut to :data:`HEAD_CHARS` code points, then drop what the cut can leave dangling: spaces,
+    the separator's ``-`` after a space, and a zero-width joiner."""
+    head = head[:HEAD_CHARS]
+    while True:
+        cut = head.rstrip(" ").removesuffix("\u200d")
+        if cut.endswith(" -"):
+            cut = cut[:-1]
+        if cut == head:
+            return head
+        head = cut
+
+
 def _line(row: QueueRow) -> str:
     name = sanitize(row.title or row.rule or "", False)
-    first = sanitize(row.message, False)
-    head = " - ".join(p for p in (name, first) if p)[:HEAD_CHARS].rstrip(" ")
+    first = _first_line(row.message)
+    head = _cut_head(" - ".join(p for p in (name, first) if p))
     source = sanitize(row.source, False)
     return f"{row.level} {source}: {head}".rstrip(" ")
 
@@ -81,7 +101,7 @@ def build(rows: Sequence[QueueRow]) -> Digest:
 # --- recording -------------------------------------------------------------------------------
 
 _ENDS = ("sent", "failed", "unknown", "disabled")
-_KEEPS_REASON = ("lock_busy", "link_refused", "keyword_refused")  # what a requeue says itself
+_KEEPS_REASON = ("lock_busy",)  # a requeue of this call that says why itself (a refusal does too)
 
 
 @dataclass(frozen=True)
@@ -111,8 +131,9 @@ def record_digest(
     its reason is ``digest``; a ``queued_retry`` that is not a refusal leaves it ``held`` and,
     for a result that counts an attempt, every member gets the schedule of the highest attempt
     count among the members that still have attempts left; the hourly count the digest took is
-    given back once, through the first member still claimed; a ``failed`` or ``unknown`` end is
-    surfaced once, for the first member (highest level, oldest) whose result was recorded."""
+    given back once, in the class of the digest's level, when at least one member was recorded;
+    a ``failed`` or ``unknown`` end is surfaced once, for the first member (highest level,
+    oldest) whose result was recorded."""
 
     def write() -> DigestResult:
         # may run twice (see ``with_retry``): ``seams.surface`` writes only through ``conn``
@@ -126,12 +147,13 @@ def record_digest(
                 and outcome.reason != "lock_busy"
             )
             if plain_retry:
-                counts = [_attempts(conn, m) + (1 if outcome.counted else 0) for m in members]
+                counts = [
+                    a + (1 if outcome.counted else 0) for a in _attempts(conn, members, token)
+                ]
                 alive = [a for a in counts if base(a) is not None]
                 later = base(max(alive)) if alive else None
                 retry_at = lambda a: None if base(a) is None else later  # noqa: E731
             applied: list[Applied] = []
-            pending: int | None = count_hour
             surfaced = False
             for m in members:
                 a = apply_outcome(
@@ -141,12 +163,10 @@ def record_digest(
                     outcome=outcome,
                     lease=lease,
                     retry_at=retry_at,
-                    count_hour=pending,
-                    requeue_kind="held",
+                    requeue_kind="held" if outcome.outcome == "queued_retry" else "single",
                 )
                 if a.applied:
-                    pending = None
-                    a = _reason_digest(conn, m, a)
+                    a = _reason_digest(conn, m, a, outcome)
                     if not surfaced and a.outcome in ("failed", "unknown"):
                         surfaced = True
                         assert a.outcome is not None
@@ -164,24 +184,40 @@ def record_digest(
                             ),
                         )
                 applied.append(a)
+            if any(a.applied for a in applied) and (
+                outcome.outcome == "deferred" or outcome.reason == "lock_busy"
+            ):  # no call was made: the digest's one count goes back, in the digest's class
+                give_back(conn, destination=dest.name, level=members[0].level, hour=count_hour)
             evicted = frozenset(e.delivery_id for a in applied for e in a.evicted)
             return DigestResult(tuple(applied), evicted)
 
     return with_retry(gateway, members[0], write)
 
 
-def _attempts(conn: sqlite3.Connection, row: QueueRow) -> int:
-    found = conn.execute(
-        "SELECT attempts FROM deliveries WHERE id = ?", (row.delivery_id,)
-    ).fetchone()
-    return int(found[0])
+def _attempts(conn: sqlite3.Connection, members: Sequence[QueueRow], token: str) -> list[int]:
+    """The attempts of the members whose claim ``token`` still holds (a lost member, or one whose
+    rows are gone, is left out: nothing is recorded for it)."""
+    out: list[int] = []
+    for m in members:
+        found = conn.execute(
+            "SELECT d.attempts FROM queue q JOIN deliveries d ON d.id = q.delivery_id"
+            " WHERE q.id = ? AND q.claimed_by = ?",
+            (m.id, token),
+        ).fetchone()
+        if found is not None:
+            out.append(int(found[0]))
+    return out
 
 
-def _reason_digest(conn: sqlite3.Connection, row: QueueRow, a: Applied) -> Applied:
+def _reason_digest(
+    conn: sqlite3.Connection, row: QueueRow, a: Applied, outcome: Outcome
+) -> Applied:
     """A member that ended, or went back to be retried, because of the digest has reason
-    ``digest``. A requeue that says why itself (``lock_busy``, a refusal) and a row the cap dropped
-    keep their own."""
-    ends = a.outcome in _ENDS or (a.outcome == "queued_retry" and a.reason not in _KEEPS_REASON)
+    ``digest``. A requeue that says why itself (this call's ``lock_busy`` or refusal) and a row
+    the cap dropped keep their own; the decision is on this call's result, not on the reason the
+    row had stored."""
+    says_itself = outcome.reason in _KEEPS_REASON or outcome.refusal is not None
+    ends = a.outcome in _ENDS or (a.outcome == "queued_retry" and not says_itself)
     if not ends:
         return a
     conn.execute(
@@ -191,18 +227,27 @@ def _reason_digest(conn: sqlite3.Connection, row: QueueRow, a: Applied) -> Appli
     return replace(a, reason="digest")
 
 
-def record_escaped_digest(store: Store, members: Sequence[QueueRow], token: str) -> list[bool]:
-    """An exception escaped the call: every member is ``unknown``/``killed`` with one more attempt
-    and stays claimed (it lapses and ``flush`` resends: at least once). One transaction; a member
-    whose claim is gone is skipped (``False``)."""
-    out: list[bool] = []
+def record_escaped_digest(
+    store: Store, members: Sequence[QueueRow], token: str
+) -> list[int | None]:
+    """An exception escaped the call: every member is ``unknown``/``killed``, reason ``digest``,
+    with one more attempt and stays claimed (it lapses and ``flush`` resends: at least once). One
+    transaction; the result is each member's new attempts, or ``None`` for a member whose claim is
+    gone (skipped)."""
+    out: list[int | None] = []
     with store.write() as conn:
         for m in members:
             cur = conn.execute(
-                "UPDATE deliveries SET outcome = 'unknown', code = 'killed',"
+                "UPDATE deliveries SET outcome = 'unknown', code = 'killed', reason = 'digest',"
                 " attempts = attempts + 1, deliver_after = NULL WHERE id = ? AND EXISTS"
                 " (SELECT 1 FROM queue WHERE id = ? AND claimed_by = ?)",
                 (m.delivery_id, m.id, token),
             )
-            out.append(cur.rowcount == 1)
+            if cur.rowcount != 1:
+                out.append(None)
+                continue
+            row = conn.execute(
+                "SELECT attempts FROM deliveries WHERE id = ?", (m.delivery_id,)
+            ).fetchone()
+            out.append(int(row[0]))
     return out

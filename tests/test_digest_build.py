@@ -138,9 +138,24 @@ def test_placeholder_text_in_a_row_stays_literal() -> None:
     assert d.message.splitlines()[0] == "warn {{hook}}: {{source}} - {{labels.x}} {{message}}"
 
 
-def test_a_message_that_is_blank_on_its_first_line_leaves_only_the_title() -> None:
-    d = build([row(1, title="Only", message="\nsecond"), row(2)])
+def test_a_message_with_leading_blank_lines_uses_its_first_non_empty_line() -> None:
+    d = build([row(1, title="Only", message="\n \t\nsecond\nthird"), row(2)])
+    assert d.message.splitlines()[0] == "warn s: Only - second"
+
+
+def test_a_message_with_no_text_at_all_leaves_only_the_title() -> None:
+    d = build([row(1, title="Only", message="\n \n"), row(2)])
     assert d.message.splitlines()[0] == "warn s: Only"
+
+
+def test_a_cut_that_leaves_the_separator_dangling_drops_it() -> None:
+    d = build([row(1, title="a" * 117, message="mm"), row(2)])
+    assert d.message.splitlines()[0] == "warn s: " + "a" * 117
+
+
+def test_a_cut_that_ends_on_a_zero_width_joiner_drops_it() -> None:
+    d = build([row(1, title="a" * 119 + "\u200d", message="mm"), row(2)])
+    assert d.message.splitlines()[0] == "warn s: " + "a" * 119
 
 
 def test_a_hostile_long_source_cannot_push_the_message_past_4000_code_points() -> None:
