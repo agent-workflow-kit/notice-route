@@ -1,6 +1,6 @@
 # notice-route: interface
 
-Status: 0.1.0-design, 2026-11-17. Written before implementation (architecture section 18.1). This document is the single normative source for notice-route's rules; `docs/design.md`, the README and the architecture link to its headings and do not restate them.
+Status: implemented. The interface was written before the code (architecture section 18.1), and the code now follows it. See [CHANGELOG.md](../CHANGELOG.md) for the version history. This document is the single normative source for notice-route's rules; `docs/design.md`, the README and the architecture link to its headings and do not restate them.
 
 notice-route routes one notification at a time to channel notifiers (slack-notice, ha-notice, wsl-notice, or any command with the same call shape) by source, labels, level and time. It decides what is sent, to whom, when and how often. It keeps a private database for the queue of held and single rows, the duplicate checks and `history`. It runs one hook, `post-fail`, from `flush`.
 
