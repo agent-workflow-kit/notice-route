@@ -569,6 +569,13 @@ def test_a_slow_read_does_not_use_up_the_write_timeout(
     assert rig.crontab.kinds() == ["list", "list", "write"]
 
 
+def test_a_slow_crontab_still_installs_under_the_full_timeout(rig: Rig) -> None:
+    """The fake's ``slow`` behavior only delays: the call then works as usual."""
+    rig.crontab.behave(slow="list", slow_s=0.3)
+    assert rig.run("install")[0] == 0
+    assert rig.crontab.table() == block_of(rig)
+
+
 def test_a_write_that_hangs_or_overflows_says_it_may_have_changed(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
