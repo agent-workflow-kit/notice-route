@@ -71,6 +71,7 @@ REASONS = (
     "digest",
     "link_refused",
     "keyword_refused",
+    "manual",
 )
 
 SOURCE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")

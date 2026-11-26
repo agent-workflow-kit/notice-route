@@ -31,6 +31,8 @@ Specified in [docs/interface.md](docs/interface.md#commands).
 - `notice-route flush`: deliver held and single rows and run the `post-fail` hook (run from cron)
 - `notice-route history --json`: what was sent, deferred, dropped or failed
 - `notice-route validate [--probe]`: check the config offline, optionally ask each notifier to validate itself
+- `notice-route queue list|show|drop`: inspect the queue and end one row by hand (never a row with a live claim)
+- `notice-route destination list|enable|disable`: show destinations and switch one off and on without editing the config (an override in `state.db`; it cannot enable what the config disables)
 - `notice-route prune`, `notice-route cron install|uninstall`
 
 ## Exit codes

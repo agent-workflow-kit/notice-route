@@ -41,6 +41,13 @@ from .history import (
     parse_since,
     run_history,
 )
+from .manage import (
+    DEFAULT_LIMIT as QUEUE_DEFAULT_LIMIT,
+)
+from .manage import (
+    MAX_LIMIT as QUEUE_MAX_LIMIT,
+)
+from .manage import destination_list, run_drop, run_list, run_set, run_show
 from .payload import InputFlags, PayloadError, UsageError, load_notification
 from .probe import run_probes
 from .prune import PruneOptions, run_prune
@@ -190,6 +197,61 @@ def build_parser() -> argparse.ArgumentParser:
         action = cron_actions.add_parser(name, help=text, allow_abbrev=False)
         _add_global_flags(action, top=False)
         action.add_argument("--dry-run", action="store_true", help="show; change nothing")
+        action.add_argument(
+            "--config", metavar="PATH", default=argparse.SUPPRESS, help=argparse.SUPPRESS
+        )
+
+    queue = commands.add_parser("queue", help="list, show and drop queue rows", allow_abbrev=False)
+    _add_global_flags(queue, top=False)
+    queue.add_argument(
+        "--config", metavar="PATH", default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
+    queue_actions = queue.add_subparsers(dest="queue_action", metavar="<action>", required=True)
+    queue_list = queue_actions.add_parser("list", help="list queue rows by id", allow_abbrev=False)
+    _add_global_flags(queue_list, top=False)
+    for flag, meta in (("--destination", "NAME"), ("--kind", "held|single"), ("--limit", "N")):
+        queue_list.add_argument(flag, action="append", default=[], metavar=meta)
+    queue_show = queue_actions.add_parser("show", help="show one queue row", allow_abbrev=False)
+    _add_global_flags(queue_show, top=False)
+    queue_show.add_argument("id", metavar="ID")
+    queue_drop = queue_actions.add_parser(
+        "drop", help="end one queue row by hand (never one with a live claim)", allow_abbrev=False
+    )
+    _add_global_flags(queue_drop, top=False)
+    queue_drop.add_argument("id", metavar="ID")
+    queue_drop.add_argument("--dry-run", action="store_true", help="show; change nothing")
+    _add_audit_flags(queue_drop)
+    for action in (queue_list, queue_show, queue_drop):
+        action.add_argument(
+            "--config", metavar="PATH", default=argparse.SUPPRESS, help=argparse.SUPPRESS
+        )
+
+    destination = commands.add_parser(
+        "destination", help="list, enable and disable destinations", allow_abbrev=False
+    )
+    _add_global_flags(destination, top=False)
+    destination.add_argument(
+        "--config", metavar="PATH", default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
+    destination_actions = destination.add_subparsers(
+        dest="destination_action", metavar="<action>", required=True
+    )
+    destination_list_parser = destination_actions.add_parser(
+        "list", help="list the destinations and their overrides", allow_abbrev=False
+    )
+    _add_global_flags(destination_list_parser, top=False)
+    destination_list_parser.add_argument(
+        "--config", metavar="PATH", default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
+    for name, text in (
+        ("enable", "clear an operator's disable (never enables what the config disables)"),
+        ("disable", "disable a destination without editing the config"),
+    ):
+        action = destination_actions.add_parser(name, help=text, allow_abbrev=False)
+        _add_global_flags(action, top=False)
+        action.add_argument("name", metavar="NAME")
+        action.add_argument("--dry-run", action="store_true", help="show; change nothing")
+        _add_audit_flags(action)
         action.add_argument(
             "--config", metavar="PATH", default=argparse.SUPPRESS, help=argparse.SUPPRESS
         )
@@ -681,6 +743,174 @@ def _run_cron(args: argparse.Namespace, gateway: Gateway) -> int:
     return EXIT_OK
 
 
+# --- queue and destination ----------------------------------------------------------------------
+
+_ROW_ID = re.compile(r"[1-9][0-9]{0,18}")
+
+
+def _row_id(text: str) -> int:
+    """A queue row id: a whole number from 1 to 9223372036854775807, else exit 2 (never echoed)."""
+    if not _ROW_ID.fullmatch(text) or int(text) > (1 << 63) - 1:
+        raise UsageError("id")
+    return int(text)
+
+
+def _destination_name(text: str) -> str:
+    if not DESTINATION.fullmatch(text):
+        raise UsageError("name")
+    return text
+
+
+def _once(args: argparse.Namespace, name: str) -> str | None:
+    given: list[str] = getattr(args, name)
+    if len(given) > 1:
+        raise UsageError("filter")
+    return given[0] if given else None
+
+
+def _queue_line(row: dict[str, Any]) -> str:
+    """One row for a terminal: every field but the title is within a closed grammar; the title is
+    untrusted text, cut, quoted and escaped as for ``history``."""
+
+    def show(value: object) -> str:
+        return "-" if value is None else str(value)
+
+    title = "" if row["title"] is None else ' "' + _safe(row["title"]).replace('"', '\\"') + '"'
+    return (
+        _safe(
+            f"{row['id']} {row['destination']} {row['kind']} {row['level']} source={row['source']}"
+            f" rule={show(row['rule'])} deliver_after={row['deliver_after']}"
+            f" attempts={row['attempts']} claim={row['claim']} reason={show(row['reason'])}"
+        )
+        + title
+    )
+
+
+def _queue_show_text(row: dict[str, Any]) -> None:
+    for key in (
+        "id", "delivery_id", "destination", "kind", "level", "source", "rule", "deliver_after",
+        "created_at", "attempts", "reason", "claim", "claim_expires",
+    ):  # fmt: skip
+        value = "-" if row[key] is None else row[key]
+        _out(_safe(f"{key}: {value}") + "\n")
+    title = "-" if row["title"] is None else '"' + _safe(row["title"]).replace('"', '\\"') + '"'
+    _out(f"title: {title}\n")
+
+
+def _warn_lines(gateway: Gateway, warnings: Sequence[str]) -> None:
+    for text in warnings:
+        _guarded(gateway, "err", lambda text=text: _err(f"{PROG}: warning: {_safe(text)}\n"))
+
+
+def _run_queue(args: argparse.Namespace, gateway: Gateway) -> int:
+    action = args.queue_action
+    if action == "list":
+        destination, kind, limit = (_once(args, n) for n in ("destination", "kind", "limit"))
+        if destination is not None and not DESTINATION.fullmatch(destination):
+            raise UsageError("filter")
+        if kind is not None and kind not in ("held", "single"):
+            raise UsageError("filter")
+        rows_limit = QUEUE_DEFAULT_LIMIT
+        if limit is not None:
+            if not _LIMIT.fullmatch(limit) or int(limit) > QUEUE_MAX_LIMIT:
+                raise UsageError("limit")
+            rows_limit = int(limit)
+        config = load_valid_config(gateway, None)
+        result = run_list(gateway, config, destination=destination, kind=kind, limit=rows_limit)
+        if args.json:
+            _json(result.rows)
+        else:
+            for row in result.rows:
+                _out(_queue_line(row) + "\n")
+        if result.skipped and not args.quiet:
+            _err(f"{PROG}: warning: {result.skipped} unreadable queue rows left out\n")
+        return EXIT_OK
+    row_id = _row_id(args.id)
+    if action == "show":
+        config = load_valid_config(gateway, None)
+        code, doc = run_show(gateway, config, row_id)
+        if args.json:
+            _json(doc)
+        elif doc["row"] is not None:
+            _queue_show_text(doc["row"])
+        else:
+            _out("no_op: not_found\n")
+        return code
+    actor, decision_id = _audit(args, gateway)
+    if gateway.env_present("NOTICE_ROUTE_HOOK"):
+        raise PayloadError("hook_recursion")
+    config = load_valid_config(gateway, None)
+    dropped = run_drop(
+        gateway, config, row_id, dry_run=args.dry_run, actor=actor, decision_id=decision_id
+    )
+    doc = dropped.document
+    _warn_lines(gateway, dropped.warnings)
+    if args.json:
+        _json(doc)
+    elif not args.quiet:
+        if doc["outcome"] == "ok":
+            verb = "would drop" if doc["dry_run"] else "dropped"
+            _out(_safe(f"{verb} {doc['id']} ({doc['destination'] or '-'})") + "\n")
+        else:
+            _out(f"no_op: {doc['reason']}\n")
+    return dropped.exit_code
+
+
+def _destination_text(doc: dict[str, Any]) -> None:
+    for d in doc["destinations"]:
+        line = (
+            f"{d['name']} {d['kind']} config_enabled={str(d['config_enabled']).lower()}"
+            f" override={d['override'] or 'none'} enabled={str(d['enabled']).lower()}"
+        )
+        if d["override"] is not None:
+            line += f" by={d['override_actor'] or '-'} at={d['override_set_at'] or '-'}"
+        _out(_safe(line) + "\n")
+
+
+def _run_destination(args: argparse.Namespace, gateway: Gateway) -> int:
+    action = args.destination_action
+    if action == "list":
+        config = load_valid_config(gateway, None)
+        code, doc = destination_list(gateway, config)
+        if args.json:
+            _json(doc)
+        else:
+            _destination_text(doc)
+        if config is None and not args.quiet:
+            _err(f"{PROG}: no config\n")
+        return code
+    name = _destination_name(args.name)
+    actor, decision_id = _audit(args, gateway)
+    if gateway.env_present("NOTICE_ROUTE_HOOK"):
+        raise PayloadError("hook_recursion")
+    config = load_valid_config(gateway, None)
+    result = run_set(
+        gateway,
+        config,
+        action,
+        name,
+        dry_run=args.dry_run,
+        actor=actor,
+        decision_id=decision_id,
+    )
+    doc = result.document
+    _warn_lines(gateway, result.warnings)
+    if args.json:
+        _json(doc)
+    elif not args.quiet:
+        if doc["outcome"] == "ok":
+            _out(
+                f"{doc['action']} {doc['destination']}"
+                + (" (dry run)" if doc["dry_run"] else "")
+                + "\n"
+            )
+        else:
+            _out(f"no_op {doc['destination']}: {doc['reason']}\n")
+    if doc["reason"] == "unconfigured" and not args.quiet:
+        _err(f"{PROG}: no config\n")
+    return result.exit_code
+
+
 def _guarded(gateway: Gateway, stream: str, write: Callable[[], None]) -> None:
     """One write after the send is done: a failure changes nothing (the exit code is the
     result's), and the stream is pointed at the null device so its buffered text cannot fail
@@ -802,6 +1032,10 @@ def _main(argv: Sequence[str] | None, gateway: Gateway | None) -> int:
             return _run_prune(args, gateway)
         if args.command == "history":
             return _run_history(args, gateway)
+        if args.command == "queue":
+            return _run_queue(args, gateway)
+        if args.command == "destination":
+            return _run_destination(args, gateway)
         if args.command == "cron":
             return _run_cron(args, gateway)
         return _run_validate(args, gateway)
@@ -816,7 +1050,16 @@ def _main(argv: Sequence[str] | None, gateway: Gateway | None) -> int:
     except (StateError, StoreError) as exc:
         # a prune that ran out of lock waits says so (a cron line is then worth a rerun)
         busy = args.command == "prune" and isinstance(exc, StoreError) and exc.reason == "busy"
-        message = "state database is busy" if busy else "state database cannot be read"
+        older = isinstance(exc, StoreError) and exc.reason == "older"
+        if busy:
+            message = "state database is busy"
+        elif older:
+            message = (
+                "state database needs a migration by a writing command "
+                "(send, flush, prune, destination disable)"
+            )
+        else:
+            message = "state database cannot be read"
         _error("internal", message, None, as_json=args.json)
         return EXIT_INTERNAL
     except _OutputClosed:

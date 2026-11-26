@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "notice-route/cli/queue-list.json",
+  "title": "queue list --json output",
+  "description": "A list of queue rows, lowest id first, at most 1000. Exit 0; empty with no state.db. A row with a column outside its grammar is left out and counted in one stderr warning.",
+  "type": "array",
+  "maxItems": 1000,
+  "items": {
+    "$ref": "../defs.json#/$defs/queue_row"
+  }
+}

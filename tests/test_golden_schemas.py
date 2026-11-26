@@ -13,8 +13,14 @@ from tests.test_cli_rules_validate import schema_errors
 GOLDEN = Path(__file__).resolve().parent / "golden"
 # golden directory -> schema under schemas/cli/ (``cron`` holds crontab text, not JSON).
 SCHEMA_OF = {
+    "destination_disable": "destination-disable.json",
+    "destination_enable": "destination-enable.json",
+    "destination_list": "destination-list.json",
     "flush": "flush.json",
     "history": "history.json",
+    "queue_drop": "queue-drop.json",
+    "queue_list": "queue-list.json",
+    "queue_show": "queue-show.json",
     "send": "send.json",
     "validate_probe": "validate.json",
 }

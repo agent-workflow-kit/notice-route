@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "notice-route/cli/queue-drop.json",
+  "title": "queue drop --json output",
+  "description": "Exit 0 (ok: the row was dropped, or with dry_run would be) or 22 (no_op, reason not_found). A row with a live claim is exit 20, reason claimed, and prints the error envelope (cli/error.json). destination is null when the stored value is outside its grammar.",
+  "type": "object",
+  "properties": {
+    "outcome": {
+      "enum": [
+        "ok",
+        "no_op"
+      ]
+    },
+    "dry_run": {
+      "type": "boolean"
+    },
+    "id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "reason": {
+      "enum": [
+        "not_found",
+        null
+      ]
+    },
+    "destination": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/destination_name"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "delivery_id": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "outcome",
+    "dry_run",
+    "id",
+    "reason",
+    "destination",
+    "delivery_id"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "ok"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "reason": {
+            "type": "null"
+          },
+          "delivery_id": {
+            "type": "integer"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "reason": {
+            "const": "not_found"
+          },
+          "destination": {
+            "type": "null"
+          },
+          "delivery_id": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ]
+}

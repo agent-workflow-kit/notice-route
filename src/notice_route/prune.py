@@ -44,6 +44,7 @@ from . import log as logmod
 from .decide import instant
 from .gateway import Gateway, UnsafePathError
 from .history import DESTINATION, LEVELS, SOURCE
+from .overrides import disabled_among
 from .queue import EXPIRY_S, Expired, Lease, count_expirable, expire_unclaimed
 from .report import worst_case_s
 from .send import Seams, SurfaceEvent
@@ -380,11 +381,15 @@ def _expire_batch(
                 finally:
                     conn.text_factory = str
                 expired = tuple(_clean(e) for e in found)
+                # an operator's ``destination disable`` counts as ``enabled: false`` here too
+                disabled = (
+                    frozenset() if config is None else disabled_among(conn, config.destinations)
+                )
                 # a row that is no failure alert takes the hour's slot first
                 for e in sorted(expired, key=lambda x: x.source == ALERT_SOURCE):
                     # surfaced only for a destination that is configured and enabled (Hooks).
                     dest = None if config is None else config.destinations.get(e.destination)
-                    if dest is not None and dest.enabled:
+                    if dest is not None and dest.enabled and dest.name not in disabled:
                         seams.surface(
                             conn,
                             SurfaceEvent(

@@ -1,0 +1,31 @@
+{
+  "destinations": [
+    {
+      "name": "chat",
+      "kind": "slack-notice",
+      "config_enabled": true,
+      "override": null,
+      "enabled": true,
+      "override_actor": null,
+      "override_set_at": null
+    },
+    {
+      "name": "other",
+      "kind": "slack-notice",
+      "config_enabled": true,
+      "override": null,
+      "enabled": true,
+      "override_actor": null,
+      "override_set_at": null
+    },
+    {
+      "name": "off",
+      "kind": "slack-notice",
+      "config_enabled": false,
+      "override": null,
+      "enabled": false,
+      "override_actor": null,
+      "override_set_at": null
+    }
+  ]
+}

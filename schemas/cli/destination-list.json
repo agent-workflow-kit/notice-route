@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "notice-route/cli/destination-list.json",
+  "title": "destination list --json output",
+  "description": "Exit 0, or 22 with an empty list when there is no config or no destination. One entry per configured destination, in config order. enabled is the effective state: config_enabled and no override.",
+  "type": "object",
+  "properties": {
+    "destinations": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "$ref": "../defs.json#/$defs/destination_name"
+          },
+          "kind": {
+            "$ref": "../defs.json#/$defs/destination_kind"
+          },
+          "config_enabled": {
+            "type": "boolean"
+          },
+          "override": {
+            "enum": [
+              "disabled",
+              null
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "override_actor": {
+            "oneOf": [
+              {
+                "$ref": "../defs.json#/$defs/actor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "override_set_at": {
+            "oneOf": [
+              {
+                "$ref": "../defs.json#/$defs/epoch_seconds"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "kind",
+          "config_enabled",
+          "override",
+          "enabled",
+          "override_actor",
+          "override_set_at"
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "override": {
+                  "const": "disabled"
+                }
+              },
+              "required": [
+                "override"
+              ]
+            },
+            "then": {
+              "properties": {
+                "enabled": {
+                  "const": false
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "override": {
+                  "type": "null"
+                }
+              },
+              "required": [
+                "override"
+              ]
+            },
+            "then": {
+              "properties": {
+                "override_actor": {
+                  "type": "null"
+                },
+                "override_set_at": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "destinations"
+  ]
+}

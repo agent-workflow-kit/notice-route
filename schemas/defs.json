@@ -188,9 +188,10 @@
         "no_rule",
         "digest",
         "link_refused",
-        "keyword_refused"
+        "keyword_refused",
+        "manual"
       ],
-      "description": "The closed reasons of history rows."
+      "description": "The closed reasons of history rows. manual: a queue row ended by queue drop."
     },
     "destination_reason": {
       "enum": [
@@ -205,6 +206,7 @@
         "digest",
         "link_refused",
         "keyword_refused",
+        "manual",
         "redelivered",
         "repeat"
       ],
@@ -224,7 +226,7 @@
         "disabled",
         "rule_drop"
       ],
-      "description": "Why no destination was called at the top level of send and test: unconfigured, no_rule, all_disabled, disabled (exit 22) or rule_drop (exit 0). all_disabled is decided before any call: every selected destination has enabled false in the router's config."
+      "description": "Why no destination was called at the top level of send and test: unconfigured, no_rule, all_disabled, disabled (exit 22) or rule_drop (exit 0). all_disabled is decided before any call: every selected destination is disabled, by enabled false in the router's config or by an override (destination disable)."
     },
     "error_code": {
       "enum": [
@@ -241,9 +243,10 @@
         "payload_unrecognized",
         "source_mismatch",
         "payload_invalid",
-        "hook_recursion"
+        "hook_recursion",
+        "claimed"
       ],
-      "description": "On exit 20 (code refused)."
+      "description": "On exit 20 (code refused). claimed: queue drop of a row with a live claim."
     },
     "error_details": {
       "type": [
@@ -550,6 +553,119 @@
       ],
       "additionalProperties": false,
       "description": "A channel notice: only title, message, level and link; message is required. A pass-through rule sends its title and message; its link is never sent."
+    },
+    "claim_state": {
+      "enum": [
+        "live",
+        "lapsed",
+        "none"
+      ],
+      "description": "live: the one lease predicate says the row is claimed; lapsed: a claim is recorded (a released one included) but the predicate says it is not live (expired, missing claimant or expiry, an expiry beyond now plus the lease length); none: no claim is recorded (never claimed, or the claim was cleared by a retry). A released claim is recorded, so it reads lapsed."
+    },
+    "queue_row": {
+      "type": "object",
+      "description": "One queue row as queue list and queue show print it. Never the message, the link or the claimant token. Every column is checked against its grammar before it is printed; a row that fails is left out.",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "delivery_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "destination": {
+          "$ref": "#/$defs/destination_name"
+        },
+        "kind": {
+          "enum": [
+            "held",
+            "single"
+          ]
+        },
+        "level": {
+          "$ref": "#/$defs/level"
+        },
+        "source": {
+          "$ref": "#/$defs/source_name",
+          "x-untrusted": true
+        },
+        "rule": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/rule_name"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "title": {
+          "oneOf": [
+            {
+              "type": "string",
+              "maxLength": 100
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-untrusted": true,
+          "description": "The stored rendered title cut to 100 characters, or null. Untrusted text: escaped by the printers."
+        },
+        "deliver_after": {
+          "$ref": "#/$defs/epoch_seconds"
+        },
+        "created_at": {
+          "$ref": "#/$defs/epoch_seconds"
+        },
+        "attempts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reason": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/history_reason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The stored reason of the row's delivery."
+        },
+        "claim": {
+          "$ref": "#/$defs/claim_state"
+        },
+        "claim_expires": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/epoch_seconds"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The recorded expiry of a live or lapsed claim, else null."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "delivery_id",
+        "destination",
+        "kind",
+        "level",
+        "source",
+        "rule",
+        "title",
+        "deliver_after",
+        "created_at",
+        "attempts",
+        "reason",
+        "claim",
+        "claim_expires"
+      ]
     }
   }
 }

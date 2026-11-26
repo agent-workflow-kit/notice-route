@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "notice-route/cli/queue-show.json",
+  "title": "queue show --json output",
+  "description": "Exit 0 (ok, row set) or 22 (no_op, reason not_found, row null).",
+  "type": "object",
+  "properties": {
+    "outcome": {
+      "enum": [
+        "ok",
+        "no_op"
+      ]
+    },
+    "reason": {
+      "enum": [
+        "not_found",
+        null
+      ]
+    },
+    "row": {
+      "oneOf": [
+        {
+          "$ref": "../defs.json#/$defs/queue_row"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "outcome",
+    "reason",
+    "row"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "ok"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "properties": {
+          "reason": {
+            "type": "null"
+          },
+          "row": {
+            "type": "object"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "reason": {
+            "const": "not_found"
+          },
+          "row": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ]
+}

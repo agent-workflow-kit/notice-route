@@ -71,6 +71,7 @@ from .digest import Digest, build, record_digest, record_escaped_digest
 from .gateway import DirHandle, Gateway, SignalTrap
 from .hooks import run_hook, start_detached
 from .outcome import LOCK_BUSY, Applied, Outcome, classify, record_escaped
+from .overrides import disabled_among
 from .payload import LEVELS, UsageError
 from .queue import (
     EXPIRY_S,
@@ -181,6 +182,9 @@ class _Run:
     state: DirHandle | None = None
     writer: logmod.LogWriter | None = None
     log_lock: threading.Lock = field(default_factory=threading.Lock)
+    # destinations an operator disabled (``destination disable``), read once when the run starts;
+    # every claim transaction asks again
+    overrides: frozenset[str] = frozenset()
 
     def cancelled(self) -> bool:
         """Asked while a send-lock wait is going: a trapped signal ends the wait."""
@@ -305,6 +309,7 @@ def run_flush(
     wall = instant(gateway.wall())
     with open_store(gateway) as store, gateway.open_state_dir() as state:
         run.state = state
+        run.overrides = disabled_among(store.conn, config.destinations)
         run.writer = logmod.LogWriter(gateway, state if config.log else None)
         if full:
             _meta(store, "flush_last", wall)
@@ -484,7 +489,7 @@ def _log_summary(run: _Run, tallies: list[_Tally]) -> None:
 
 def _skip_reason(run: _Run, dest: Destination, t: _Tally) -> bool:
     """Steps 1 and 2: ``True`` when the destination is skipped."""
-    if not dest.enabled:
+    if not dest.enabled or dest.name in run.overrides:
         t.state = "disabled"
         return True
     if env_unset(dest.env, run.gateway.environ()):
@@ -501,6 +506,8 @@ def _dry_run(run: _Run, selected: list[Destination]) -> list[_Tally]:
     """Lists what is due and changes nothing (``state.db`` is opened read-only)."""
     tallies: list[_Tally] = []
     with _read_only(run.gateway) as store:
+        if store is not None:
+            run.overrides = disabled_among(store.conn, run.config.destinations)
         for dest in selected:
             t = _Tally(dest.name)
             tallies.append(t)
@@ -694,6 +701,8 @@ def _claim(
     claim: _Claim | None = None
     with store.write() as conn:
         lease = Lease.at(run.gateway.wall(), run.worst)
+        if disabled_among(conn, (dest.name,)):  # disabled since the run began: no further claim
+            return None
         after = max(skipped, default=0)  # rows are read in id order: step past the skipped ones
         while True:
             rows = due_rows(conn, dest.name, lease, kind=kind, limit=1, after_id=after)  # type: ignore[arg-type]
@@ -820,6 +829,8 @@ def _claim_digest(
     result: _DigestClaim | None = None
     with store.write() as conn:
         lease = Lease.at(run.gateway.wall(), run.worst)
+        if disabled_among(conn, (dest.name,)):  # disabled since the run began: no further claim
+            return None
         usable: list[QueueRow] = []
         for row in due_rows(conn, dest.name, lease, kind="held"):
             if row.level in LEVELS:

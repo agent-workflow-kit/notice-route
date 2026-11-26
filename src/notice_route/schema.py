@@ -22,8 +22,18 @@ APPLICATION_ID = 0x4E525445
 Step = str | Callable[[sqlite3.Connection], None]
 Migration = Sequence[Step]
 
-# Tables ``read_state`` and the store rely on at version 1.
-TABLES = ("deliveries", "queue", "dedup", "event_ids", "surfaced", "rate", "meta")
+# Tables the store relies on (``_check_tables``): the seven of version 1 and the override table of
+# version 2.
+TABLES = (
+    "deliveries",
+    "queue",
+    "dedup",
+    "event_ids",
+    "surfaced",
+    "rate",
+    "meta",
+    "destination_overrides",
+)
 
 _V1: tuple[str, ...] = (
     """
@@ -133,5 +143,22 @@ _V1: tuple[str, ...] = (
     "INSERT INTO meta (key, value) VALUES ('flush_last', NULL), ('flush_env_missing', NULL)",
 )
 
-MIGRATIONS: tuple[Migration, ...] = (_V1,)
+# Version 2 (docs/design.md C-61): operator overrides of a destination. A row means "disabled by an
+# operator"; ``enable`` deletes it, so the router never enables what the config disables. ``value``
+# is a single word today and is checked, so a later version can add words without a rebuild.
+# ``actor`` and ``decision_id`` are the ``--actor`` and ``--decision-id`` of the command that set
+# it.
+_V2: tuple[str, ...] = (
+    """
+    CREATE TABLE destination_overrides (
+        destination TEXT PRIMARY KEY,
+        value TEXT NOT NULL CHECK (value = 'disabled'),
+        actor TEXT NOT NULL,
+        decision_id TEXT,
+        set_at INTEGER NOT NULL
+    ) WITHOUT ROWID
+    """,
+)
+
+MIGRATIONS: tuple[Migration, ...] = (_V1, _V2)
 SCHEMA_VERSION = len(MIGRATIONS)

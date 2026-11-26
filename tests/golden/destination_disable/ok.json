@@ -1,0 +1,10 @@
+{
+  "outcome": "ok",
+  "dry_run": false,
+  "destination": "chat",
+  "action": "disabled",
+  "reason": null,
+  "config_enabled": true,
+  "override": "disabled",
+  "enabled": false
+}
