@@ -280,8 +280,8 @@ def apply_outcome(
 ) -> Applied:
     """Record ``outcome`` for the claimed ``row`` inside a ``Store.write`` transaction.
 
-    ``retry_at(attempts)`` is the retry schedule (:mod:`notice_route.retry`): the ``deliver_after`` of a retry after
-    ``attempts`` calls (refusal retries included), or None when the attempts are used up (the row
+    ``retry_at(attempts)`` is the retry schedule (:mod:`notice_route.retry`): the ``deliver_after``
+    of a retry after ``attempts`` calls (refusal retries included), or None when the attempts are used up (the row
     then ends ``failed``, code ``retries_exhausted``, unless a second or uncurable refusal ended it
     first with the refusal code). ``count_hour`` is the UTC hour start in which the hourly count of
     this call was taken; when given and no call was made (``env_missing``, ``lock_busy``) the

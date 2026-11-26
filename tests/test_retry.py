@@ -39,7 +39,7 @@ def test_every_attempt_beyond_the_cap_is_exhausted_even_a_huge_one(kind: str) ->
 
 @pytest.mark.parametrize("kind", ["slack-notice", "wsl-notice"])
 def test_each_attempt_with_a_step_has_one_and_the_rest_none(kind: str) -> None:
-    """flush asks ``at(n)`` for n >= 1 to tell an exhausted claimed row: None exactly from the cap."""
+    """flush asks ``at(n)``, n >= 1, to tell an exhausted claimed row: None from the cap on."""
     cap = retry.attempt_cap(kind)
     at = retry.retry_schedule(kind, NOW)
     assert [at(a) is not None for a in range(1, cap + 3)] == [True] * (cap - 1) + [False] * 3
