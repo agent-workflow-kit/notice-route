@@ -192,7 +192,7 @@ A `send` makes at most one call per destination. Counted from the end of its inp
 
 ### `send`
 
-`notice-route send [--stdin-json | --file <path|->] [--title <t>] [--message <m>] [--source <name>] [--label <k=v>]... [--dry-run]`
+`notice-route send [--stdin-json | --file <path|->] [--title <t>] [--message <m>] [--source <name>] [--label <k=v>]... [--dry-run] [--exit-zero-on-noop]`
 
 Routes one notification. In order:
 
@@ -297,6 +297,8 @@ Failure alerts: the router routes the `post-fail` payload through its rules as a
 `send` and `flush` refuse with exit 20 and reason `hook_recursion` whenever `NOTICE_ROUTE_HOOK` is present in their own environment (`flush` checks it before it reads the config). Any process started from a `post-fail` hook, including a producer whose own hook calls `send`, is refused with `hook_recursion`.
 
 ## Calling from automation
+
+`--exit-zero-on-noop` (a `send` flag only, so `send --dry-run` takes it and `test` and every other command refuse it as exit 2 `usage`) maps exit 22 to exit 0, for a caller such as a hook runner that knows only zero and non-zero. It changes that one mapping and nothing else: the stdout document (`outcome` `no_op`, the same `reason`), stderr, the history and the log are what a run without it produces, and exits 1, 2, 12, 20 and 128+N are unchanged. It covers exactly the exit 22 of `send` and `send --dry-run`: `unconfigured`, `disabled`, `no_rule` and `all_disabled`. A `rule_drop` and a notifier's own exit 22 recorded as `disabled` already exit 0. The flag is additive (a new optional flag; a call without it behaves as before).
 
 Wire a producer's hook to the router with one line, for example `notice-route send --source agent-spawn --stdin-json` on a `post-escalate` hook. A permission profile of a sandboxed session must not allow `notice-route send` or any notifier, and must deny writes to every path the router runs, sources or passes with `--config`: `~/.config/notice-route/`, `~/.local/state/notice-route/`, the router and notifier executables with their interpreters and package directories, each destination's notifier config, `cron.env_file` and the crontab. `send` writes the state directory, and a process that can write it can queue any text, link and level for `flush` to deliver with the credentials; the other paths run, or are read, with the same credentials. A session's events reach the router through its producers' hooks (agent-spawn, claude-session), which run outside the session. Any other caller of `send` chooses the payload (and the text of a pass-through rule), so wire it only from producers and scripts you trust. A hook-run `send` should not be wrapped in a shell pipeline that hides its exit code. There is no per-invocation `--hook` flag.
 

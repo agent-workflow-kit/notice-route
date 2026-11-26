@@ -130,6 +130,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_global_flags(send, top=False)
     _add_input_flags(send)
     send.add_argument("--dry-run", action="store_true", help="same as test; changes nothing")
+    send.add_argument(
+        "--exit-zero-on-noop",
+        action="store_true",
+        help="exit 0 instead of 22 when there is nothing to do (the output is the same)",
+    )
     _add_audit_flags(send)
     # Parsed only to refuse it with exit 2 `usage`: send never reads a config from a flag.
     send.add_argument("--config", metavar="PATH", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
@@ -417,6 +422,14 @@ def _dry_run_text(doc: dict[str, Any]) -> None:
         _out(_safe(line) + "\n")
 
 
+def _noop_exit(args: argparse.Namespace, code: int) -> int:
+    """``send --exit-zero-on-noop``: only the final mapping changes, 22 becomes 0. Only ``send``
+    (``--dry-run`` included) has the flag; every other code, 128+N included, stays."""
+    if code == EXIT_NOOP and getattr(args, "exit_zero_on_noop", False):
+        return 0
+    return code
+
+
 def _run_dry_run(args: argparse.Namespace, gateway: Gateway) -> int:
     """``test`` and ``send --dry-run``: send steps 1 to 6 for the config alone. Nothing is
     written, locked, spawned or sent; ``state.db`` is opened read-only once the router is enabled
@@ -448,7 +461,7 @@ def _run_dry_run(args: argparse.Namespace, gateway: Gateway) -> int:
         _dry_run_text(doc)
     if doc["reason"] == "unconfigured" and not args.quiet:
         _err(f"{PROG}: no config\n")
-    return code
+    return _noop_exit(args, code)
 
 
 _ACTOR = re.compile(r"(?:human|auto):[A-Za-z0-9._@/-]{1,64}")
@@ -520,7 +533,7 @@ def _run_send(args: argparse.Namespace, gateway: Gateway) -> int:
             return 128 + exc.signum
         finally:
             trap.armed = False
-    return result.exit_code
+    return _noop_exit(args, result.exit_code)
 
 
 def _run_flush(args: argparse.Namespace, gateway: Gateway) -> int:
