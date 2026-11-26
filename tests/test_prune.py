@@ -5,8 +5,6 @@ state directory under a private home."""
 from __future__ import annotations
 
 import json
-import sqlite3
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -36,10 +34,10 @@ pytestmark = pytest.mark.usefixtures("send_environment")
 HOUR = 3600
 
 
-def configure(rig: Rig, *, enabled: bool = True, **top: Any) -> Any:
+def configure(rig: Rig, *, dest_enabled: bool = True, **top: Any) -> Any:
     n = rig.notifier()
     config: dict[str, Any] = {
-        "destinations": {"chat": {"kind": "slack-notice", "cmd": n.cmd, "enabled": enabled}},
+        "destinations": {"chat": {"kind": "slack-notice", "cmd": n.cmd, "enabled": dest_enabled}},
         "rules": [{"name": "pt", "match": {"level_min": "info"}, "notify": ["chat"]}],
     }
     config.update(top)
@@ -238,7 +236,7 @@ def test_rows_of_any_destination_state_expire_by_age(rig: Rig, state: str) -> No
         )
         dest = "chat"
     elif state == "disabled":
-        configure(rig, enabled=False)
+        configure(rig, dest_enabled=False)
         dest = "chat"
     else:
         configure(rig)
@@ -255,7 +253,7 @@ def test_prune_works_without_a_config_and_with_a_disabled_router(rig: Rig) -> No
     seed(rig, now=NOW - 3 * DAY, created_at=NOW - 3 * DAY)
     code, doc, _ = prune(rig)
     assert (code, doc["deleted"]) == (0, deleted(queue=1))
-    configure(rig, enabled=True, **{"enabled": False})
+    configure(rig, enabled=False)
     seed(rig, now=NOW - 3 * DAY, created_at=NOW - 3 * DAY)
     code, doc, _ = prune(rig)
     assert (code, doc["deleted"]) == (0, deleted(queue=1))
@@ -338,13 +336,18 @@ def test_dry_run_counts_exactly_what_the_real_run_deletes_and_writes_nothing(rig
     assert code == 0 and real["dry_run"] is False
     assert real["deleted"] == dry["deleted"]
     assert dry["deleted"] == deleted(history=7, event_ids=5, dedup=3, surfaced=1, rate=1, queue=1)
+    # the delivery that this run expired is two days old: a history row for the next run
     code, again, _ = prune(rig, "--dry-run")
-    assert again["deleted"] == deleted()
+    assert again["deleted"] == deleted(history=1)
 
 
-def test_prune_is_idempotent(rig: Rig) -> None:
+def test_prune_converges_and_a_run_after_that_changes_nothing(rig: Rig) -> None:
+    """The queue is expired last (so the dry run can be exact): the deliveries it ended are old
+    history rows only for the following run. After that every run deletes nothing."""
     populate(rig)
     prune(rig)
+    code, doc, _ = prune(rig)
+    assert (code, doc["deleted"]) == (0, deleted(history=1))
     snapshot = counts(rig)
     code, doc, _ = prune(rig)
     assert (code, doc["deleted"]) == (0, deleted())
@@ -362,15 +365,6 @@ def test_more_than_one_batch_completes_and_each_transaction_deletes_at_most_1000
     add_many_event_ids(rig, 2_100, NOW - 5 * DAY)
     keep = add_delivery(rig, NOW)
     sizes: list[int] = []
-    real = sqlite3.Cursor
-    del real
-    original = prune_mod.run_prune
-
-    def traced(*a: Any, **k: Any) -> Any:
-        return original(*a, **k)
-
-    monkeypatch.setattr(cli, "run_prune", traced)
-    monkeypatch.setattr(prune_mod, "BATCH", 1000)
     monkeypatch.setattr(prune_mod, "_on_batch", sizes.append)
     code, doc, _ = prune(rig)
     assert (code, doc["deleted"]) == (0, deleted(history=2_345, event_ids=2_100))
@@ -398,14 +392,13 @@ def test_a_clock_stepped_back_deletes_nothing_and_does_not_stall(rig: Rig) -> No
     assert counts(rig) == before
 
 
-def test_a_clock_stepped_forward_ends_old_rows_but_never_a_live_claim(rig: Rig) -> None:
+def test_a_clock_stepped_forward_a_day_expires_every_queued_row(rig: Rig) -> None:
     configure(rig)
-    _, live = seed(rig, now=NOW, created_at=NOW, claim="t", claim_expires=NOW + 30)
+    seed(rig, now=NOW, created_at=NOW, claim="t", claim_expires=NOW + 30)
     seed(rig, now=NOW, created_at=NOW)
-    rig.clock.jump_wall(DAY)  # the claim lapsed at +30 s: only a forward step of a day reaches it
+    rig.clock.jump_wall(DAY)  # the interface: a forward step of 24 hours expires every row
     code, doc, _ = prune(rig)
     assert code == 0 and doc["deleted"]["queue"] == 2
-    assert live
 
 
 # --- the command line ------------------------------------------------------------------------
@@ -487,4 +480,3 @@ def test_the_state_dir_may_exist_without_a_database(rig: Rig) -> None:
     code, doc, _ = prune(rig)
     assert (code, doc["deleted"]) == (0, deleted())
     assert not (rig.state / "state.db").exists()
-    assert isinstance(rig.state, Path)

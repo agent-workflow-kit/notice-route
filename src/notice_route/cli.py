@@ -29,6 +29,7 @@ from .dryrun import dry_run_document
 from .flush import FlushOptions, FlushResult, run_flush
 from .gateway import Gateway, HomeError, Interrupted, StateError
 from .payload import InputFlags, PayloadError, UsageError, load_notification
+from .prune import PruneOptions, run_prune
 from .report import rules_document, validate_document
 from .send import SendOptions, SendResult, run_send
 from .store import StoreError, open_readonly
@@ -123,6 +124,15 @@ def build_parser() -> argparse.ArgumentParser:
     flush.add_argument("--dry-run", action="store_true", help="list what is due; change nothing")
     _add_audit_flags(flush)
     flush.add_argument(
+        "--config", metavar="PATH", default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
+
+    prune = commands.add_parser(
+        "prune", help="delete old history and expire old queue rows", allow_abbrev=False
+    )
+    _add_global_flags(prune, top=False)
+    prune.add_argument("--dry-run", action="store_true", help="count what would go; change nothing")
+    prune.add_argument(
         "--config", metavar="PATH", default=argparse.SUPPRESS, help=argparse.SUPPRESS
     )
     return parser
@@ -342,13 +352,18 @@ _DECISION_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 _NAME_OUTSIDE = re.compile(r"[^A-Za-z0-9._@-]")
 
 
+def _default_actor(gateway: Gateway) -> str:
+    """``human:<login name>`` when stdin is a terminal, else ``auto:unknown``."""
+    user = _NAME_OUTSIDE.sub("_", gateway.login_name())[:64]
+    return f"human:{user}" if user and gateway.stdin_is_tty() else "auto:unknown"
+
+
 def _audit(args: argparse.Namespace, gateway: Gateway) -> tuple[str, str | None]:
     """The actor and the decision id of the call (design guide section 6): ``--actor``, else
     ``human:<login name>`` when stdin is a terminal, else ``auto:unknown``."""
     actor = args.actor
     if actor is None:
-        user = _NAME_OUTSIDE.sub("_", gateway.login_name())[:64]
-        actor = f"human:{user}" if user and gateway.stdin_is_tty() else "auto:unknown"
+        actor = _default_actor(gateway)
     elif not _ACTOR.fullmatch(actor):
         raise UsageError("actor")
     if len(args.decision_id) > 1 or (
@@ -433,6 +448,24 @@ def _run_flush(args: argparse.Namespace, gateway: Gateway) -> int:
             return result.exit_code if result.called else 128 + exc.signum
         finally:
             trap.armed = False
+    return result.exit_code
+
+
+_PRUNE_TABLES = ("history", "event_ids", "dedup", "surfaced", "rate", "queue")
+
+
+def _run_prune(args: argparse.Namespace, gateway: Gateway) -> int:
+    """``prune``: the flags (exit 2), the config, then the run. It needs no ``--actor``: the
+    log lines it writes carry the default actor."""
+    config = load_valid_config(gateway, None)
+    result = run_prune(gateway, config, PruneOptions(_default_actor(gateway), args.dry_run))
+    doc = result.document
+    assert doc is not None
+    if args.json:
+        _json(doc)
+    elif not args.quiet:
+        for table in _PRUNE_TABLES:
+            _out(f"{table}: {doc['deleted'][table]}\n")
     return result.exit_code
 
 
@@ -553,6 +586,8 @@ def _main(argv: Sequence[str] | None, gateway: Gateway | None) -> int:
             return _run_send(args, gateway)
         if args.command == "flush":
             return _run_flush(args, gateway)
+        if args.command == "prune":
+            return _run_prune(args, gateway)
         return _run_validate(args, gateway)
     except (PayloadError, UsageError) as exc:
         return _refused(exc, as_json=args.json)
