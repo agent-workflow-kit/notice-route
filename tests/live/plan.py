@@ -10,7 +10,13 @@ import shutil
 import sys
 from collections.abc import Callable, Mapping
 
-from tests.live.support import REPORT_DIR_VAR, TOOLS, tool_config
+from tests.live.support import (
+    PLANNED_MESSAGES,
+    REPORT_DIR_VAR,
+    TOOLS,
+    WORST_CASE_MESSAGES,
+    tool_config,
+)
 
 
 def describe(environ: Mapping[str, str], which: Callable[[str], str | None] = shutil.which) -> str:
@@ -20,6 +26,9 @@ def describe(environ: Mapping[str, str], which: Callable[[str], str | None] = sh
         "It will run the real notifiers listed below and a real shell, in a private scratch",
         "home (the router's config and state never touch yours). Marked test messages go only",
         "to the destinations those notifiers' own configs name. It never runs crontab.",
+        f"A full run sends {PLANNED_MESSAGES} planned messages and at most {WORST_CASE_MESSAGES}",
+        "in the worst case (a stale-interop toast through a fallback socket; a duplicate",
+        "after SIGTERM).",
         "",
     ]
     for name in TOOLS:

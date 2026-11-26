@@ -7,7 +7,6 @@ so the offline harness test can run the rest of the suite without them.
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
 
@@ -46,7 +45,7 @@ def setup_failing(router: LiveRouter, scratch: Path, hook_body: str, *, async_: 
     })  # fmt: skip
     r = router.send("TEST MESSAGE: a local failing destination, nothing leaves this machine",
                     title="notice-route live test")  # fmt: skip
-    assert r.code == 12, r.err[:300]
+    assert r.code == 12, f"send exit code {r.code}"
     assert r.json()["destinations"][0]["code"] == "generic_failed"
 
 
@@ -69,7 +68,7 @@ def test_sync_hook_environment_and_payload(
                   f"env > {out}.tmp\nmv {out}.tmp {out}\ncat > {scratch}/payload.json\n",
                   async_=False)  # fmt: skip
     f = router.run("flush", "--json")
-    assert f.code in (0, 12), f.err[:300]
+    assert f.code in (0, 12), f"flush exit code {f.code}"
     names = {line.split("=", 1)[0] for line in out.read_text().splitlines() if "=" in line}
     names = {n for n in names if n.isidentifier()}
     report.record("hook/sync_env", names=sorted(names), extra_over_fixed=sorted(names - FIXED))
@@ -84,20 +83,29 @@ def test_sync_hook_environment_and_payload(
 
 def test_async_hook_outlives_flush_and_hits_its_timeout(router: LiveRouter, scratch: Path,
                                                         report: Report) -> None:  # fmt: skip
-    """#27 note 3: an `async` hook's detached supervisor survives the end of `flush`; the same
-    supervisor ends the hook at its timeout (the hook's late marker never appears). Bounded
-    waits only."""
+    """#27 note 3: an `async` hook's detached supervisor survives the end of `flush` and ends the
+    hook at its timeout. The hook traps SIGTERM, writes `termed` and exits; it loops in short
+    steps for at most 20 s on its own. `termed` appearing after `flush` returned proves the
+    supervisor outlived `flush` and sent the TERM at the hook's 2 s timeout. The order is
+    recorded (flush return time against the mtime of `termed`); no other timing is asserted."""
     started = scratch / "started"
-    late = scratch / "late"
-    setup_failing(router, scratch,
-                  f"echo up > {started}\nsleep 8\necho late > {late}\n",
-                  async_=True, timeout="1s")  # fmt: skip
+    termed = scratch / "termed"
+    body = (
+        f"trap 'echo term > {termed}; exit 0' TERM\n"
+        f"echo up > {started}\n"
+        "i=0\nwhile [ $i -lt 200 ]; do sleep 0.1; i=$((i+1)); done\n"
+    )
+    setup_failing(router, scratch, body, async_=True, timeout="2s")
     f = router.run("flush", "--json")
-    assert f.code in (0, 12), f.err[:300]
+    flush_returned = time.time()
+    already_termed = termed.exists()
+    assert f.code in (0, 12), f"flush exit code {f.code}"
     assert wait_for(started, 10), "the async hook never started"
-    time.sleep(10)  # past the hook's own 8 s sleep and 1 s timeout (no assertion on elapsed time)
-    report.record("hook/async", started=started.exists(), late_marker=late.exists())
-    assert not late.exists(), "the hook ran past its timeout"
+    appeared = wait_for(termed, 25)
+    report.record("hook/async", started=started.exists(), termed=appeared,
+                  termed_before_flush_returned=already_termed, flush_returned_at=flush_returned,
+                  termed_mtime=termed.stat().st_mtime if appeared else None)  # fmt: skip
+    assert appeared, "the hook was never terminated at its timeout"
 
 
 def test_hook_recursion_guard_with_the_real_environment(router: LiveRouter, scratch: Path,
@@ -109,9 +117,9 @@ def test_hook_recursion_guard_with_the_real_environment(router: LiveRouter, scra
     setup_failing(router, scratch,
                   f"cat > /dev/null\necho '{{\"message\":\"x\"}}' | {quoted} > {result}\n",
                   async_=False)  # fmt: skip
-    router.run("flush", "--json")
+    f = router.run("flush", "--json")
+    assert f.code in (0, 12), f"flush exit code {f.code}"
     assert wait_for(result, 10)
     doc = json.loads(result.read_text())
     report.record("hook/recursion", stdout=doc)
     assert doc["error"]["reason"] == "hook_recursion"
-    assert os.path.exists(result)

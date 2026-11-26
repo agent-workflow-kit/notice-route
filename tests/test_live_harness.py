@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -32,12 +33,17 @@ from tests.live import plan, support
 from tests.live.support import (
     ENV_VARS,
     OPT_IN_VAR,
+    PLANNED_MESSAGES,
     TOOLS,
+    WORST_CASE_MESSAGES,
     LiveRouter,
     Protected,
     Report,
+    communicate_bounded,
+    found_in,
     opted_in,
     tool_config,
+    wait_group_gone,
     window_around_now,
     wsl_ready,
 )
@@ -46,6 +52,7 @@ ROOT = Path(__file__).resolve().parent.parent
 LIVE = ROOT / "tests" / "live"
 LIVE_FILES = sorted(p for p in LIVE.glob("*.py"))
 CANARY = "canary-value-9f3b2c71"
+ODD = 'q"uo\\te-\u00e9-\u4e2d-value-5d1e'  # a quote, a backslash and non-ASCII characters
 
 
 def clean_env(tmp: Path, **extra: str) -> dict[str, str]:
@@ -163,6 +170,7 @@ def test_plan_names_variables_and_never_values(tmp_path: Path) -> None:
     assert "ha-notice: will run" in text and "HA_CRED" in text
     assert CANARY not in text
     assert "slack-notice: its tests will be skipped" in text
+    assert f"{PLANNED_MESSAGES} planned" in text and f"at most {WORST_CASE_MESSAGES}" in text
     assert plan.describe({}, which=lambda n: None).count("will be skipped") == 3
 
 
@@ -229,6 +237,19 @@ def test_wsl_needs_both_variables() -> None:
     assert wsl_ready({"WSL_DISTRO_NAME": "x", "WSL_INTEROP": "/run/x"}) == ""
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["HOME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "WSL_INTEROP", "NOTICE_ROUTE_LIVE",
+     "XDG_CONFIG_HOME", "TMPDIR"],
+)  # fmt: skip
+def test_a_reserved_variable_name_is_refused_for_the_credential(tmp_path: Path, name: str) -> None:
+    exe = make_exe(tmp_path, "ha-notice")
+    env = {TOOLS["ha-notice"].cred_var: name, name: CANARY}
+    cfg, reason = tool_config("ha-notice", env, need_credential=True, which=lambda n: str(exe))
+    assert cfg is None and "reserved" in reason
+    assert CANARY not in reason
+
+
 # --- credentials never leak ----------------------------------------------------------------------
 
 
@@ -272,6 +293,157 @@ def test_report_default_directory_is_a_new_private_temp_directory() -> None:
         assert path.parent.name.startswith("notice-route-live-")
     finally:
         shutil.rmtree(path.parent)
+
+
+def test_report_redacts_values_with_quotes_backslashes_and_non_ascii(tmp_path: Path) -> None:
+    report = Report()
+    report.protected.add(ODD)
+    escaped = json.dumps(ODD)[1:-1]  # how a JSON output would carry the value
+    report.record("x", out=f"a {ODD} b", enc=f"a {escaped} b", nested={ODD: [ODD, {"k": ODD}]},
+                  obj=ODD.encode())  # fmt: skip
+    path = report.write({support.REPORT_DIR_VAR: str(tmp_path / "r")})
+    assert path is not None
+    raw = path.read_bytes().decode("utf-8")
+    for form in (ODD, escaped, json.dumps(ODD, ensure_ascii=False)[1:-1]):
+        assert form not in raw
+    assert not report.protected.leaks(raw)
+    assert json.loads(raw)["observations"]["x"]["out"] == "a <redacted> b"
+
+
+def test_clip_redacts_before_it_cuts() -> None:
+    p = Protected()
+    p.add(CANARY)
+    text = "x" * 10 + CANARY
+    assert CANARY[:6] in text[:16]  # a cut first would leave a fragment of the value
+    clipped = p.clip(text, 16)
+    assert CANARY[:6] not in clipped and clipped.startswith("xxxxxxxxxx<")
+
+
+def test_found_in_and_leaks_look_at_text_and_bytes() -> None:
+    p = Protected()
+    p.add(CANARY)
+    assert found_in("some text", "a log with some text in it", b"x")
+    assert not found_in("some text", "nothing", b"here")
+    assert not p.leaks("no value here", CANARY[:5])  # a fragment is not a leak
+    assert p.leaks(CANARY.encode() + b"\xff")  # bytes: found even beside invalid UTF-8
+
+
+LEAKING_TEST = """
+import os
+
+from tests.live.support import Protected, found_in
+
+CANARY = os.environ["LEAK_CANARY"]  # not written in this file, so only a leak can show it
+
+
+def test_leak_in_output():
+    p = Protected()
+    p.add(CANARY)
+    leaked = p.leaks("stdout holds " + CANARY + " here")
+    assert not leaked, "credential value found in the router output (redacted)"
+
+
+def test_message_in_log():
+    present = found_in(CANARY, "log " + CANARY)
+    assert not present, "text that must not be present was found in the log"
+"""
+
+
+def test_a_forced_leak_prints_no_value_in_the_failure_output(tmp_path: Path) -> None:
+    """The failure of a leak check, as pytest prints it (assertion rewriting, `-vv`, long
+    tracebacks; `make live` shows no locals)."""
+    test_file = tmp_path / "test_forced_leak.py"
+    test_file.write_text(LEAKING_TEST)
+    done = pytest_child(
+        tmp_path, "-c", os.devnull, "--rootdir", str(tmp_path), "-vv", "--tb=long", "-rA",
+        str(test_file), LEAK_CANARY=CANARY,
+    )  # fmt: skip
+    shown = done.stdout + done.stderr
+    assert done.returncode == 1 and "2 failed" in shown, shown[-600:]
+    assert CANARY not in shown
+    assert "credential value found in the router output (redacted)" in shown
+
+
+def assert_problems(source: str) -> list[str]:
+    """Assertions of a live test that can print an output or a value: a ``leaks`` call inside the
+    test of an ``assert``, a membership test of an output or log text, or a message that holds a
+    raw ``out`` or ``err`` (it must pass through ``clip``)."""
+    problems: list[str] = []
+
+    def raw_output(node: ast.AST, under_clip: bool = False) -> bool:
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            under_clip = under_clip or node.func.attr in {"clip", "redact"}
+        if isinstance(node, ast.Attribute) and node.attr in {"out", "err"} and not under_clip:
+            return True
+        return any(raw_output(c, under_clip) for c in ast.iter_child_nodes(node))
+
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Assert):
+            continue
+        for sub in ast.walk(node.test):
+            if isinstance(sub, ast.Call):
+                func = sub.func
+                called = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+                if called in {"leaks", "found_in"}:
+                    problems.append(f"line {node.lineno}: {called}() inside an assert")
+            if isinstance(sub, ast.Compare) and any(
+                isinstance(o, (ast.In, ast.NotIn)) for o in sub.ops
+            ):
+                names = {n.id for n in ast.walk(sub) if isinstance(n, ast.Name)}
+                attrs = {n.attr for n in ast.walk(sub) if isinstance(n, ast.Attribute)}
+                if names & {"log_text", "db_bytes"} or attrs & {"out", "err"}:
+                    problems.append(f"line {node.lineno}: membership test of an output")
+        if node.msg is not None and raw_output(node.msg):
+            problems.append(f"line {node.lineno}: a message holds a raw output")
+    return problems
+
+
+def test_no_live_assertion_can_print_an_output() -> None:
+    for path in LIVE_FILES:
+        assert assert_problems(path.read_text()) == [], path.name
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "assert not report.protected.leaks(r.out)",
+        "assert not found_in(msg, r.out)",
+        "assert msg not in log_text",
+        "assert msg not in r.out",
+        "assert r.code == 0, r.err[:300]",
+        "assert x, (rows, follow.out[:300])",
+    ],
+)
+def test_the_assertion_check_flags_each_shape_that_leaked(source: str) -> None:
+    assert assert_problems(source)
+
+
+def test_the_assertion_check_accepts_the_safe_shapes() -> None:
+    safe = (
+        "assert r.code == 0, f'exit {r.code}'\nassert x, report.clip(r.err, 30)\nassert a in (1, 2)"
+    )
+    assert assert_problems(safe) == []
+
+
+def test_report_directory_is_private_whatever_the_umask(tmp_path: Path) -> None:
+    old = os.umask(0o002)
+    try:
+        report = Report()
+        report.record("x", a=1)
+        nested = tmp_path / "a" / "b"
+        path = report.write({support.REPORT_DIR_VAR: str(nested)})
+        assert path is not None and stat.S_IMODE(nested.stat().st_mode) == 0o700
+        loose = tmp_path / "loose"
+        loose.mkdir()
+        loose.chmod(0o775)  # an existing directory that others can enter
+        Report(observations={"x": 1}).write({support.REPORT_DIR_VAR: str(loose)})
+        assert stat.S_IMODE(loose.stat().st_mode) == 0o700
+        link = tmp_path / "link"
+        link.symlink_to(loose)
+        with pytest.raises(RuntimeError):
+            Report(observations={"x": 1}).write({support.REPORT_DIR_VAR: str(link)})
+    finally:
+        os.umask(old)
 
 
 def test_protected_ignores_trivial_values_and_detects_leaks() -> None:
@@ -332,38 +504,95 @@ def string_constants(tree: ast.AST) -> list[str]:
     ]
 
 
-def imported_modules(tree: ast.AST) -> set[str]:
+def imported_names(tree: ast.AST) -> set[str]:
+    """Every dotted name an import statement brings in: ``import a.b`` gives ``a.b``; ``from a
+    import b`` gives ``a`` and ``a.b`` (and ``b``, which may itself be a module)."""
     found: set[str] = set()
     for n in ast.walk(tree):
         if isinstance(n, ast.Import):
-            found |= {a.name.split(".")[0] for a in n.names}
-        elif isinstance(n, ast.ImportFrom) and n.module:
-            found.add(n.module.split(".")[0])
+            found |= {a.name for a in n.names}
+        elif isinstance(n, ast.ImportFrom):
+            module = n.module or ""
+            if module:
+                found.add(module)
+            for a in n.names:
+                found.add(a.name)
+                if module:
+                    found.add(f"{module}.{a.name}")
     return found
 
 
+def imported_modules(tree: ast.AST) -> set[str]:
+    """The top-level packages that are imported."""
+    return {name.split(".")[0] for name in imported_names(tree)}
+
+
+BANNED_NETWORK = {
+    "socket", "ssl", "http", "urllib", "urllib3", "requests", "httpx", "aiohttp", "ftplib",
+    "smtplib", "imaplib", "poplib", "telnetlib", "xmlrpc", "asyncio", "websockets", "paramiko",
+}  # fmt: skip
+
+
+def banned_import_problems(source: str) -> list[str]:
+    tree = ast.parse(source)
+    problems = sorted(imported_modules(tree) & BANNED_NETWORK)
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call):
+            func = n.func
+            called = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
+            if called in {"__import__", "import_module"}:
+                problems.append(f"dynamic import at line {n.lineno}")
+    return problems
+
+
 def test_no_live_module_imports_a_network_library() -> None:
-    banned = {
-        "socket",
-        "ssl",
-        "http",
-        "urllib",
-        "urllib3",
-        "requests",
-        "httpx",
-        "aiohttp",
-        "ftplib",
-    }
     for path in LIVE_FILES:
-        assert not imported_modules(ast.parse(path.read_text())) & banned, path.name
+        assert banned_import_problems(path.read_text()) == [], path.name
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import smtplib",
+        "from xmlrpc import client",
+        "import xmlrpc.client",
+        "import asyncio",
+        "from ssl import create_default_context",
+        "import websockets",
+        "x = __import__('socket')",
+        "import importlib\nimportlib.import_module('urllib.request')",
+        "from importlib import import_module\nimport_module('http.client')",
+    ],
+)
+def test_the_network_ban_flags_each_way_in(source: str) -> None:
+    assert banned_import_problems(source)
+
+
+def guard_mentions(source: str) -> bool:
+    tree = ast.parse(source)
+    return any("crontab_guard" in n for n in imported_names(tree)) or any(
+        isinstance(n, ast.Attribute) and n.attr == "crontab_guard" for n in ast.walk(tree)
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from tests import crontab_guard",
+        "import tests.crontab_guard",
+        "from tests.crontab_guard import expected",
+        "import tests.crontab_guard as g",
+    ],
+)
+def test_the_guard_check_catches_each_import_shape(source: str) -> None:
+    assert guard_mentions(source)
+    assert not guard_mentions("from tests import support\nimport tests.live.support")
 
 
 def test_the_live_suite_never_names_crontab_and_has_no_guard_bypass() -> None:
     for path in LIVE_FILES:
         tree = ast.parse(path.read_text())
-        assert "crontab_guard" not in imported_modules(tree) | {
-            n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)
-        }, path.name
+        assert not guard_mentions(path.read_text()), path.name
         for text in string_constants(tree):
             assert not re.search(r"(^|[/\s])crontab(\s+-|$)", text), (path.name, text)
             assert "cron" not in text.split() and "install" not in text.split(), (path.name, text)
@@ -416,6 +645,23 @@ def test_the_docs_name_every_variable_the_suite_reads() -> None:
         assert needle in docs, needle
 
 
+def test_the_runbook_counts_planned_and_worst_case_messages_and_the_manual_items() -> None:
+    docs = (ROOT / "docs" / "live-testing.md").read_text()
+    assert f"{PLANNED_MESSAGES} planned" in docs and f"at most {WORST_CASE_MESSAGES}" in docs
+    for needle in (
+        "A refused notifier path",
+        "128+N",
+        "SIGSTOP",
+        "waiting for the send lock",
+        "macOS (#32)",
+        "lock_wait",
+        "150 s",
+    ):
+        assert needle in docs, needle
+    fidelity = (ROOT / "tests" / "fakebin" / "FIDELITY.md").read_text()
+    assert "128+N" in fidelity and "closed stdout" in fidelity
+
+
 def test_fidelity_links_each_item_to_an_existing_live_test_marked_pending() -> None:
     text = (ROOT / "tests" / "fakebin" / "FIDELITY.md").read_text()
     assert "## Verified live" in text
@@ -433,6 +679,50 @@ def test_every_live_test_is_listed_in_the_runbook() -> None:
     docs = (ROOT / "docs" / "live-testing.md").read_text()
     for _, name in live_test_functions():
         assert f"`{name}`" in docs, name
+
+
+# --- bounded waits -----------------------------------------------------------------------------
+
+SAFE_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+
+
+def spawn(argv: list[str]) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
+        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=SAFE_ENV, cwd="/", start_new_session=True,
+    )  # fmt: skip
+
+
+def test_a_run_that_overstays_is_killed_and_reported_as_a_timeout() -> None:
+    result = support._run(["sh", "-c", "sleep 30"], b"", SAFE_ENV, timeout=0.3)
+    assert result.code == 124 and result.err.startswith("timeout")
+
+
+def test_communicate_bounded_kills_the_handle_s_group_and_reaps_it() -> None:
+    proc = spawn(["sh", "-c", "sleep 30 & wait"])
+    _, _, timed_out = communicate_bounded(proc, timeout=0.3, grace=5.0)
+    assert timed_out and proc.returncode is not None
+    assert wait_group_gone(proc.pid, 5.0)  # the group this call created is gone
+
+
+def test_communicate_bounded_closes_pipes_a_stray_process_holds_open() -> None:
+    holder = (
+        "import os, time\nif os.fork() == 0:\n    os.setsid()\n    time.sleep(3)\n    os._exit(0)\n"
+    )
+    proc = spawn([sys.executable, "-I", "-c", holder])
+    _, _, timed_out = communicate_bounded(proc, timeout=0.3, grace=0.3)
+    assert timed_out and proc.returncode is not None
+    assert proc.stdout is not None and proc.stdout.closed  # not left to block a later read
+
+
+def test_wait_group_gone_waits_for_the_group_and_is_bounded() -> None:
+    proc = spawn(["sh", "-c", "sleep 30"])
+    try:
+        assert wait_group_gone(proc.pid, 0.2) is False  # still running: bounded, not stuck
+    finally:
+        os.killpg(proc.pid, signal.SIGKILL)  # the group this test started
+        proc.communicate(timeout=10)
+    assert wait_group_gone(proc.pid, 5.0) is True
 
 
 # --- the plumbing, driven locally ----------------------------------------------------

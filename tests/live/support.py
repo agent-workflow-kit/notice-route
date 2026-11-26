@@ -5,7 +5,10 @@ Rules this module keeps (checked offline by ``tests/test_live_harness.py``):
 - Nothing here starts a process, opens a socket or reads a file at import time.
 - A credential value is read from the environment only, handed to a child only through the
   variable the notifier's own config names, and never put in argv, a file, the report or an
-  assertion message. Everything that is written or shown passes ``Protected.redact``.
+  assertion message. Everything written to the report passes ``Protected.redact`` (each string
+  value, before it is encoded or sliced); assertion messages carry names and fixed words only,
+  never an output of a notifier or of the router: a test computes ``leaked = ...leaks(...)`` (or
+  ``found_in``) first and asserts ``not leaked`` with a fixed text.
 - A test whose prerequisite is missing is skipped with a reason that names variables and
   binaries, never values.
 - The suite never runs ``crontab`` in any form. The autouse guard of ``tests/conftest.py`` stays
@@ -20,17 +23,30 @@ import re
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+PLANNED_MESSAGES = 8  # one send, one deferred-then-flushed per notifier, two signal checks
+WORST_CASE_MESSAGES = 10  # plus a stale-interop toast and a duplicate after SIGTERM
 OPT_IN_VAR = "NOTICE_ROUTE_LIVE"
 REPORT_DIR_VAR = "NOTICE_ROUTE_LIVE_REPORT_DIR"
 NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+RESERVED_NAMES = frozenset({"HOME", "PATH", "LANG", "TMPDIR"})
+RESERVED_PREFIXES = ("LC_", "WSL_", "NOTICE_ROUTE_", "XDG_")
+
+
+def reserved_name(name: str) -> bool:
+    """A variable the suite or the notifiers use for their own purposes cannot hold a credential."""
+    return name in RESERVED_NAMES or name.startswith(RESERVED_PREFIXES)
+
+
 TOOL_TIMEOUT_S = 90.0
 ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -135,6 +151,11 @@ def tool_config(
             return None, f"set {spec.cred_var} to the NAME of the variable holding the credential"
         if not NAME_RE.fullmatch(cred_env):
             return None, f"{spec.cred_var} must be a variable name ([A-Za-z_][A-Za-z0-9_]*)"
+        if reserved_name(cred_env):
+            return None, (
+                f"{spec.cred_var} names a reserved variable (HOME, PATH, LANG, TMPDIR, LC_*, "
+                "WSL_*, NOTICE_ROUTE_*, XDG_*); use a variable of your own"
+            )
         if not environ.get(cred_env, "").strip():
             return None, f"the variable named by {spec.cred_var} is unset or empty"
     return ToolConfig(spec, binary, config, cred_env), ""
@@ -152,50 +173,80 @@ def wsl_ready(environ: Mapping[str, str]) -> str:
 
 
 class Protected:
-    """The values that must never be shown (credential values). ``redact`` replaces them."""
+    """The values that must never be shown (credential values). ``redact`` replaces them, also
+    in their JSON-escaped forms (a value with a quote, a backslash or a non-ASCII character is
+    written differently inside a JSON output)."""
 
     def __init__(self) -> None:
         self._values: set[str] = set()
 
     def add(self, value: str) -> None:
-        if len(value.strip()) >= 4:
-            self._values.add(value)
-            self._values.add(value.strip())
+        if len(value.strip()) < 4:
+            return
+        for v in (value, value.strip()):
+            self._values.add(v)
+            self._values.add(json.dumps(v)[1:-1])
+            self._values.add(json.dumps(v, ensure_ascii=False)[1:-1])
 
     def redact(self, text: str) -> str:
         for value in sorted(self._values, key=len, reverse=True):
             text = text.replace(value, "<redacted>")
         return text
 
+    def redact_data(self, data: Any) -> Any:
+        """A copy of ``data`` with every string (and key) redacted; other objects by ``repr``."""
+        if isinstance(data, str):
+            return self.redact(data)
+        if isinstance(data, bool) or data is None or isinstance(data, (int, float)):
+            return data
+        if isinstance(data, Mapping):
+            return {self.redact(str(k)): self.redact_data(v) for k, v in data.items()}
+        if isinstance(data, (list, tuple, set, frozenset)):
+            return [self.redact_data(v) for v in data]
+        return self.redact(repr(data))
+
+    def clip(self, text: str, limit: int) -> str:
+        """Redact first, then cut: a value that a cut would split is still gone."""
+        return self.redact(text)[:limit]
+
     def leaks(self, *texts: str | bytes) -> bool:
-        return any(
-            v in (t.decode("utf-8", "replace") if isinstance(t, bytes) else t)
-            for t in texts
-            for v in self._values
-        )
+        for t in texts:
+            raw = t if isinstance(t, bytes) else t.encode("utf-8", "replace")
+            if any(v.encode("utf-8") in raw for v in self._values):
+                return True
+        return False
+
+
+def found_in(needle: str, *texts: str | bytes) -> bool:
+    """Whether ``needle`` is in one of ``texts``. A test calls it OUTSIDE its ``assert`` and asserts
+    the result with a fixed message: a helper that raised would show its arguments (the texts) in
+    a long traceback."""
+    raw = needle.encode("utf-8")
+    return any(raw in (t if isinstance(t, bytes) else t.encode("utf-8", "replace")) for t in texts)
 
 
 @dataclass
 class Report:
     """Observations of a run, written as JSON to a private directory for the person to compare
-    with ``tests/fakebin/FIDELITY.md``. Credential values are redacted on the way in."""
+    with ``tests/fakebin/FIDELITY.md``. Every string value is redacted before it is encoded."""
 
     protected: Protected = field(default_factory=Protected)
     run_id: str = field(default_factory=lambda: secrets.token_hex(4))
     observations: dict[str, Any] = field(default_factory=dict)
     directory: Path | None = None
 
+    def clip(self, text: str, limit: int) -> str:
+        return self.protected.clip(text, limit)
+
     def record(self, key: str, **data: Any) -> None:
-        text = json.dumps(data, ensure_ascii=True, default=repr, sort_keys=True)
-        self.observations[key] = json.loads(self.protected.redact(text))
+        self.observations[key] = self.protected.redact_data(data)
 
     def write(self, environ: Mapping[str, str]) -> Path | None:
         if not self.observations:
             return None
         chosen = environ.get(REPORT_DIR_VAR)
         if chosen and os.path.isabs(chosen):
-            directory = Path(chosen)
-            directory.mkdir(parents=True, exist_ok=True)
+            directory = private_directory(Path(chosen))
         else:
             directory = Path(tempfile.mkdtemp(prefix="notice-route-live-"))  # mode 0700
         self.directory = directory
@@ -210,6 +261,35 @@ class Report:
             )
             handle.write("\n")
         return path
+
+
+def private_directory(path: Path) -> Path:
+    """Create ``path`` (parents as needed) and make the leaf mode 0700 whatever the umask. An
+    existing leaf is fixed to 0700 when it is ours; a symlink or another user's directory is
+    refused."""
+    path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError(f"{REPORT_DIR_VAR} is not a plain directory")
+    if info.st_uid != os.getuid():
+        raise RuntimeError(f"{REPORT_DIR_VAR} is owned by another user")
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        path.chmod(0o700)
+    return path
+
+
+def schema_errors(instance: Any, name: str) -> list[str]:
+    """Errors of ``instance`` against ``schemas/cli/<name>`` of this repository (offline)."""
+    from jsonschema import Draft202012Validator
+    from referencing import Registry, Resource
+
+    registry: Registry[Any] = Registry()
+    for path in (ROOT / "schemas").rglob("*.json"):
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        registry = registry.with_resource(doc["$id"], Resource.from_contents(doc))
+    schema = json.loads((ROOT / "schemas" / "cli" / name).read_text(encoding="utf-8"))
+    validator = Draft202012Validator(schema, registry=registry)
+    return [e.message for e in validator.iter_errors(instance)]
 
 
 def title_for(run_id: str) -> str:
@@ -249,7 +329,59 @@ def tool_env(cfg: ToolConfig, environ: Mapping[str, str], *, credential: bool) -
     return env
 
 
-def _run(argv: Sequence[str], stdin: bytes, env: Mapping[str, str], timeout: float) -> Result:
+def communicate_bounded(
+    proc: subprocess.Popen[bytes], stdin: bytes | None = None, timeout: float = 90.0,
+    grace: float = 10.0,
+) -> tuple[bytes, bytes, bool]:  # fmt: skip
+    """``(out, err, timed_out)``. Never waits unboundedly: after ``timeout`` the process this
+    handle started (and the group it created, while it is not yet reaped) is killed, the pipes are
+    read for ``grace`` more seconds and then closed."""
+    try:
+        out, err = proc.communicate(stdin, timeout=timeout)
+        return out, err, False
+    except subprocess.TimeoutExpired:
+        pass
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)  # the session this call created (not yet reaped)
+        except ProcessLookupError:
+            pass
+        proc.kill()
+    try:
+        out, err = proc.communicate(timeout=grace)
+    except subprocess.TimeoutExpired:  # a grandchild outside the group holds the pipes open
+        out, err = b"", b""
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+        try:
+            proc.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            pass
+    return out, err, True
+
+
+def wait_group_gone(pgid: int, seconds: float = 20.0) -> bool:
+    """Wait (bounded) until no process is left in the group this suite created (signal 0 sends
+    nothing). True when it is gone."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        time.sleep(0.05)
+    return False
+
+
+def _run(
+    argv: Sequence[str], stdin: bytes, env: Mapping[str, str], timeout: float, grace: float = 10.0
+) -> Result:
     proc = subprocess.Popen(
         list(argv),
         stdin=subprocess.PIPE,
@@ -259,11 +391,8 @@ def _run(argv: Sequence[str], stdin: bytes, env: Mapping[str, str], timeout: flo
         cwd="/",
         start_new_session=True,
     )
-    try:
-        out, err = proc.communicate(stdin, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()  # the exact process this call started
-        out, err = proc.communicate()
+    out, err, timed_out = communicate_bounded(proc, stdin, timeout, grace)
+    if timed_out:
         return Result(
             124, out.decode("utf-8", "replace"), "timeout\n" + err.decode("utf-8", "replace")
         )
@@ -395,15 +524,14 @@ class LiveRouter:
                     proc.wait(timeout=20)
                 except (subprocess.TimeoutExpired, ProcessLookupError):
                     proc.kill()
-            proc.communicate()
+            communicate_bounded(proc, timeout=10.0, grace=5.0)
 
 
 def window_around_now(now: float, before_h: int = 1, after_h: int = 2) -> tuple[str, str]:
     """``(start, end)`` HH:MM in UTC of a window that contains ``now``."""
-    import time as _time
 
     def hhmm(t: float) -> str:
-        g = _time.gmtime(t)
+        g = time.gmtime(t)
         return f"{g.tm_hour:02d}:{g.tm_min:02d}"
 
     return hhmm(now - before_h * 3600), hhmm(now + after_h * 3600)
