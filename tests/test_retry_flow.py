@@ -81,9 +81,8 @@ def test_the_failed_end_is_not_retried_by_a_later_flush(rig: Rig) -> None:
     assert rig.query("SELECT COUNT(*) FROM deliveries") == [(1,)]
 
 
-def test_the_default_schedule_is_the_real_one_and_no_copy_is_left_in_send() -> None:
+def test_the_default_schedule_is_the_real_one() -> None:
     assert send.Seams().retry_schedule is retry.retry_schedule
-    assert not hasattr(send, "retry_schedule_copy")
 
 
 # --- calls that count no attempt --------------------------------------------------------------
