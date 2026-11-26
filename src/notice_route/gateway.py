@@ -70,6 +70,8 @@ __all__ = [
 
 
 STDOUT_LIMIT = 65536
+CRONTAB_TIMEOUT = 30.0
+PROGRAM_NAME = "notice-route"
 STDERR_LIMIT = 16384
 TERM_GRACE = 5.0
 FINAL_READ = 1.0
@@ -365,6 +367,10 @@ def _system_environ() -> Mapping[str, str]:
     return os.environ
 
 
+def _system_argv0() -> str:
+    return sys.argv[0] if sys.argv else ""
+
+
 def _passwd_home() -> str:
     try:
         return pwd.getpwuid(os.geteuid()).pw_dir
@@ -444,6 +450,7 @@ class Gateway:
     stdin_fd: int = 0
     environ: Callable[[], Mapping[str, str]] = _system_environ
     exec_check_from: str = "/"  # directories above this one are trusted (tests only)
+    argv0: Callable[[], str] = _system_argv0  # the running program's name (tests substitute it)
 
     def wall(self) -> float:
         return self.clock.wall()
@@ -993,6 +1000,73 @@ class Gateway:
             if stat.S_ISDIR(info.st_mode) and info.st_uid in (uid, 0) and not info.st_mode & 0o022:
                 kept.append(entry)
         return ":".join(kept)
+
+    def _find_executable(self, name: str, path: str) -> str | None:
+        """The first regular executable file called ``name`` in an entry of ``path`` (an absolute
+        entry only: ``clean_path`` has dropped the rest), as an absolute path."""
+        for entry in self.clean_path(path).split(":"):
+            if not entry:
+                continue
+            candidate = os.path.join(entry, name)
+            try:
+                if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                    return candidate
+            except (OSError, ValueError):
+                continue
+        return None
+
+    def program_path(self) -> str | None:
+        """The ``realpath`` of the running ``notice-route`` executable, or None when it cannot
+        be found. ``argv[0]`` is used when its base name is ``notice-route`` (an installed
+        script); otherwise (``python -m notice_route``) the first ``notice-route`` on the cleaned
+        ``PATH``. Runs nothing."""
+        given = self.argv0()
+        found: str | None = None
+        try:
+            if given and os.path.basename(given) == PROGRAM_NAME:
+                found = (
+                    os.path.abspath(given)
+                    if "/" in given
+                    else self._find_executable(given, self.environ().get("PATH", ""))
+                )
+            if found is None:
+                found = self._find_executable(PROGRAM_NAME, self.environ().get("PATH", ""))
+            if found is None:
+                return None
+            # todo(#32): realpath bakes a versioned Homebrew path (Cellar/<version>) into the cron
+            # line; macOS support should consider the stable symlink path instead
+            real = os.path.realpath(found)
+            if os.path.isfile(real) and os.access(real, os.X_OK):
+                return real
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def run_crontab(self, args: Sequence[str], *, stdin: bytes | None = None) -> RunResult:
+        """Run ``crontab <args>`` the way :meth:`run` runs a child, from the cleaned ``PATH``
+        (found there, never elsewhere, then started by its absolute path) with ``LC_ALL=C`` and
+        nothing else in the environment. ``spawn_failed`` when there is no ``crontab`` on that
+        path. The user's crontab is the only one it can reach: callers pass ``-l`` or ``-``."""
+        path = self.clean_path(self.environ().get("PATH", ""))
+        program = self._find_executable("crontab", path)
+        if program is None:
+            return RunResult(
+                status="spawn_failed",
+                returncode=None,
+                signal=None,
+                stdout=b"",
+                stderr=b"",
+                overflow=None,
+                pid=None,
+                elapsed=0.0,
+                error="crontab not found",
+            )
+        return self.run(
+            [program, *args],
+            env={"PATH": path, "LC_ALL": "C"},
+            timeout=CRONTAB_TIMEOUT,
+            stdin=stdin,
+        )
 
     def check_env_file(self, path: str) -> bool:
         """``cron.env_file``: by ``lstat`` a regular file (not a symlink) owned by the user with

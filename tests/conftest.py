@@ -10,6 +10,8 @@ from typing import Any
 import pytest
 
 from notice_route.gateway import DirHandle, Gateway
+from tests import crontab_guard
+from tests.fakecron import FakeCrontab, build_fake_crontab
 from tests.fakes import Hook, Notifier, build_hook, build_notifier
 from tests.send_support import Rig
 
@@ -103,3 +105,30 @@ def rig(
     r = Rig(home, tmp_path, make_notifier, capsys)
     yield r
     r.finish()
+
+
+@pytest.fixture(autouse=True)
+def crontab_guard_fixture(
+    request: pytest.FixtureRequest,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[crontab_guard.Guard]:
+    """Every test runs with a private ``PATH`` whose ``crontab`` is a fake, and with a guard that
+    refuses (before anything starts) any attempt to run another ``crontab``, by name or by
+    path. A refused attempt fails the test at teardown even when the code under test caught it
+    (unless the test says it expects one: ``guard.expected``)."""
+    guard = crontab_guard.Guard()
+    fake = build_fake_crontab(tmp_path_factory.mktemp("fakecron"))
+    guard.allow(fake.stub)
+    crontab_guard.install(monkeypatch, guard)
+    monkeypatch.setenv("PATH", crontab_guard.private_path(fake.bin_dir, os.environ.get("PATH", "")))
+    request.node.fake_crontab = fake
+    yield guard
+    if not guard.expected:
+        assert guard.attempts == [], f"a test tried to run the real crontab: {guard.attempts}"
+
+
+@pytest.fixture
+def fake_crontab(request: pytest.FixtureRequest) -> FakeCrontab:
+    """The fake crontab of this test (its table starts absent: ``no crontab for``)."""
+    return request.node.fake_crontab  # type: ignore[no-any-return]

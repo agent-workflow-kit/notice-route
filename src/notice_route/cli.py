@@ -24,6 +24,7 @@ from typing import Any, NoReturn
 
 from . import __version__
 from .config import ConfigError
+from .cron import CronError, run_cron
 from .decide import instant
 from .dryrun import dry_run_document
 from .flush import FlushOptions, FlushResult, run_flush
@@ -168,6 +169,20 @@ def build_parser() -> argparse.ArgumentParser:
     prune.add_argument(
         "--config", metavar="PATH", default=argparse.SUPPRESS, help=argparse.SUPPRESS
     )
+
+    cron = commands.add_parser(
+        "cron", help="install or remove the crontab block", allow_abbrev=False
+    )
+    _add_global_flags(cron, top=False)
+    cron.add_argument("--config", metavar="PATH", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    cron_actions = cron.add_subparsers(dest="cron_action", metavar="<action>", required=True)
+    for name, text in (("install", "write the block"), ("uninstall", "remove the block")):
+        action = cron_actions.add_parser(name, help=text, allow_abbrev=False)
+        _add_global_flags(action, top=False)
+        action.add_argument("--dry-run", action="store_true", help="show; change nothing")
+        action.add_argument(
+            "--config", metavar="PATH", default=argparse.SUPPRESS, help=argparse.SUPPRESS
+        )
     return parser
 
 
@@ -593,6 +608,23 @@ def _run_prune(args: argparse.Namespace, gateway: Gateway) -> int:
     return result.exit_code
 
 
+def _run_cron(args: argparse.Namespace, gateway: Gateway) -> int:
+    """``cron install|uninstall``: install reads the config (``cron.env_file``), uninstall does
+    not. Nothing is logged and no state directory is touched."""
+    try:
+        config = load_valid_config(gateway, None) if args.cron_action == "install" else None
+        result = run_cron(gateway, config, args.cron_action, args.dry_run)
+    except CronError as exc:
+        _error(exc.code, exc.message, None, as_json=args.json)
+        return exc.exit_code
+    if args.json:
+        _json(result.document)
+    elif not args.quiet:
+        for line in result.lines:
+            _out(_safe(line) + "\n")
+    return EXIT_OK
+
+
 def _guarded(gateway: Gateway, stream: str, write: Callable[[], None]) -> None:
     """One write after the send is done: a failure changes nothing (the exit code is the
     result's), and the stream is pointed at the null device so its buffered text cannot fail
@@ -714,6 +746,8 @@ def _main(argv: Sequence[str] | None, gateway: Gateway | None) -> int:
             return _run_prune(args, gateway)
         if args.command == "history":
             return _run_history(args, gateway)
+        if args.command == "cron":
+            return _run_cron(args, gateway)
         return _run_validate(args, gateway)
     except (PayloadError, UsageError) as exc:
         return _refused(exc, as_json=args.json)
