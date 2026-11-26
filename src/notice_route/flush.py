@@ -58,7 +58,7 @@ import math
 import sqlite3
 import threading
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -91,8 +91,8 @@ from .report import env_unset, worst_case_s
 from .send import Seams, SurfaceEvent, escaped_surface, record_result, with_retry
 from .sendlock import flush_lock
 from .store import Store, StoreError, open_readonly, open_store
-from .surfacing import surface_evictions
-from .validate import Config, Destination
+from .surfacing import ALERT_SOURCE, surface_evictions
+from .validate import Config, Destination, Hook
 from .window import in_window
 
 __all__ = ["FlushOptions", "FlushResult", "run_flush"]
@@ -205,6 +205,24 @@ class _Run:
                 )
             )
 
+    def log_hook(self, destination: str, mode: str, result: str) -> None:
+        if self.writer is None:
+            return
+        with self.log_lock:
+            self.writer.write(
+                logmod.record(
+                    "hook",
+                    wall=self.gateway.wall(),
+                    actor=self.opts.actor,
+                    decision_id=self.opts.decision_id,
+                    duration_ms=_elapsed_ms(self.gateway, self.started),
+                    hook="post-fail",
+                    destination=destination,
+                    mode=mode,
+                    result=result,
+                )
+            )
+
     def log_flush(self, **fields: Any) -> None:
         if self.writer is None:
             return
@@ -290,19 +308,32 @@ def run_flush(
         if full:
             _meta(store, "flush_last", wall)
         taken = _take_surfaced(run, store)
+        sync_jobs = [
+            (job, hook)
+            for job in taken.jobs
+            for hook in config.hooks_post_fail
+            if not hook.is_async
+        ]
         with (
             ThreadPoolExecutor(max_workers=len(selected)) as pool,
             ThreadPoolExecutor(max_workers=_HOOK_THREADS) as hook_pool,
         ):
             hook_futures = [
-                hook_pool.submit(run_hook, gateway, hook, job.payload)
-                for job in taken.jobs
-                for hook in config.hooks_post_fail
-                if not hook.is_async
+                hook_pool.submit(_run_sync_hook, run, hook, job) for job, hook in sync_jobs
             ]
             futures = [pool.submit(_destination, run, d) for d in selected]
             tallies = [f.result() for f in futures]
-            hook_failures = [w for w in (f.result() for f in hook_futures) if w is not None]
+            words = [_hook_word(f) for f in hook_futures]
+        hook_records: list[tuple[str, str, str]] = []  # destination, mode, result
+        hook_failures: list[str] = []
+        late: list[tuple[HookJob, Hook]] = []  # a signal came first: started detached instead
+        for (job, hook), word in zip(sync_jobs, words, strict=True):
+            if word is _NOT_STARTED:
+                late.append((job, hook))
+                continue
+            hook_records.append((job.destination, "sync", word or "ok"))
+            if word is not None:
+                hook_failures.append(word)
         result = FlushResult(0)
         if taken.error:
             result.error = ("internal", "state database cannot be written")
@@ -314,17 +345,39 @@ def run_flush(
                 result.error = ("internal", "state database cannot be written")
         finished = _finish(run, tallies, result)
         _log_summary(run, tallies)
-    for job in taken.jobs:  # detached: nothing waits for these, and no thread is running now
-        for hook in config.hooks_post_fail:
-            if hook.is_async:
-                failed = start_detached(gateway, hook, job.payload)
-                if failed is not None:
-                    hook_failures.append(failed)
+        # detached: nobody waits for these, and no thread is running now; the supervisor closes
+        # every descriptor, so it holds neither the flush lock nor the database
+        detached = [(j, h) for j in taken.jobs for h in config.hooks_post_fail if h.is_async]
+        for job, hook in detached + late:
+            failed = start_detached(gateway, hook, job.payload)
+            hook_records.append((job.destination, "async", failed or "started"))
+            if failed is not None:
+                hook_failures.append(failed)
+        for destination, mode, word in hook_records:
+            run.log_hook(destination, mode, word)
     for word in dict.fromkeys(hook_failures):
         finished.warnings.append(f"a post-fail hook failed ({word})")
     if run.writer.problems:
         finished.warnings.append("the log could not be written")
     return finished
+
+
+_NOT_STARTED: Any = object()  # a sync hook that a signal kept from starting
+
+
+def _run_sync_hook(run: _Run, hook: Hook, job: HookJob) -> str | None:
+    """One synchronous hook: not started once a signal was trapped (a hook already running is
+    like a call in progress and finishes within its timeout)."""
+    if run.trap.received is not None:
+        return _NOT_STARTED
+    return run_hook(run.gateway, hook, job.payload)
+
+
+def _hook_word(future: Future[str | None]) -> str | None:
+    try:
+        return future.result()
+    except Exception:  # a hook never changes the result
+        return "lost"
 
 
 @dataclass
@@ -336,13 +389,10 @@ class _TakenRows:
 def _take_surfaced(run: _Run, store: Store) -> _TakenRows:
     """Every run (but a dry run) first takes the new ``surfaced`` rows: alerts are routed (rows
     due now, which the destinations' step 6 delivers in this run) and the hook jobs returned."""
-    try:
-        taken = take_surfaced(run.gateway, store, run.config, run.worst)
-    except StoreError:
-        return _TakenRows([], True)
+    taken = take_surfaced(run.gateway, store, run.config, run.worst)
     for record in taken.log:
         run.log(**record)
-    return _TakenRows(taken.jobs)
+    return _TakenRows(taken.jobs, taken.error)
 
 
 def _meta(store: Store, key: str, value: int | None) -> None:
@@ -520,23 +570,23 @@ def _destination(run: _Run, dest: Destination) -> _Tally:
 
 def _surface_env_missing(run: _Run, dest: Destination, t: _Tally) -> None:
     """The destination is skipped for an unset variable: surface ``env_missing`` (once per UTC
-    hour) for its oldest queued row. A destination with nothing queued has nothing waiting on
-    the credential, so it surfaces nothing."""
+    hour) for its oldest unclaimed due row, one that is not a failure alert when there is one. A
+    destination with nothing due and unclaimed has nothing waiting on the credential, so it
+    surfaces nothing."""
     try:
         with open_store(run.gateway) as store, store.write() as conn:
             lease = Lease.at(run.gateway.wall(), run.worst)
-            found = conn.execute(
-                "SELECT q.delivery_id, q.source, q.level, d.attempts FROM queue q"
-                " JOIN deliveries d ON d.id = q.delivery_id WHERE d.destination = ?"
-                " ORDER BY q.id LIMIT 1",
-                (dest.name,),
-            ).fetchone()
-            if found is not None:
+            due = due_rows(conn, dest.name, lease)
+            picked = next((r for r in due if r.source != ALERT_SOURCE), due[0] if due else None)
+            if picked is not None:
+                attempts = conn.execute(
+                    "SELECT attempts FROM deliveries WHERE id = ?", (picked.delivery_id,)
+                ).fetchone()
                 run.seams.surface(
                     conn,
                     SurfaceEvent(
-                        int(found[0]), dest.name, dest.kind, str(found[1]), str(found[2]),
-                        "deferred", "env_missing", int(found[3]), lease.now,
+                        picked.delivery_id, dest.name, dest.kind, picked.source, picked.level,
+                        "deferred", "env_missing", int(attempts[0]) if attempts else 0, lease.now,
                     ),
                 )  # fmt: skip
     except StoreError:
@@ -573,7 +623,8 @@ def _prepare(run: _Run, store: Store, dest: Destination, t: _Tally) -> None:
         counts = count_due(conn, dest.name, lease)
         t.due_single, t.due_held = counts["single"], counts["held"]
         expired = expire_unclaimed(conn, lease, destination=dest.name)
-        for e in expired[:1]:  # one ``expired`` surfacing per destination per UTC hour
+        if expired:  # one ``expired`` surfacing per destination per UTC hour, no alert's if any
+            e = next((x for x in expired if x.source != ALERT_SOURCE), expired[0])
             run.seams.surface(
                 conn,
                 SurfaceEvent(

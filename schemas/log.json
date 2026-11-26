@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "notice-route/log.json",
   "title": "notice-route log.jsonl record",
-  "description": "One line per destination outcome (record delivery) and per flush summary (record flush). Never holds title text, message text, links or credentials; titles and messages appear only as the first 16 hex characters of the SHA-256 of the rendered UTF-8 title and message of the row (for a digest's rows, each row's own text); the dedupe digest as its first 16 characters (dedupe_key_sha256). A drop rule and no_rule write a delivery record with destination null and reason rule_drop or no_rule. A flush record carries totals across the destinations it handled, with destination null. Rotates at 10 MiB, keeping three rotated files (log.1 to log.3). It is a record of recent activity, not an audit trail. A problem with the log warns on stderr and never changes a result. ts is UTC with milliseconds. actor and decision_id are the --actor and --decision-id of the call.",
+  "description": "One line per destination outcome (record delivery), per flush summary (record flush) and per post-fail hook run (record hook: destination, hook post-fail, mode sync or async, and a fixed-word result; an async hook is logged only as started or spawn_failed, since its end is not observed). Never holds title text, message text, links or credentials; titles and messages appear only as the first 16 hex characters of the SHA-256 of the rendered UTF-8 title and message of the row (for a digest's rows, each row's own text); the dedupe digest as its first 16 characters (dedupe_key_sha256). A drop rule and no_rule write a delivery record with destination null and reason rule_drop or no_rule. A flush record carries totals across the destinations it handled, with destination null. Rotates at 10 MiB, keeping three rotated files (log.1 to log.3). It is a record of recent activity, not an audit trail. A problem with the log warns on stderr and never changes a result. ts is UTC with milliseconds. actor and decision_id are the --actor and --decision-id of the call.",
   "type": "object",
   "properties": {
     "ts": {
@@ -18,7 +18,8 @@
     "record": {
       "enum": [
         "delivery",
-        "flush"
+        "flush",
+        "hook"
       ]
     },
     "source": {
@@ -217,6 +218,38 @@
     "duration_ms": {
       "type": "integer",
       "minimum": 0
+    },
+    "mode": {
+      "oneOf": [
+        {
+          "enum": [
+            "sync",
+            "async"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "result": {
+      "oneOf": [
+        {
+          "enum": [
+            "ok",
+            "nonzero_exit",
+            "signaled",
+            "timeout",
+            "overflow",
+            "spawn_failed",
+            "lost",
+            "started"
+          ]
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "additionalProperties": false,
@@ -247,7 +280,9 @@
     "unknown",
     "dropped",
     "expired",
-    "duration_ms"
+    "duration_ms",
+    "mode",
+    "result"
   ],
   "allOf": [
     {
@@ -297,10 +332,28 @@
           },
           "expired": {
             "type": "null"
+          },
+          "mode": {
+            "type": "null"
+          },
+          "result": {
+            "type": "null"
           }
         }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "record": {
+            "const": "flush"
+          }
+        },
+        "required": [
+          "record"
+        ]
       },
-      "else": {
+      "then": {
         "properties": {
           "source": {
             "type": "null"
@@ -361,8 +414,114 @@
           },
           "expired": {
             "type": "integer"
+          },
+          "mode": {
+            "type": "null"
+          },
+          "result": {
+            "type": "null"
           }
         }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "record": {
+            "const": "hook"
+          }
+        },
+        "required": [
+          "record"
+        ]
+      },
+      "then": {
+        "properties": {
+          "source": {
+            "type": "null"
+          },
+          "rule": {
+            "type": "null"
+          },
+          "level": {
+            "type": "null"
+          },
+          "outcome": {
+            "type": "null"
+          },
+          "reason": {
+            "type": "null"
+          },
+          "code": {
+            "type": "null"
+          },
+          "attempts": {
+            "type": "null"
+          },
+          "title_sha256": {
+            "type": "null"
+          },
+          "message_sha256": {
+            "type": "null"
+          },
+          "event_id": {
+            "type": "null"
+          },
+          "dedupe_key_sha256": {
+            "type": "null"
+          },
+          "due": {
+            "type": "null"
+          },
+          "sent": {
+            "type": "null"
+          },
+          "queued_retry": {
+            "type": "null"
+          },
+          "failed": {
+            "type": "null"
+          },
+          "unknown": {
+            "type": "null"
+          },
+          "dropped": {
+            "type": "null"
+          },
+          "expired": {
+            "type": "null"
+          },
+          "hook": {
+            "const": "post-fail"
+          },
+          "destination": {
+            "$ref": "defs.json#/$defs/destination_name"
+          },
+          "mode": {
+            "enum": [
+              "sync",
+              "async"
+            ]
+          },
+          "result": {
+            "enum": [
+              "ok",
+              "nonzero_exit",
+              "signaled",
+              "timeout",
+              "overflow",
+              "spawn_failed",
+              "lost",
+              "started"
+            ]
+          }
+        },
+        "required": [
+          "hook",
+          "destination",
+          "mode",
+          "result"
+        ]
       }
     },
     {

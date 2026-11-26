@@ -22,6 +22,9 @@ Choices where the interface is silent (the narrower reading):
   make a failure look like one (the hook payload's ``outcome`` rule ties them to the outcome).
 - The event is keyed on the outcome (``failed``/``unknown``, ``deferred``, ``dropped``,
   ``expired``), never on the code alone.
+- An hourly row about a destination's queue (``overflow``, ``expired``, ``env_missing``) is
+  keyed on the oldest row that is not a failure alert when there is one, since an alert's row
+  only runs the hooks and would spend the hour's slot on no alert.
 - The delivery of a new row is marked ``surfaced`` only when the row was inserted.
 """
 
@@ -35,6 +38,7 @@ from datetime import UTC, datetime, timedelta
 from .queue import Evicted
 
 __all__ = [
+    "ALERT_SOURCE",
     "DAILY_CODE_LIMIT",
     "HOURLY_CODES",
     "OTHER",
@@ -46,6 +50,7 @@ __all__ = [
     "surface_outcome",
 ]
 
+ALERT_SOURCE = "notice-route"  # a failure alert's own source: surfacing it only runs the hooks
 HOURLY_CODES = ("rate_capped", "env_missing", "overflow", "expired")
 DAILY_CODE_LIMIT = 8
 OTHER = "other"
@@ -131,10 +136,18 @@ def surface_evicted(
     conn: sqlite3.Connection, destination: str, delivery_ids: Sequence[int], now: int
 ) -> bool:
     """The cap dropped rows of ``destination``: one ``overflow`` row for the hour, for the first
-    of them."""
+    of them that is not a failure alert (the first of all when each one is)."""
     if not delivery_ids:
         return False
-    return surface_hourly(conn, destination, "overflow", delivery_ids[0], now)
+    chosen = delivery_ids[0]
+    for delivery_id in delivery_ids:
+        found = conn.execute(
+            "SELECT source FROM deliveries WHERE id = ?", (delivery_id,)
+        ).fetchone()
+        if found is not None and found[0] != ALERT_SOURCE:
+            chosen = delivery_id
+            break
+    return surface_hourly(conn, destination, "overflow", chosen, now)
 
 
 def surface_evictions(conn: sqlite3.Connection, evicted: Sequence[Evicted], now: int) -> None:

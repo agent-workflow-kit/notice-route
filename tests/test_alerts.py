@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from notice_route.gateway import SYSTEM_TZ_DIRS
-from tests.alerts_support import ALERT_RULE, DAY, HOUR, SEND_RULE, Setup
+from tests.alerts_support import ALERT_RULE, DAY, HOUR, SEND_RULE, MakeHook, Setup, hooks_config
 from tests.flush_support import checked_log, flush, seed
 from tests.send_support import CANARY, NOW, Rig
 
@@ -93,8 +94,11 @@ def test_an_unrouted_alert_is_taken_and_logged_only(rig: Rig) -> None:
     s.fail("boom")
     code, _, err = s.flush()
     assert code == 22 and err == ""
-    assert s.alerts() == [] and s.ops.events("invoke") == []
-    assert s.surfaced()[0][4] == 1
+    assert s.ops.events("invoke") == []
+    assert [(a[1], a[2], a[3], a[5]) for a in s.alerts()] == [
+        (None, "dropped", "no_rule", "post-fail")
+    ]  # in history, as ``send`` writes an unrouted notice
+    assert s.surfaced()[0][4] == 1 and len(s.surfaced()) == 1  # and never surfaced itself
     (line,) = [x for x in checked_log(rig) if x["source"] == "notice-route"]
     assert (line["outcome"], line["reason"], line["destination"]) == ("dropped", "no_rule", None)
     _, out, _ = rig.run("validate", "--json")
@@ -106,7 +110,8 @@ def test_a_drop_rule_for_alerts_routes_nothing(rig: Rig) -> None:
     s = Setup(rig, rules=[drop, ALERT_RULE, SEND_RULE])
     s.fail("boom")
     s.flush()
-    assert s.alerts() == []
+    assert [(a[2], a[3]) for a in s.alerts()] == [("dropped", "rule_drop")]
+    assert len(s.surfaced()) == 1
     (line,) = [x for x in checked_log(rig) if x["source"] == "notice-route"]
     assert line["reason"] == "rule_drop"
 
@@ -182,19 +187,42 @@ def test_the_alert_never_carries_notifier_output(rig: Rig) -> None:
     assert CANARY not in blob
 
 
-def test_a_hostile_label_or_source_never_reaches_the_alert_text(rig: Rig) -> None:
-    s = Setup(rig)
-    rig.send(
-        "boom",
-        source="s",
-        extra=(
-            "--label",
-            "team=a-b",
-        ),
-    )
+def edit_delivery(rig: Rig, **columns: str) -> None:
+    con = sqlite3.connect(rig.state / "state.db")
+    for name, value in columns.items():
+        con.execute(f"UPDATE deliveries SET {name} = ? WHERE id = 1", (value,))  # noqa: S608
+    con.commit()
+    con.close()
+
+
+HOSTILE = "evil\n=\x1b[31m{{object_id}}$(id)"
+
+
+def test_a_hostile_label_in_the_database_never_reaches_the_alert_or_the_hook(
+    rig: Rig, make_hook: MakeHook
+) -> None:
+    h = make_hook()
+    s = Setup(rig, **hooks_config(h))
+    s.fail("boom")
+    edit_delivery(rig, labels=json.dumps(["team=a-b", HOSTILE, "k=" + CANARY + "\n"]))
     s.flush()
-    assert s.delivered_texts() == [TEXT]
-    assert rig.query("SELECT labels FROM deliveries WHERE id = 1") == [('["team=a-b"]',)]
+    assert s.delivered_texts() == [TEXT]  # the label is edited out by the grammar
+    (run,) = h.runs()
+    assert json.loads(run["stdin"])["labels"] == ["team=a-b"]
+    log = (rig.state / "log.jsonl").read_text()
+    assert "evil" not in log + json.dumps(s.delivered_texts()) + run["stdin"]
+
+
+def test_a_hostile_source_in_the_database_refuses_the_alert_and_the_hook(
+    rig: Rig, make_hook: MakeHook
+) -> None:
+    h = make_hook()
+    s = Setup(rig, **hooks_config(h))
+    s.fail("boom")
+    edit_delivery(rig, source="s; touch /tmp/x" + HOSTILE)
+    code, _, err = s.flush()
+    assert err == "" and s.surfaced()[0][4] == 1  # taken
+    assert s.ops.events("invoke") == [] and h.runs() == [] and s.alerts() == []
 
 
 # --- the surfaced row ------------------------------------------------------------------------
@@ -203,8 +231,6 @@ def test_a_hostile_label_or_source_never_reaches_the_alert_text(rig: Rig) -> Non
 def test_a_row_whose_delivery_was_deleted_is_processed_and_skipped(rig: Rig) -> None:
     s = Setup(rig)
     s.fail("boom")
-    import sqlite3
-
     con = sqlite3.connect(rig.state / "state.db")
     con.execute("DELETE FROM deliveries")
     con.commit()
@@ -223,15 +249,21 @@ def test_a_row_of_a_removed_destination_is_processed_and_skipped(rig: Rig) -> No
     assert s.alerts() == []
 
 
-def test_a_row_of_a_disabled_destination_is_processed_and_skipped(rig: Rig) -> None:
-    s = Setup(rig)
+def test_a_row_of_a_disabled_destination_still_routes_its_alert_and_runs_the_hook(
+    rig: Rig, make_hook: MakeHook
+) -> None:
+    h = make_hook()
+    s = Setup(rig, **hooks_config(h))
     s.fail("boom")
     rig.configure(
         {"chat": {"notifier": s.bad, "enabled": False}, "ops": {"notifier": s.ops}},
         [ALERT_RULE, SEND_RULE],
+        **hooks_config(h),
     )
     s.flush()
-    assert s.surfaced()[0][4] == 1 and s.ops.events("invoke") == []
+    assert s.surfaced()[0][4] == 1
+    assert len(s.ops.events("invoke")) == 1 and len(h.runs()) == 1
+    assert h.runs()[0]["stdin"] and json.loads(h.runs()[0]["stdin"])["object_id"] == "chat"
 
 
 def test_a_dry_run_and_a_disabled_router_take_nothing(rig: Rig) -> None:
@@ -274,7 +306,6 @@ def test_a_clock_step_back_inside_the_hour_does_not_duplicate_a_row(rig: Rig) ->
     rig.clock.jump_wall(-600)
     s.fail("four")
     assert [r[2] for r in s.surfaced() if r[1] == "rate_capped"] == ["2023-11-14T22"]
-    _ = seed
 
 
 def test_send_refuses_the_source_notice_route(rig: Rig) -> None:

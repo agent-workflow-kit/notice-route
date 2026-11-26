@@ -55,6 +55,7 @@ from .store import (
     open_store,
     prune_deliveries,
 )
+from .surfacing import ALERT_SOURCE
 from .validate import Config
 
 __all__ = ["BATCH", "PAUSE_S", "PruneOptions", "PruneResult", "run_prune"]
@@ -379,7 +380,8 @@ def _expire_batch(
                 finally:
                     conn.text_factory = str
                 expired = tuple(_clean(e) for e in found)
-                for e in expired:
+                # a row that is no failure alert takes the hour's slot first
+                for e in sorted(expired, key=lambda x: x.source == ALERT_SOURCE):
                     # surfaced only for a destination that is configured and enabled (Hooks).
                     dest = None if config is None else config.destinations.get(e.destination)
                     if dest is not None and dest.enabled:

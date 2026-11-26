@@ -78,7 +78,8 @@ def test_the_failed_end_is_not_retried_by_a_later_flush(rig: Rig) -> None:
     rig.clock.jump_wall(10 * DAY)
     code, doc, _ = flush(rig)
     assert dest(doc)["state"] == "nothing_due"
-    assert rig.query("SELECT COUNT(*) FROM deliveries") == [(1,)]
+    # the failure's own row (the unrouted alert about it is a second, destination-less one)
+    assert rig.query("SELECT COUNT(*) FROM deliveries WHERE destination IS NOT NULL") == [(1,)]
 
 
 def test_the_default_schedule_is_the_real_one() -> None:

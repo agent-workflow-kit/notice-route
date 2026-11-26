@@ -47,7 +47,7 @@ The notifier call (``notify.py``) and the recording of its outcome (``outcome.py
 and ``give_back`` for a call never made) exist,
 and so does ``lock_busy`` (:data:`notice_route.outcome.LOCK_BUSY`);
 ``send.py`` (#22) renders, calls :func:`decide_and_record`, calls, prints and logs;
-TODO(#23) ``flush`` claims a due row with :func:`claim_call` (single rows) or :func:`count_call`
+``flush`` (#23) claims a due row with :func:`claim_call` (single rows) or :func:`count_call`
 (a digest); ``prune`` (#26) deletes ``rate`` rows of past hours older than 2 days;
 failure alerts are decided by :func:`decide_alert` (steps 1 to 6, then an unclaimed ``single`` row
 due now; the redelivery check never applies to source ``notice-route``), and ``rate_capped`` and

@@ -12,11 +12,10 @@ from typing import Any
 import pytest
 
 from notice_route import cli
-from notice_route import flush as flush_mod
 from notice_route.gateway import SYSTEM_TZ_DIRS
 from notice_route.notify import CallResult
 from notice_route.send import Seams
-from tests.alerts_support import DAY, HOUR, Setup
+from tests.alerts_support import DAY, HOUR, MakeHook, Setup, hook_errors, hooks_config
 from tests.flush_support import flush, seed
 from tests.send_support import NOW, Rig
 
@@ -80,8 +79,11 @@ def test_a_queued_retry_is_not_surfaced(rig: Rig) -> None:
     assert s.surfaced() == []
 
 
-def test_a_notifier_that_sends_a_router_word_cannot_use_its_hourly_slot(rig: Rig) -> None:
-    s = Setup(rig, "expired")
+@pytest.mark.parametrize("word", ["expired", "rate_capped", "env_missing", "overflow"])
+def test_a_notifier_that_sends_a_router_word_cannot_use_its_hourly_slot(
+    rig: Rig, word: str
+) -> None:
+    s = Setup(rig, word)
     s.fail("one")
     assert s.surfaced() == [("chat", "other", DAY0, 1, 0)]
 
@@ -228,7 +230,14 @@ def test_an_overflow_eviction_is_surfaced_once_per_hour(rig: Rig) -> None:
         seed(rig, "chat", level="warn", deliver_after=NOW + 10_000, message=f"q{i}")
     s.fail("one")  # a retry that goes back to the full queue evicts the lowest row
     assert [(r[1], r[2]) for r in s.surfaced()] == [("overflow", HOUR0)]
-    rig.query("SELECT 1")
+    first = s.surfaced()[0][3]
+    assert rig.query("SELECT surfaced FROM deliveries WHERE id = ?", (first,)) == [(1,)]
+    s.fail("two")  # a second eviction in the same hour: no second row, no second mark
+    assert [(r[1], r[2], r[3]) for r in s.surfaced()] == [("overflow", HOUR0, first)]
+    assert rig.query("SELECT COUNT(*) FROM deliveries WHERE outcome = 'dropped'") == [(2,)]
+    assert rig.query("SELECT id FROM deliveries WHERE surfaced = 1 AND outcome = 'dropped'") == [
+        (first,)
+    ]
     assert rig.query("SELECT COUNT(*) FROM queue") == [(100,)]
 
 
@@ -272,4 +281,41 @@ def test_failures_in_a_transaction_that_rolls_back_leave_no_row(
     assert rig.query("SELECT outcome, surfaced FROM deliveries") == [("sending", 0)]
 
 
-_ = flush_mod
+def test_the_hook_payloads_of_a_deferral_and_an_expiry_fit_the_schema(
+    rig: Rig, make_hook: MakeHook
+) -> None:
+    h = make_hook()
+    s = Setup(
+        rig,
+        destinations={"chat": {"notifier": rig.notifier("chat"), "max_per_hour": 1}},
+        **hooks_config(h),
+    )
+    s.fail("one")
+    s.fail("two")  # over the cap: deferred, rate_capped
+    old = NOW - DAY - 5
+    seed(rig, "chat", created_at=old, now=old)
+    flush(rig, "--destination", "chat")
+    flush(rig)
+    payloads = [json.loads(r["stdin"]) for r in h.runs()]
+    assert {(p["code"], p["outcome"]) for p in payloads} >= {
+        ("rate_capped", "deferred"),
+        ("expired", "expired"),
+    }
+    assert all(hook_errors(p) == [] for p in payloads)
+
+
+def test_the_hook_payload_of_an_overflow_fits_the_schema(rig: Rig, make_hook: MakeHook) -> None:
+    h = make_hook()
+    s = Setup(
+        rig,
+        rules=[{"name": "pt", "match": {"level_min": "info"}, "notify": ["chat"]}],
+        **hooks_config(h),
+    )
+    s.behave("rate_limited", retryable=True)
+    for i in range(100):
+        seed(rig, "chat", level="warn", deliver_after=NOW + 10_000, message=f"q{i}")
+    s.fail("one")
+    flush(rig)
+    (payload,) = [json.loads(r["stdin"]) for r in h.runs()]
+    assert (payload["code"], payload["outcome"]) == ("overflow", "dropped")
+    assert hook_errors(payload) == []

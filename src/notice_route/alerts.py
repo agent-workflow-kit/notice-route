@@ -11,13 +11,18 @@ a crash in between loses the hook (best effort, at most once).
 
 Choices where the interface is silent (the narrower reading):
 
-- A row whose ``deliveries`` row is gone, whose destination is not configured or is disabled now,
+- A row whose ``deliveries`` row is gone, whose destination is no longer configured,
   or whose columns do not fit the payload grammar (the database is a file anyone with write access
   to the state directory can edit) is marked processed and skipped: no alert, no hook, no error.
 - A failure whose notification has source ``notice-route`` (an alert's own failure, cap, overflow
   or expiry) runs the hooks and routes nothing, so an alert never causes another alert.
-- An alert no rule routes (``no_rule`` or a ``drop`` rule) writes no ``deliveries`` row, only a
-  log line (as ``send`` logs them); the failing row's ``surfaced`` flag and the hook remain.
+- An alert no rule routes (``no_rule`` or a ``drop`` rule) writes the destination-less
+  ``deliveries`` row ``send`` writes (source ``notice-route``, outcome ``dropped``, reason
+  ``no_rule`` or ``rule_drop``) and a log line; it is never surfaced. The failing row's
+  ``surfaced`` flag and the hook remain.
+- A row of a destination that is disabled now still routes its alert and runs the hook (only
+  ``expired`` is restricted to enabled destinations, where it is surfaced); a destination
+  removed from the config is skipped.
 - The payload carries no title, message, link or payload text of the failing notification: its
   fields come from validated columns only, and the alert's text comes from the rule's templates
   through :mod:`notice_route.render` (so hostile text is sanitized or excluded there).
@@ -31,15 +36,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import log as logmod
-from .decide import decide_alert
+from .decide import _object_id, decide_alert, labels_text  # pyright: ignore[reportPrivateUsage]
 from .dryrun import make_notice
 from .gateway import Gateway
 from .links import build_links
 from .match import decide as match_decide
 from .payload import alert_notification
-from .queue import Lease
+from .queue import Lease, insert_delivery
 from .render import render
-from .store import Store
+from .store import Store, StoreError
 from .surfacing import HOURLY_CODES
 from .validate import LEVELS, Config
 
@@ -68,9 +73,13 @@ class HookJob:
 
 @dataclass
 class Taken:
+    """What a run took. ``error`` is set when the state database could not be written part way:
+    the rows committed before it are all here and stay taken."""
+
     jobs: list[HookJob] = field(default_factory=list[HookJob])
     log: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])  # delivery records
     taken: int = 0
+    error: bool = False
 
 
 def _labels(text: object) -> list[str] | None:
@@ -96,10 +105,10 @@ def build_payload(
     config: Config, destination: str, code: str, delivery_id: int, delivery: tuple[Any, ...]
 ) -> dict[str, Any] | None:
     """The ``post-fail`` payload of one surfaced row, or ``None`` when the destination is not
-    configured and enabled or a column does not fit the grammar of schemas/hooks/post-fail.json.
+    configured or a column does not fit the grammar of schemas/hooks/post-fail.json.
     ``delivery`` is ``(source, level, attempts, outcome, labels)`` of the failing row."""
     dest = config.destinations.get(destination)
-    if dest is None or not dest.enabled:
+    if dest is None:
         return None
     source, level, attempts, outcome, labels_text = delivery
     labels = _labels(labels_text)
@@ -136,36 +145,65 @@ def build_payload(
 
 def take_surfaced(gateway: Gateway, store: Store, config: Config, worst: float) -> Taken:
     """Take the pending ``surfaced`` rows, oldest first, one transaction each (at most
-    :data:`MAX_ROWS`). ``StoreError`` propagates; rows taken before it stay taken."""
+    :data:`MAX_ROWS`). A ``StoreError`` ends the run with ``error`` set: the jobs and log lines
+    of the rows committed before it are returned, since those rows stay taken."""
     out = Taken()
     while out.taken < MAX_ROWS:
+        try:
+            one = _take_one(gateway, store, config, worst)
+        except StoreError:
+            out.error = True
+            break
+        if one is None:
+            break
+        out.taken += 1
+        out.jobs += one.jobs
+        out.log += one.log
+    return out
+
+
+def _take_one(gateway: Gateway, store: Store, config: Config, worst: float) -> Taken | None:
+    """One row in one transaction; ``None`` when none is pending. A fault of the routing (not of
+    the database) rolls the row's alert back, and the row is still marked processed in a
+    transaction of its own, so that it cannot block every later run; its hook job is kept."""
+    one = Taken()
+    row_id: int | None = None
+    try:
         with store.write() as conn:
             row = conn.execute(
                 "SELECT id, destination, code, delivery_id FROM surfaced WHERE processed = 0"
                 " ORDER BY id LIMIT 1"
             ).fetchone()
             if row is None:
-                break
-            conn.execute("UPDATE surfaced SET processed = 1 WHERE id = ?", (row[0],))
-            out.taken += 1
+                return None
+            row_id = int(row[0])
+            conn.execute("UPDATE surfaced SET processed = 1 WHERE id = ?", (row_id,))
             delivery_id = row[3]
             if type(delivery_id) is not int:
-                continue
+                return one
             found = conn.execute(
                 "SELECT source, level, attempts, outcome, labels FROM deliveries WHERE id = ?",
                 (delivery_id,),
             ).fetchone()
             if found is None:
-                continue
+                return one
             payload = build_payload(config, str(row[1]), str(row[2]), delivery_id, tuple(found))
             if payload is None:
-                continue
-            out.jobs.append(HookJob(str(row[1]), payload))
+                return one
+            one.jobs.append(HookJob(str(row[1]), payload))
             if payload["notification_source"] == "notice-route":
-                continue  # an alert's own failure: hooks only
+                return one  # an alert's own failure: hooks only
             lease = Lease.at(gateway.wall(), worst)
-            _route(gateway, conn, config, payload, lease, out)
-    return out
+            _route(gateway, conn, config, payload, lease, one)
+    except StoreError:
+        raise
+    except Exception:  # a fault of the routing: never block the later rows
+        if row_id is None:
+            raise
+        one.log.clear()
+        with store.write() as conn:
+            conn.execute("UPDATE surfaced SET processed = 1 WHERE id = ?", (row_id,))
+    return one
 
 
 def _route(
@@ -181,6 +219,19 @@ def _route(
     base: dict[str, Any] = {"source": n.source, "hook": n.hook, "event_id": n.event_id}
     if decision.rule is None or decision.outcome == "dropped":
         reason = "no_rule" if decision.rule is None else "rule_drop"
+        insert_delivery(  # as ``send`` records them: in ``history``, never surfaced
+            conn,
+            ts=lease.now,
+            source=n.source,
+            level="info",
+            outcome="dropped",
+            hook=n.hook,
+            object_id=_object_id(n.object_id),
+            rule=None if decision.rule is None else decision.rule.name,
+            reason=reason,
+            event_id=None,
+            labels=labels_text(n.labels),
+        )
         out.log.append(
             base
             | {

@@ -67,6 +67,8 @@ def run_hook(gateway: Gateway, hook: Hook, payload: Mapping[str, Any]) -> str | 
         return "lost"
     except (ValueError, SigchldIgnoredError):
         return "spawn_failed"
+    except Exception:  # best effort: nothing a hook does or an OS fault changes a result
+        return "lost"
     if result.status == "exited":
         return None if result.returncode == 0 else "nonzero_exit"
     return result.status
@@ -82,6 +84,6 @@ def start_detached(gateway: Gateway, hook: Hook, payload: Mapping[str, Any]) -> 
             timeout=hook.timeout,
             stdin=hook_stdin(payload),
         )
-    except ValueError:
+    except Exception:  # a bad argument or an OS fault: never raised into the caller
         return "spawn_failed"
     return None if started else "spawn_failed"

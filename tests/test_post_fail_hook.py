@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from notice_route.gateway import SYSTEM_TZ_DIRS
-from tests.alerts_support import ALERT_RULE, SEND_RULE, MakeHook, Setup, hook_errors, hooks_config
+from notice_route.gateway import SYSTEM_TZ_DIRS, Gateway
+from tests.alerts_support import MakeHook, Setup, hook_errors, hooks_config
 from tests.fakes import alive
-from tests.flush_support import flush
+from tests.flush_support import checked_log
 from tests.send_support import CANARY, Rig
 
 _HAVE_ZONES = any((Path(d) / "America" / "New_York").is_file() for d in SYSTEM_TZ_DIRS)
@@ -35,7 +36,13 @@ def test_the_hook_gets_the_payload_on_stdin_and_the_documented_environment(
     h = make_hook()
     s = with_hooks(rig, h)
     s.fail("boom", extra=("--label", "team=a"))
-    code, _, err = s.flush()
+    leak = rig.tmp_path / "inheritable-file"
+    leak_fd = os.open(leak, os.O_RDWR | os.O_CREAT, 0o600)
+    os.set_inheritable(leak_fd, True)  # a descriptor a careless child would inherit
+    try:
+        code, _, err = s.flush()
+    finally:
+        os.close(leak_fd)
     assert (code, err) == (0, "")
     (run,) = h.runs()
     payload = json.loads(run["stdin"])
@@ -56,11 +63,11 @@ def test_the_hook_gets_the_payload_on_stdin_and_the_documented_environment(
     assert run["env"]["NOTICE_ROUTE_OBJECT_TYPE"] == "destination"
     assert run["argv"] == []  # nothing of the payload on the command line
     assert run["cwd"] == "/"
-    # nothing but stdin, stdout, stderr, the directory the fake itself lists and what the
-    # interpreter opens for itself (3.12 holds a transparent-hugepage probe)
-    own = ("/proc/", "/sys/kernel/mm/", "?")
-    leaked = {k: v for k, v in run["fd_targets"].items() if int(k) > 2 and not v.startswith(own)}
-    assert leaked == {}, leaked
+    # no descriptor of the router or the test reaches the hook, whatever the interpreter opens
+    # for itself: the inheritable file, the state and the temporary directories are not listed
+    targets = list(run["fd_targets"].values())
+    assert str(leak) not in targets
+    assert not [t for t in targets if t.startswith((str(rig.tmp_path), str(rig.home)))], targets
     assert run["pgid"] == run["sid"] != os.getsid(0)  # a session and group of its own
     assert "credential_invalid" not in json.dumps(run["env"])
 
@@ -71,7 +78,7 @@ def test_the_environment_of_the_router_does_not_reach_the_hook(
     h = make_hook()
     s = with_hooks(rig, h)
     s.fail("boom")
-    s.flush(env={"AWS_SECRET_THING": CANARY, "OPS_CRED": CANARY, "PATH": "/usr/bin:/bin"})
+    s.flush(env={"CANARY_VALUE_XYZ": CANARY, "OPS_CRED": CANARY, "PATH": "/usr/bin:/bin"})
     assert CANARY not in json.dumps(h.runs()[0]["env"])
 
 
@@ -248,4 +255,97 @@ def test_flush_in_a_dry_run_starts_no_hook(rig: Rig, make_hook: MakeHook) -> Non
     s.fail("boom")
     s.flush("--dry-run")
     assert h.runs() == []
-    _ = flush, ALERT_RULE, SEND_RULE
+
+
+class _Raising(Gateway):
+    def run(self, *a: Any, **k: Any) -> Any:
+        raise OSError("boom")
+
+    def run_detached(self, *a: Any, **k: Any) -> bool:
+        raise OSError("boom")
+
+
+def test_a_gateway_fault_in_a_hook_is_lost_and_never_raised() -> None:
+    from notice_route.hooks import run_hook, start_detached
+    from notice_route.validate import Hook
+
+    hook = Hook(cmd="/bin/true", timeout=5.0, is_async=False)
+    assert run_hook(_Raising(), hook, {"object_id": "chat"}) == "lost"
+    assert start_detached(_Raising(), hook, {"object_id": "chat"}) == "spawn_failed"
+
+
+def test_a_hook_that_raises_does_not_stop_the_later_detached_starts(
+    rig: Rig, make_hook: MakeHook, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from notice_route import flush as flush_mod
+
+    sync, detached = make_hook("sync"), make_hook("detached")
+
+    def boom(*_a: Any, **_k: Any) -> str | None:
+        raise OSError("boom")
+
+    monkeypatch.setattr(flush_mod, "run_hook", boom)
+    s = Setup(
+        rig,
+        hooks={
+            "post-fail": [
+                {"cmd": sync.cmd, "async": False},
+                {"cmd": detached.cmd, "async": True},
+            ]
+        },
+    )
+    s.fail("boom")
+    code, _, err = s.flush()
+    assert code == 0 and err.count("a post-fail hook failed (lost)") == 1
+    assert len(s.ops.events("invoke")) == 1
+    detached.wait_for("run")
+    assert sync.runs() == []
+
+
+def test_after_a_signal_no_sync_hook_is_started_and_the_taken_ones_go_detached(
+    rig: Rig, make_hook: MakeHook, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from notice_route import flush as flush_mod
+
+    h = make_hook(sleep=0.2)
+    s = with_hooks(rig, h, timeout="20s")
+    s.fail("boom")
+    real = flush_mod._take_surfaced
+
+    def take_then_signal(run: Any, store: Any) -> Any:
+        taken = real(run, store)
+        run.trap.received = signal.SIGTERM
+        return taken
+
+    monkeypatch.setattr(flush_mod, "_take_surfaced", take_then_signal)
+    t0 = time.monotonic()
+    code, _, err = rig.run("flush", "--json")
+    assert code == 128 + signal.SIGTERM and time.monotonic() - t0 < 5
+    assert s.ops.events("invoke") == []  # no further call after the signal
+    run = h.wait_for("run")  # started once, detached, by the supervisor
+    assert hook_errors(json.loads(run["stdin"])) == []
+    assert len(h.runs()) == 1 and "failed" not in err
+    assert s.surfaced()[0][4] == 1  # taken: not lost
+
+
+def test_the_hooks_are_logged_with_the_observed_result(rig: Rig, make_hook: MakeHook) -> None:
+    ok, bad, detached = make_hook("ok"), make_hook("bad", exit=3), make_hook("det")
+    s = Setup(
+        rig,
+        hooks={
+            "post-fail": [
+                {"cmd": ok.cmd},
+                {"cmd": bad.cmd},
+                {"cmd": detached.cmd, "async": True},
+            ]
+        },
+    )
+    s.fail("boom")
+    s.flush()
+    detached.wait_for("run")
+    found = [x for x in checked_log(rig) if x["record"] == "hook"]
+    assert sorted((x["mode"], x["result"]) for x in found) == [
+        ("async", "started"), ("sync", "nonzero_exit"), ("sync", "ok"),
+    ]  # fmt: skip
+    for x in found:
+        assert (x["destination"], x["hook"], x["source"]) == ("chat", "post-fail", None)
