@@ -64,10 +64,12 @@ from typing import Any
 
 from . import dedup
 from . import log as logmod
+from .alerts import HookJob, take_surfaced
 from .calling import Busy, Called, CallEnd, Escaped, Gate, NotRun, Skipped, call_row
 from .decide import claim_call, count_call, give_back, hour_start, instant
 from .digest import Digest, build, record_digest, record_escaped_digest
 from .gateway import DirHandle, Gateway, SignalTrap
+from .hooks import run_hook, start_detached
 from .outcome import LOCK_BUSY, Applied, Outcome, classify, record_escaped
 from .payload import LEVELS, UsageError
 from .queue import (
@@ -99,6 +101,7 @@ _STOPPING = ("sent", "disabled")  # the classified outcomes after which the run 
 _ROW_FAULT = "a queue row could not be used"  # fixed texts of an exit 1 (never an exception's)
 _LOCK_FAULT = "a flush lock cannot be used"
 _THREAD_FAULT = "internal error"
+_HOOK_THREADS = 4  # hooks that run at the same time
 
 
 @dataclass(frozen=True)
@@ -286,10 +289,23 @@ def run_flush(
         run.writer = logmod.LogWriter(gateway, state if config.log else None)
         if full:
             _meta(store, "flush_last", wall)
-        with ThreadPoolExecutor(max_workers=len(selected)) as pool:
+        taken = _take_surfaced(run, store)
+        with (
+            ThreadPoolExecutor(max_workers=len(selected)) as pool,
+            ThreadPoolExecutor(max_workers=_HOOK_THREADS) as hook_pool,
+        ):
+            hook_futures = [
+                hook_pool.submit(run_hook, gateway, hook, job.payload)
+                for job in taken.jobs
+                for hook in config.hooks_post_fail
+                if not hook.is_async
+            ]
             futures = [pool.submit(_destination, run, d) for d in selected]
             tallies = [f.result() for f in futures]
+            hook_failures = [w for w in (f.result() for f in hook_futures) if w is not None]
         result = FlushResult(0)
+        if taken.error:
+            result.error = ("internal", "state database cannot be written")
         if full:
             missing = any(t.state == "env_missing" for t in tallies)
             try:
@@ -298,9 +314,35 @@ def run_flush(
                 result.error = ("internal", "state database cannot be written")
         finished = _finish(run, tallies, result)
         _log_summary(run, tallies)
+    for job in taken.jobs:  # detached: nothing waits for these, and no thread is running now
+        for hook in config.hooks_post_fail:
+            if hook.is_async:
+                failed = start_detached(gateway, hook, job.payload)
+                if failed is not None:
+                    hook_failures.append(failed)
+    for word in dict.fromkeys(hook_failures):
+        finished.warnings.append(f"a post-fail hook failed ({word})")
     if run.writer.problems:
         finished.warnings.append("the log could not be written")
     return finished
+
+
+@dataclass
+class _TakenRows:
+    jobs: list[HookJob]
+    error: bool = False
+
+
+def _take_surfaced(run: _Run, store: Store) -> _TakenRows:
+    """Every run (but a dry run) first takes the new ``surfaced`` rows: alerts are routed (rows
+    due now, which the destinations' step 6 delivers in this run) and the hook jobs returned."""
+    try:
+        taken = take_surfaced(run.gateway, store, run.config, run.worst)
+    except StoreError:
+        return _TakenRows([], True)
+    for record in taken.log:
+        run.log(**record)
+    return _TakenRows(taken.jobs)
 
 
 def _meta(store: Store, key: str, value: int | None) -> None:

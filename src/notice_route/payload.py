@@ -28,6 +28,7 @@ __all__ = [
     "PayloadError",
     "StrictJsonError",
     "UsageError",
+    "alert_notification",
     "check_flags",
     "classify",
     "load_notification",
@@ -428,6 +429,25 @@ def classify(obj: Mapping[str, Any], *, source: str | None, labels: Sequence[str
         )
     merged = _merge(found, _flag_labels(labels))
     return _with_labels(note, merged, ignored)
+
+
+def alert_notification(obj: Mapping[str, Any]) -> Notification:
+    """The ``post-fail`` payload the router built itself, as the hook notification of source
+    ``notice-route`` that ``flush`` routes through the rules (a failure alert). Unlike
+    :func:`classify` it accepts the reserved source: only the router calls it, with a payload it
+    made from its own columns (never from input)."""
+    found, ignored = _payload_labels(obj)
+    return Notification(
+        shape="hook",
+        source=RESERVED_SOURCE,
+        hook="post-fail",
+        event_id=_plain_id(obj.get("event_id")),
+        object_id=_plain_id(obj.get("object_id")),
+        repo=None,
+        payload=dict(obj),
+        labels=tuple(found),
+        labels_ignored=ignored,
+    )
 
 
 def _with_labels(

@@ -65,6 +65,7 @@ __all__ = [
     "CallResult",
     "CallStatus",
     "EnvBuild",
+    "base_env",
     "build_argv",
     "build_env",
     "call_deadline",
@@ -169,6 +170,18 @@ def _passable(value: str | None) -> str | None:
     return value
 
 
+def base_env(gateway: Gateway) -> dict[str, str]:
+    """The fixed part of every child's environment (notifier calls and hooks): ``PATH`` (the
+    router's own, cleaned), ``LANG`` and ``LC_ALL``."""
+    source = gateway.environ()
+    path = gateway.clean_path(source.get("PATH", ""))
+    return {
+        "PATH": path or DEFAULT_PATH,
+        "LANG": _locale(source.get("LANG")),
+        "LC_ALL": _locale(source.get("LC_ALL")),
+    }
+
+
 def build_env(gateway: Gateway, destination: Destination) -> EnvBuild:
     """The scrubbed environment of one call. Raises ``ValueError`` for an ``env`` name outside
     ``[A-Za-z_][A-Za-z0-9_]{0,127}`` or in the fixed set (config validation forbids both)."""
@@ -176,12 +189,7 @@ def build_env(gateway: Gateway, destination: Destination) -> EnvBuild:
         if _NAME.fullmatch(name) is None or name in FIXED_NAMES:
             raise ValueError("a destination env name is outside the grammar or fixed")
     source = gateway.environ()
-    path = gateway.clean_path(source.get("PATH", ""))
-    env: dict[str, str] = {
-        "PATH": path or DEFAULT_PATH,
-        "LANG": _locale(source.get("LANG")),
-        "LC_ALL": _locale(source.get("LC_ALL")),
-    }
+    env = base_env(gateway)
     if destination.kind == "wsl-notice":
         for name in _WSL_NAMES:
             value = _passable(source.get(name))

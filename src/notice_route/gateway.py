@@ -519,6 +519,47 @@ class Gateway:
             )
         return _Supervisor(self.clock, proc, payload, started + timeout, started).run()
 
+    def run_detached(
+        self,
+        argv: Sequence[str],
+        *,
+        env: Mapping[str, str],
+        timeout: float,
+        stdin: str | bytes | None = None,
+    ) -> bool:
+        """Start ``argv`` as :meth:`run` does, detached: a double fork leaves a supervisor (a
+        session of its own, every descriptor beyond 0 to 2 closed and those three on
+        ``/dev/null``, so it holds no lock of this process) that runs :meth:`run` with the same
+        deadline and exits. Returns once the supervisor is started; ``False`` when a fork failed.
+        The arguments are checked first (``ValueError``). The caller must have no other thread
+        running and no output pending."""
+        if not list(argv) or not all(isinstance(a, str) and "\x00" not in a for a in argv):
+            raise ValueError("argv must be a non-empty list of strings without NUL")
+        try:
+            pid = os.fork()
+        except OSError:
+            return False
+        if pid != 0:
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+            return True
+        try:  # the first child: leave the caller's session, fork again, vanish
+            os.setsid()
+            if os.fork() != 0:
+                os._exit(0)
+            null = os.open(os.devnull, os.O_RDWR)
+            for fd in (0, 1, 2):
+                os.dup2(null, fd)
+            os.closerange(3, 4096)
+            try:
+                self.run(argv, env=env, timeout=timeout, stdin=stdin)
+            finally:
+                os._exit(0)
+        except BaseException:  # nothing may return into the caller's code from a forked child
+            os._exit(1)
+
     def home_dir(self) -> Path:
         """The home directory from the password database; ``HOME`` and ``XDG_*`` are never read.
 

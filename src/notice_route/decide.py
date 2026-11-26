@@ -80,6 +80,7 @@ __all__ = [
     "Notice",
     "claim_call",
     "count_call",
+    "decide_alert",
     "decide_and_record",
     "env_unset",
     "give_back",
@@ -270,9 +271,13 @@ def _classify(
     now: int,
     environ: Mapping[str, str],
     retention: int,
+    alert: bool = False,
 ) -> _Plan:
     """Steps 1 to 9. ``state`` yields the connection (``None``: no database, so no records);
-    with ``write`` the repeat check and the counter write, otherwise they only read."""
+    with ``write`` the repeat check and the counter write, otherwise they only read. An ``alert``
+    (a failure alert, :func:`decide_alert`) stops after step 6: a destination that would be sent
+    now gets an unclaimed ``single`` row due now (``flush`` claims it, so the credential and the
+    cap apply there)."""
     level = notice.level
     if level not in LEVELS:
         raise ValueError("level must be one of info, warn, action, error")
@@ -316,6 +321,8 @@ def _classify(
     if quiet and level in ("warn", "action"):
         assert window is not None
         return _Plan("defer", "deferred", "quiet", "held", quiet_deliver_after(window, now))
+    if alert:
+        return _Plan("defer", "deferred", None, "single", now)
     if env_unset(dest.env, environ):
         return _Plan("defer", "deferred", "env_missing", "single", now)
     next_hour = hour_start(now) + HOUR
@@ -410,39 +417,69 @@ def decide_and_record(
     there (docs/design.md C-46). Any exception rolls the whole transaction back: nothing is
     half decided. A send-now result carries a fresh claim token; the notifier call (#19) must
     use it to record its outcome."""
-    retention = math.ceil(config.retention_event_ids)
     with store.write() as conn:
         lease = Lease.at(gateway.wall(), worst_case_s(config))
-        now = lease.now
-        environ = dict(gateway.environ())
-        out: list[DestinationDecision] = []
-        for name in dict.fromkeys(destinations):
-            dest = config.destinations[name]
-            plan = _classify(
-                lambda: conn,
-                write=True,
-                config=config,
-                dest=dest,
-                notice=notice,
-                now=now,
-                environ=environ,
-                retention=retention,
+        return _decide_all(
+            conn, gateway, config, notice, destinations, lease, dict(gateway.environ()), False
+        )
+
+
+def decide_alert(
+    conn: _Conn,
+    gateway: Gateway,
+    config: Config,
+    notice: Notice,
+    destinations: Sequence[str],
+    lease: Lease,
+) -> list[DestinationDecision]:
+    """The decision of a failure alert for every destination of its rule, inside the caller's
+    ``Store.write`` transaction: steps 1 to 6 and then an unclaimed ``single`` row due now (no
+    claim, no counter, no ``env`` check: ``flush`` does those when it calls). The redelivery check
+    never applies to the router's own source (:func:`dedup.is_redelivered`)."""
+    return _decide_all(conn, gateway, config, notice, destinations, lease, {}, True)
+
+
+def _decide_all(
+    conn: _Conn,
+    gateway: Gateway,
+    config: Config,
+    notice: Notice,
+    destinations: Sequence[str],
+    lease: Lease,
+    environ: Mapping[str, str],
+    alert: bool,
+) -> list[DestinationDecision]:
+    retention = math.ceil(config.retention_event_ids)
+    now = lease.now
+    out: list[DestinationDecision] = []
+    for name in dict.fromkeys(destinations):
+        dest = config.destinations[name]
+        plan = _classify(
+            lambda: conn,
+            write=True,
+            config=config,
+            dest=dest,
+            notice=notice,
+            now=now,
+            environ=environ,
+            retention=retention,
+            alert=alert,
+        )
+        if plan.decision == "suppress":
+            repeats = None
+            if plan.reason == "repeat":
+                found = conn.execute(
+                    "SELECT d.count FROM dedup x JOIN deliveries d ON d.id = x.delivery_id"
+                    " WHERE x.destination = ? AND x.key_digest = ?",
+                    (name, notice.dedupe),
+                ).fetchone()
+                repeats = None if found is None else int(found[0])
+            out.append(
+                DestinationDecision(name, "suppress", "suppressed", plan.reason, count=repeats)
             )
-            if plan.decision == "suppress":
-                repeats = None
-                if plan.reason == "repeat":
-                    found = conn.execute(
-                        "SELECT d.count FROM dedup x JOIN deliveries d ON d.id = x.delivery_id"
-                        " WHERE x.destination = ? AND x.key_digest = ?",
-                        (name, notice.dedupe),
-                    ).fetchone()
-                    repeats = None if found is None else int(found[0])
-                out.append(
-                    DestinationDecision(name, "suppress", "suppressed", plan.reason, count=repeats)
-                )
-                continue
-            out.append(_record(conn, gateway, plan, dest, notice, lease, retention))
-        return out
+            continue
+        out.append(_record(conn, gateway, plan, dest, notice, lease, retention))
+    return out
 
 
 def _record(
