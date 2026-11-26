@@ -2,6 +2,9 @@
 # team-chat and desktop in config.yaml. It holds the producer rules; config.example.yaml holds the
 # destinations phone, team-chat and desktop and the router's own rules. It holds rules only; rule
 # names must not be used in your own config.
+#
+# Wiring hazard: wire either agent-spawn's or claude-session's state hooks to notifications, not
+# both (see "Wiring hazards" in docs/interface.md). The rules below are for agent-spawn.
 
 rules:
   # A launch is not worth a notification. drop allows only name and match.
@@ -101,6 +104,18 @@ rules:
     title: "Review failed"
     message: "Review attention ({{reason}}) for {{object_id}}."
     link: "{{pr_url}}"
+
+  # A host-level attention (the host cannot be polled): no PR, so no link.
+  - name: review-poll-failed
+    match:
+      source: review-watch
+      hook: post-attention
+      where:
+        reason: poll_failed
+    notify: [team-chat]
+    level: warn
+    title: "Review polling failed"
+    message: "Review watch cannot poll {{object_id}}."
 
   - name: review-attention
     match:

@@ -28,6 +28,7 @@ def test_every_golden_json_directory_is_mapped() -> None:
 
 @pytest.mark.parametrize("path", FILES, ids=lambda p: f"{p.parent.name}/{p.name}")
 def test_golden_file_matches_its_schema(path: Path) -> None:
+    # An empty-array golden (history/none.json) proves well-formedness only: it cannot fail.
     document = json.loads(path.read_text(encoding="utf-8"))
     assert schema_errors(document, SCHEMA_OF[path.parent.name]) == []
 
