@@ -301,7 +301,7 @@ def apply_outcome(
     ).fetchone()
     if state is None:
         raise ValueError("the row's delivery does not exist")
-    attempts = int(state[0]) + (1 if outcome.counted else 0)
+    attempts = max(int(state[0]), 0) + (1 if outcome.counted else 0)  # clamp a corrupt count
     prior_reason = state[1]
 
     message: str | None = None

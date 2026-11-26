@@ -148,7 +148,8 @@ def record_digest(
             )
             if plain_retry:
                 counts = [
-                    a + (1 if outcome.counted else 0) for a in _attempts(conn, members, token)
+                    max(a, 0) + (1 if outcome.counted else 0)
+                    for a in _attempts(conn, members, token)
                 ]
                 alive = [a for a in counts if base(a) is not None]
                 later = base(max(alive)) if alive else None

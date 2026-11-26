@@ -85,10 +85,14 @@ def test_a_bad_attempt_count_is_refused(bad: Any) -> None:
         at(bad)
 
 
-@pytest.mark.parametrize("bad", [True, 1.5, math.nan, "1", None, -1])
+@pytest.mark.parametrize("bad", [True, 1.5, math.nan, "1", None])
 def test_a_bad_clock_value_is_refused(bad: Any) -> None:
     with pytest.raises((TypeError, ValueError)):
         retry.retry_schedule("slack-notice", bad)
+
+
+def test_a_negative_clock_value_works_like_any_other() -> None:
+    assert retry.retry_schedule("slack-notice", -1000)(1) == -1000 + 60
 
 
 @pytest.mark.parametrize("bad", [None, 5, b"slack-notice", ["slack-notice"]])

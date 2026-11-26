@@ -29,7 +29,8 @@ This plan implements [interface.md](interface.md) and [design.md](design.md). It
 | `queue.py` | 3 | queue rows, claims, leases, the cap and eviction |
 | `dedup.py` | 3 | the repeat and redelivery checks, the lifetime of their records |
 | `decide.py` | 3 | the per-destination decision order; calls `dedup.py` for dedup, holds the rate statements |
-| `notifier.py` | 4 | building the call, the child process, classification, the retry schedule |
+| `notifier.py` | 4 | building the call, the child process, classification |
+| `retry.py` | 4 | the retry schedule and attempt caps |
 | `log.py` | 4 | the public `log.jsonl` |
 | `flush.py` | 5 | due rows, digests, delivery, heartbeat |
 | `history.py` | 5 | the `history` command and `prune` |

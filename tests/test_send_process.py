@@ -417,7 +417,7 @@ def test_a_claim_lost_during_the_call_is_logged_and_shown_as_classified(rig: Rig
         "rate_limited",
         1,
     )
-    assert d["deliver_after"] == NOW  # shown due now: the claimant that took the row sends it
+    assert d["deliver_after"] == NOW  # shown as classified: nothing is stored for a lost claim
     assert "the claim was lost" in err
     assert rig.query("SELECT outcome, attempts FROM deliveries") == [("sending", 0)]
     assert [(x["outcome"], x["code"]) for x in rig.log_lines()] == [

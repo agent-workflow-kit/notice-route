@@ -42,8 +42,6 @@ def retry_schedule(kind: str, now: int) -> Callable[[int], int | None]:
     """The schedule of a ``kind`` destination for a call that ended at ``now``."""
     cap = attempt_cap(kind)
     ended = _int(now, "now")
-    if ended < 0:
-        raise ValueError("now must not be negative")
 
     def retry_at(attempts: int) -> int | None:
         n = _int(attempts, "attempts")

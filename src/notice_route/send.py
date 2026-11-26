@@ -28,8 +28,8 @@ Choices where the interface is silent (docs/design.md C-52 has the reasons):
 - A result that cannot be recorded (``StoreError`` after one retry, or any other exception of the
   recording) is logged only, the claim lapses and ``flush`` resends (a duplicate is possible); the
   command exits 1 ``internal`` after it has handled every other destination. A result whose claim
-  was lost goes to the log and the output as classified (a queued retry is shown due now: the
-  claimant that took the row sends it).
+  was lost goes to the log and the output as classified (a queued retry is shown as classified:
+  nothing is stored for a lost claim, the claimant that took the row decides).
 - ``not_started`` (an internal fault) records nothing, is not logged (``outcome`` has no word for
   it) and ends the command with exit 1.
 - Seams, injectable through :class:`Seams`: the retry schedule (:mod:`notice_route.retry` by

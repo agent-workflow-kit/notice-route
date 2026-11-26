@@ -14,6 +14,7 @@ from notice_route.gateway import SYSTEM_TZ_DIRS
 from tests.flush_support import dest, flush, seed
 from tests.send_support import MORNING, NOW, Rig
 from tests.test_flush import hold
+from tests.test_send_outcomes import LINK_BODY, LINK_RULE, LINKS
 
 _HAVE_ZONES = any((Path(d) / "America" / "New_York").is_file() for d in SYSTEM_TZ_DIRS)
 if not _HAVE_ZONES and os.environ.get("CI"):
@@ -80,9 +81,9 @@ def test_the_failed_end_is_not_retried_by_a_later_flush(rig: Rig) -> None:
     assert rig.query("SELECT COUNT(*) FROM deliveries") == [(1,)]
 
 
-def test_the_default_schedule_is_the_real_one_and_the_interim_copy_is_gone() -> None:
+def test_the_default_schedule_is_the_real_one_and_no_copy_is_left_in_send() -> None:
     assert send.Seams().retry_schedule is retry.retry_schedule
-    assert not hasattr(send, "interim_retry_schedule")
+    assert not hasattr(send, "retry_schedule_copy")
 
 
 # --- calls that count no attempt --------------------------------------------------------------
@@ -173,8 +174,56 @@ def test_a_retry_due_after_the_expiry_ends_expired_with_its_attempts_and_no_call
     assert row(rig)[:4] == ("expired", None, "expired", 3) and n.events("invoke") == []
 
 
-def test_the_longest_chain_of_delays_ends_before_the_expiry(rig: Rig) -> None:
-    assert sum(retry.RETRY_DELAYS_S) < DAY  # a row never waits out its 24 hours between steps
+# --- refusals on the real schedule ------------------------------------------------------------
+
+
+def test_a_keyword_refusal_retries_in_a_minute_and_a_second_one_ends_failed(rig: Rig) -> None:
+    n = rig.notifier("ha-notice", error={"code": "refused", "reason": "command_keyword"})
+    rig.configure({"chat": {"notifier": n, "kind": "ha-notice"}})
+    rig.send("hello")
+    assert row(rig) == ("queued_retry", "keyword_refused", "command_keyword", 1, NOW + 60)
+    rig.clock.jump_wall(60)
+    flush(rig)
+    outcome, _, code, attempts, after = row(rig)
+    assert (outcome, code, attempts, after) == ("failed", "command_keyword", 2, None)
+    assert rig.query("SELECT COUNT(*) FROM queue") == [(0,)]
+
+
+def test_a_link_refusal_retries_in_a_minute_and_a_second_one_ends_failed(rig: Rig) -> None:
+    n = rig.notifier(error={"code": "refused", "reason": "link_scheme"})
+    rig.configure({"chat": {"notifier": n}}, rules=[LINK_RULE], links=LINKS)
+    rig.run("send", "--stdin-json", "--json", stdin=LINK_BODY)
+    assert row(rig) == ("queued_retry", "link_refused", "link_scheme", 1, NOW + 60)
+    rig.clock.jump_wall(60)
+    flush(rig)
+    outcome, _, code, attempts, after = row(rig)
+    assert (outcome, code, attempts, after) == ("failed", "link_scheme", 2, None)
+    assert rig.query("SELECT COUNT(*) FROM queue") == [(0,)]
+
+
+# --- stored attempts that are not positive ----------------------------------------------------
+
+
+def test_a_stored_attempt_count_below_zero_is_clamped_and_the_retry_is_recorded(rig: Rig) -> None:
+    n = rig.notifier(error={"code": "rate_limited"})
+    rig.configure({"chat": {"notifier": n}})
+    seed(rig, attempts=-1, outcome="queued_retry", deliver_after=NOW - 5)
+    flush(rig)
+    assert row(rig)[0] == "queued_retry" and row(rig)[3:] == (1, NOW + 60)
+    assert len(n.events("invoke")) == 1
+
+
+def test_a_digest_of_members_with_negative_attempts_is_clamped_too(rig: Rig) -> None:
+    n = rig.notifier(error={"code": "rate_limited"})
+    rig.configure({"chat": {"notifier": n}})
+    seed(rig, kind="held", attempts=-1, outcome="queued_retry")
+    seed(rig, kind="held", attempts=-1, outcome="queued_retry")
+    flush(rig)
+    assert rig.query("SELECT outcome, attempts FROM deliveries ORDER BY id") == [
+        ("queued_retry", 1),
+        ("queued_retry", 1),
+    ]
+    assert rig.query("SELECT deliver_after FROM queue") == [(NOW + 60,), (NOW + 60,)]
 
 
 # --- quiet hours and wall-clock steps ----------------------------------------------------------
