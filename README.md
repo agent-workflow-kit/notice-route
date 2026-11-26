@@ -43,7 +43,7 @@ Specified in [docs/interface.md](docs/interface.md#commands).
 
 ## Wiring a producer
 
-One line in the producer's own config, for example `notice-route send --source agent-spawn --stdin-json` on its `post-state-change` hook. Wire either agent-spawn's or claude-session's state hooks to notifications, not both. Never allow `notice-route send` or a notifier in an agent session's permission profile; a session's events reach the router through agent-spawn's and claude-session's hooks.
+One line in the producer's own config, for example `notice-route send --source agent-spawn --stdin-json` on its `post-state-change` hook. A hook runner that knows only zero and non-zero should add `--exit-zero-on-noop`, so a no-op (exit 22) counts as success. Wire either agent-spawn's or claude-session's state hooks to notifications, not both. Never allow `notice-route send` or a notifier in an agent session's permission profile; a session's events reach the router through agent-spawn's and claude-session's hooks.
 
 | Producer | Hook | Command |
 |---|---|---|
