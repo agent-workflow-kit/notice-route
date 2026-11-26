@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -132,9 +131,7 @@ def test_a_hook_that_fails_is_run_again_by_a_later_flush_with_the_same_payload(
     assert hook_log(rig) == [("sync", "nonzero_exit"), ("sync", "ok")]
 
 
-def test_every_failure_warns_and_never_changes_the_exit_code(
-    rig: Rig, make_hook: MakeHook
-) -> None:
+def test_every_failure_warns_and_never_changes_the_exit_code(rig: Rig, make_hook: MakeHook) -> None:
     h = make_hook(exit=3)
     s = with_hooks(rig, h)
     s.fail("boom")
@@ -151,6 +148,7 @@ def test_the_retry_delays_and_the_attempt_limit(rig: Rig, make_hook: MakeHook) -
     s.fail("boom")
     t = NOW
     s.flush()
+    err = ""
     for n, delay in enumerate(DELAYS, start=1):
         assert outbox(rig) == [("chat", n, t + delay, None)]
         rig.clock.jump_wall(delay - 1)
@@ -552,8 +550,7 @@ def test_a_run_takes_at_most_one_hundred_rows(rig: Rig, make_hook: MakeHook) -> 
     s.fail("boom")
     s.flush()
     (row,) = rig.query(
-        "SELECT destination, hook_key, event_id, payload, created_at, next_attempt"
-        " FROM hook_outbox"
+        "SELECT destination, hook_key, event_id, payload, created_at, next_attempt FROM hook_outbox"
     )
     for i in range(1, 106):
         write(
@@ -567,3 +564,33 @@ def test_a_run_takes_at_most_one_hundred_rows(rig: Rig, make_hook: MakeHook) -> 
     assert len(h.runs()) == 1 + 100
     s.flush()  # the same second: the 100 are not due again, the other 6 are
     assert len(h.runs()) == 1 + 100 + 6
+
+
+def test_hook_keys_tell_equal_commands_apart_and_skip_async_entries() -> None:
+    from notice_route.outbox import hook_keys
+    from notice_route.validate import Hook
+
+    a, b = Hook("/bin/a", 30.0, False), Hook("/bin/b", 30.0, False)
+    keys = hook_keys([a, b, a, Hook("/bin/a", 5.0, True)])
+    assert keys[3] is None
+    assert len({keys[0], keys[1], keys[2]}) == 3
+    assert keys[0] is not None and keys[0].endswith(".0") and keys[2] is not None
+    assert keys[2].endswith(".1") and keys[0][:16] == keys[2][:16]
+    assert hook_keys([b, a])[1] == keys[0]  # reordering keeps an entry's identity
+    assert "/bin" not in "".join(k for k in keys if k)  # the command text is not stored
+
+
+def test_a_read_only_command_refuses_a_version_two_database_until_a_writer_migrates_it(
+    rig: Rig, make_hook: MakeHook
+) -> None:
+    h = make_hook()
+    s = with_hooks(rig, h)
+    s.fail("boom")
+    s.flush()
+    write(rig, "DROP TABLE hook_outbox")
+    write(rig, "PRAGMA user_version=2")
+    code, _, _ = rig.run("history", "--json")
+    assert code == 1
+    s.flush()
+    code, _, _ = rig.run("history", "--json")
+    assert code == 0

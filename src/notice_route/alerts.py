@@ -7,9 +7,9 @@ through the rules as a hook payload of source ``notice-route`` (decisions (1) to
 then an unclaimed ``single`` row due now: :func:`notice_route.decide.decide_alert`). Reading the
 delivery and marking the row processed happen in the same transaction (``prune`` may delete the
 delivery right after). The hook jobs it returns are started by ``flush`` after the transaction:
-the synchronous hooks are also written to the outbox in that transaction (:mod:`notice_route.outbox`,
-design C-62), which the flush runs and retries, so a crash in between loses only an ``async`` hook
-(best effort, at most once).
+the synchronous hooks are also written to the outbox in that transaction
+(:mod:`notice_route.outbox`, design C-62), which the flush runs and retries, so a crash in
+between loses only an ``async`` hook (best effort, at most once).
 
 Choices where the interface is silent (the narrower reading):
 

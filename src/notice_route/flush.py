@@ -55,8 +55,8 @@ reading:
 from __future__ import annotations
 
 import math
-import sqlite3
 import secrets
+import sqlite3
 import threading
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -409,10 +409,8 @@ def _run_outbox(run: _Run, store: Store, hook_pool: ThreadPoolExecutor) -> _Plan
     most :data:`outbox.RUN_LIMIT`) goes to a worker."""
     planned = _Planned()
     config = run.config
-    by_key = {
-        k: h for k, h in zip(outbox.hook_keys(config.hooks_post_fail), config.hooks_post_fail)
-        if k is not None
-    }  # fmt: skip
+    hooks = config.hooks_post_fail
+    by_key = {k: h for k, h in zip(outbox.hook_keys(hooks), hooks, strict=True) if k is not None}
     try:
         with store.write() as conn:
             now = instant(run.gateway.wall())
