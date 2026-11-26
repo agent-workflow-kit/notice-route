@@ -326,6 +326,8 @@ def test_after_a_signal_no_sync_hook_is_started_and_the_taken_ones_go_detached(
     assert hook_errors(json.loads(run["stdin"])) == []
     assert len(h.runs()) == 1 and "failed" not in err
     assert s.surfaced()[0][4] == 1  # taken: not lost
+    logged = [x for x in checked_log(rig) if x["record"] == "hook"]
+    assert [(x["mode"], x["result"]) for x in logged] == [("sync", "started")]
 
 
 def test_the_hooks_are_logged_with_the_observed_result(rig: Rig, make_hook: MakeHook) -> None:

@@ -99,6 +99,7 @@ __all__ = ["FlushOptions", "FlushResult", "run_flush"]
 
 _STOPPING = ("sent", "disabled")  # the classified outcomes after which the run goes on
 _ROW_FAULT = "a queue row could not be used"  # fixed texts of an exit 1 (never an exception's)
+_ROUTING_FAULT = "a failure alert could not be routed"
 _LOCK_FAULT = "a flush lock cannot be used"
 _THREAD_FAULT = "internal error"
 _HOOK_THREADS = 4  # hooks that run at the same time
@@ -350,13 +351,17 @@ def run_flush(
         detached = [(j, h) for j in taken.jobs for h in config.hooks_post_fail if h.is_async]
         for job, hook in detached + late:
             failed = start_detached(gateway, hook, job.payload)
-            hook_records.append((job.destination, "async", failed or "started"))
+            # a sync hook that a signal kept from starting is still logged as mode sync
+            mode = "sync" if (job, hook) in late else "async"
+            hook_records.append((job.destination, mode, failed or "started"))
             if failed is not None:
                 hook_failures.append(failed)
         for destination, mode, word in hook_records:
             run.log_hook(destination, mode, word)
     for word in dict.fromkeys(hook_failures):
         finished.warnings.append(f"a post-fail hook failed ({word})")
+    if taken.faults:
+        finished.warnings.append(_ROUTING_FAULT)
     if run.writer.problems:
         finished.warnings.append("the log could not be written")
     return finished
@@ -384,6 +389,7 @@ def _hook_word(future: Future[str | None]) -> str | None:
 class _TakenRows:
     jobs: list[HookJob]
     error: bool = False
+    faults: int = 0
 
 
 def _take_surfaced(run: _Run, store: Store) -> _TakenRows:
@@ -392,7 +398,7 @@ def _take_surfaced(run: _Run, store: Store) -> _TakenRows:
     taken = take_surfaced(run.gateway, store, run.config, run.worst)
     for record in taken.log:
         run.log(**record)
-    return _TakenRows(taken.jobs, taken.error)
+    return _TakenRows(taken.jobs, taken.error, taken.faults)
 
 
 def _meta(store: Store, key: str, value: int | None) -> None:

@@ -65,8 +65,10 @@ def test_a_fault_in_the_routing_of_a_row_does_not_block_the_later_rows(
     s = Setup(rig, **hooks_config(h))
     five_failures(s)
     counting_route(monkeypatch, 2, RuntimeError("fault"))
-    code, _, _ = s.flush()
-    assert code == 0
+    code, _, err = s.flush()
+    assert code == 0  # the fault does not change the exit code
+    assert err.count("a failure alert could not be routed") == 1  # one fixed-word warning
+    assert "fault" not in err.replace("a failure alert could not be routed", "")
     assert [r[4] for r in s.surfaced()] == [1, 1, 1, 1, 1]
     assert len(h.runs()) == 5  # the faulty row's hook still ran
     assert len(s.ops.events("invoke")) == 4  # but it has no alert

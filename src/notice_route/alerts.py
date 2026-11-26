@@ -80,6 +80,7 @@ class Taken:
     log: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])  # delivery records
     taken: int = 0
     error: bool = False
+    faults: int = 0  # rows whose routing faulted (counted, never described)
 
 
 def _labels(text: object) -> list[str] | None:
@@ -159,6 +160,7 @@ def take_surfaced(gateway: Gateway, store: Store, config: Config, worst: float) 
         out.taken += 1
         out.jobs += one.jobs
         out.log += one.log
+        out.faults += one.faults
     return out
 
 
@@ -201,6 +203,7 @@ def _take_one(gateway: Gateway, store: Store, config: Config, worst: float) -> T
         if row_id is None:
             raise
         one.log.clear()
+        one.faults = 1
         with store.write() as conn:
             conn.execute("UPDATE surfaced SET processed = 1 WHERE id = ?", (row_id,))
     return one
