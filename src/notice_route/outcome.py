@@ -276,6 +276,7 @@ def apply_outcome(
     lease: Lease,
     retry_at: Callable[[int], int | None],
     count_hour: int | None = None,
+    requeue_kind: Literal["held", "single"] = "single",
 ) -> Applied:
     """Record ``outcome`` for the claimed ``row`` inside a ``Store.write`` transaction.
 
@@ -284,8 +285,9 @@ def apply_outcome(
     then ends ``failed``, code ``retries_exhausted``, unless a second or uncurable refusal ended it
     first with the refusal code). ``count_hour`` is the UTC hour start in which the hourly count of
     this call was taken; when given and no call was made (``env_missing``, ``lock_busy``) the
-    count is given back (a digest passes it for one of its rows only). Everything is fenced by
-    ``token``."""
+    count is given back (a digest passes it for one of its rows only). ``requeue_kind`` is the kind
+    of a row that goes back unchanged (a digest member stays ``held``); a refusal retry rewrites
+    the row and always makes it ``single``. Everything is fenced by ``token``."""
     if outcome.outcome is None:
         return Applied(False, None, None, None, None, 0, None, internal=True)
     held = conn.execute(
@@ -345,8 +347,8 @@ def apply_outcome(
             )
         else:
             conn.execute(
-                "UPDATE queue SET kind = 'single' WHERE id = ? AND claimed_by = ?",
-                (row.id, token),
+                "UPDATE queue SET kind = ? WHERE id = ? AND claimed_by = ?",
+                (requeue_kind, row.id, token),
             )
         change = requeue_row(conn, row.id, token, deliver_after, lease)
         if not change.applied:
