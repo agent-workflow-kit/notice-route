@@ -139,3 +139,36 @@ The sources are the notifiers' interfaces (`Calling from automation`, `Exit code
   abbreviations (the interfaces say they are refused; checked from the text only).
 - The sanitizer's exact empty-message and command-keyword behavior beyond the documented
   tables, and the `bytes` and `truncated` values.
+
+## Verified live
+
+The live suite (`tests/live/`, run by hand with `NOTICE_ROUTE_LIVE=1 make live`; see
+[docs/live-testing.md](../../docs/live-testing.md)) settles each "Unverified" item above. Each
+row links the item to its live test. A person changes a row to `verified live: <date>, <tool>
+<version>` after a run, and files an issue for each difference found (the report of the run lists
+what the real tools did). Until then every row is pending.
+
+| Item | Live test | Status |
+|---|---|---|
+| `validate --json [--probe]` stdout and exit codes of the real trio; `enabled` boolean, exit 22 `{"outcome":"disabled"}`; plain `validate` with a whitespace-only credential (recorded) | `tests/live/test_live_validate.py::test_validate_json_real_output`, `tests/live/test_live_validate.py::test_router_validate_probe`, `tests/live/test_live_validate.py::test_observe_whitespace_only_credential` | verified live: pending |
+| the real `wsl-notice` `--probe` grammar; slack-notice rejects `--probe` | `tests/live/test_live_validate.py::test_validate_rejects_probe_grammar`, `tests/live/test_live_validate.py::test_validate_json_real_output` | verified live: pending |
+| config loaded and checked before input is read | `tests/live/test_live_observe.py::test_observe_config_checked_before_input` | verified live: pending |
+| stdout is exactly one line with a trailing newline; real success object against the pins (slack-notice pin stale, wsl-notice unpinned) | `tests/live/test_live_observe.py::test_observe_dry_run_stdout_shape` | verified live: pending |
+| usage message texts and stderr lines | `tests/live/test_live_observe.py::test_observe_usage_errors` | verified live: pending |
+| `--config`/`--actor` placement, a value flag on both sides, abbreviations | `tests/live/test_live_observe.py::test_observe_flag_positioning` | verified live: pending |
+| sanitizer empty-message and command-keyword behavior, `bytes` and `truncated` | `tests/live/test_live_observe.py::test_observe_sanitizer` | verified live: pending |
+| stdin closed early and input at the 1 MiB bound | `tests/live/test_live_observe.py::test_observe_closed_stdin_and_oversize` | verified live: pending |
+| a real send is `sent`; the router's output, log and raw `state.db` bytes (with `-wal` and `-shm`) hold no credential, its output and log no message text (whether the database keeps it is recorded); `history --json` rows and `prune --dry-run --json` match their schemas | `tests/live/test_live_router.py::test_send_reaches_the_real_notifier` | verified live: pending |
+| quiet-hours deferral, then `flush` delivery outside the window | `tests/live/test_live_router.py::test_quiet_deferral_then_flush_delivers` | verified live: pending |
+| the real tools' credential check (the fake has none), surfacing, the alert's content, the hook's environment | `tests/live/test_live_router.py::test_bad_credential_fails_surfaces_and_alerts` | verified live: pending |
+| wsl-notice `interop_failed` is retryable (cap 3) and its lock/interop handling (a candidate outside `/run/WSL/<digits>_interop` is ignored and a valid socket used, so a toast may be delivered and the test skips) | `tests/live/test_live_router.py::test_wsl_interop_failed_is_retried_three_times` | verified live: pending |
+| a stopped or terminated flusher with a real notifier (flush lock, send lock) | `tests/live/test_live_router.py::test_flusher_signals_with_a_real_notifier` | verified live: pending |
+| the hook runs through the real `sh -c`: environment, payload, recursion guard | `tests/live/test_live_local.py::test_sync_hook_environment_and_payload`, `tests/live/test_live_local.py::test_hook_recursion_guard_with_the_real_environment` | verified live: pending |
+| the detached `async` hook supervisor survives `flush` and enforces the timeout | `tests/live/test_live_local.py::test_async_hook_outlives_flush_and_hits_its_timeout` | verified live: pending |
+
+Items with no automated live test (manual checklist in the runbook): a real `crontab` (`crontab -`
+with empty stdin, the `no crontab for` text, the 64 KiB read cap, the effect of `PATH=` and
+`SHELL=` lines), the authored agent-spawn hook examples against a real producer, the exit code 128+N on a signal before the send starts, the behavior with a closed stdout, the
+SIGTERM envelope after the send started, a stopped flusher that keeps the send lock, SIGTERM
+while waiting for the send lock, the `async` hook supervisor on macOS (#32), the notifiers' own
+send-lock spacing, and re-pinning slack-notice (0.25.1) and wsl-notice from the report.
