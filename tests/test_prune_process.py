@@ -78,11 +78,34 @@ def test_a_live_claim_survives_a_prune_and_a_flush_running_together(rig: Rig) ->
         rig.spawn("flush", "--json"),
         rig.spawn("prune", "--json"),
     ]
-    for p in procs:
-        p.communicate(timeout=120)
-    assert [p.returncode for p in procs][0] == 0
+    results = [p.communicate(timeout=120) for p in procs]
+    assert [procs[0].returncode, procs[2].returncode] == [0, 0], results  # both prunes
+    assert procs[1].returncode in (0, 22), results
     assert rig.query("SELECT claimed_by, claim_expires FROM queue WHERE id = ?", (qid,)) == [
         ("holder", t + 20)
     ]
     assert rig.query("SELECT outcome FROM deliveries WHERE id = ?", (did,)) == [("deferred",)]
     assert n.events("invoke") == []
+
+
+def test_a_claim_live_across_the_24_hour_mark_with_a_call_in_flight_is_left_alone(
+    rig: Rig,
+) -> None:
+    n = rig.notifier(sleep=4.0)
+    rig.configure({"chat": {"notifier": n}})
+    t = real_now()
+    did, qid = seed(rig, now=t, created_at=t - DAY + 2, deliver_after=t)  # 24 h old at t + 2
+    flush = rig.spawn("flush", "--json")
+    n.wait_for("invoke", timeout=30)  # the row is claimed and its call is in flight
+    deadline = time.monotonic() + 10
+    while time.time() < t + 3 and time.monotonic() < deadline:  # past the 24 h mark
+        time.sleep(0.05)
+    assert time.time() >= t + 3
+    prune = rig.spawn("prune", "--json")
+    out, err = prune.communicate(timeout=120)
+    assert prune.returncode == 0, err
+    assert json.loads(out)["deleted"]["queue"] == 0  # the live claim was not expired
+    assert flush.communicate(timeout=120)[0] and flush.returncode == 0
+    assert len(n.events("invoke")) == 1  # called once
+    assert rig.query("SELECT outcome FROM deliveries WHERE id = ?", (did,)) == [("sent",)]
+    assert rig.query("SELECT COUNT(*) FROM queue WHERE id = ?", (qid,)) == [(0,)]

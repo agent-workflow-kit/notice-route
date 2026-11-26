@@ -5,6 +5,7 @@ state directory under a private home."""
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import pytest
@@ -12,7 +13,7 @@ import pytest
 from notice_route import cli
 from notice_route import prune as prune_mod
 from notice_route.send import Seams, SurfaceEvent
-from notice_route.store import StoreError
+from notice_route.store import StoreError, open_store, prune_deliveries
 from tests.flush_support import checked_log, seed
 from tests.prune_support import (
     DAY,
@@ -520,12 +521,179 @@ def test_a_database_that_stays_busy_is_exit_1_internal(
 ) -> None:
     configure(rig)
     add_window(rig, NOW - 500, 100, "a")
+    calls: list[int] = []
 
     def busy(*a: Any, **k: Any) -> int:
+        calls.append(1)
         raise StoreError("busy")
 
     monkeypatch.setattr(prune_mod.dedup, "prune_windows", busy)
+    code, out, err = rig.run("prune", "--json")
+    assert code == 1
+    assert len(calls) == prune_mod.BUSY_TRIES == 3  # exactly three tries, then the run fails
+    error = json.loads(out)["error"]
+    assert (error["code"], error["message"]) == ("internal", "state database is busy")
+    assert err == "notice-route: internal: state database is busy\n"
+    assert counts(rig)["dedup"] == 1
+
+
+def test_a_database_that_cannot_be_read_keeps_its_own_message_for_prune(rig: Rig) -> None:
+    configure(rig)
+    rig.state.mkdir(parents=True)
+    rig.state.chmod(0o700)
+    path = rig.state / "state.db"
+    path.write_bytes(b"not a database" * 100)
+    path.chmod(0o600)
     code, out, _ = rig.run("prune", "--json")
     assert code == 1
-    assert json.loads(out)["error"]["code"] == "internal"
-    assert counts(rig)["dedup"] == 1
+    assert json.loads(out)["error"]["message"] == "state database cannot be read"
+
+
+# --- hostile rows, the log and the warning ---------------------------------------------------
+
+
+def add_queue_row(
+    rig: Rig,
+    *,
+    source_sql: str = "'s'",
+    level: str = "info",
+    destination: str = "chat",
+    created_at: int = NOW - 2 * DAY,
+) -> int:
+    """One unclaimed queue row (and its delivery) with a raw SQL expression for ``source``."""
+    with open_store(rig.gateway()) as store, store.write() as conn:
+        cur = conn.execute(
+            "INSERT INTO deliveries (ts, source, level, outcome, destination)"
+            " VALUES (?, 's', 'info', 'deferred', ?)",
+            (created_at, destination),
+        )
+        conn.execute(
+            "INSERT INTO queue (delivery_id, kind, message, level, source, deliver_after,"
+            f" created_at) VALUES (?, 'single', 'm', ?, {source_sql}, ?, ?)",
+            (cur.lastrowid, level, created_at, created_at),
+        )
+        assert cur.lastrowid is not None
+        return cur.lastrowid
+
+
+def only_good_line(rig: Rig, good: int) -> None:
+    lines = checked_log(rig)
+    assert [x["source"] for x in lines] == ["good"], lines
+    assert rig.query("SELECT outcome FROM deliveries WHERE id = ?", (good,)) == [("expired",)]
+    assert counts(rig)["queue"] == 0
+
+
+@pytest.mark.parametrize(
+    "source_sql",
+    ["CAST(x'73ff' AS TEXT)", "x'7366ff'", "CAST('a' || char(27) || '[31m' || char(10) AS TEXT)"],
+    ids=["not-utf8-text", "blob", "ansi-newline"],
+)
+def test_a_queue_row_with_a_hostile_source_still_expires_and_never_stops_the_log(
+    rig: Rig, source_sql: str
+) -> None:
+    configure(rig)
+    add_queue_row(rig, source_sql=source_sql)
+    good = add_queue_row(rig, source_sql="'good'")
+    code, doc, err = prune(rig)
+    assert (code, doc["deleted"], err) == (0, deleted(queue=2), "")
+    only_good_line(rig, good)
+    assert "\x1b" not in (rig.state / "log.jsonl").read_text()
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [("destination", "x\ny"), ("destination", "A\x1b[31m"), ("level", "loud"), ("level", "a\nb")],
+)
+def test_a_destination_or_level_outside_the_log_grammar_omits_that_line_only(
+    rig: Rig, column: str, value: str
+) -> None:
+    configure(rig)
+    add_queue_row(
+        rig,
+        destination=value if column == "destination" else "chat",
+        level=value if column == "level" else "info",
+    )
+    good = add_queue_row(rig, source_sql="'good'")
+    code, doc, err = prune(rig)
+    assert (code, doc["deleted"], err) == (0, deleted(queue=2), "")
+    only_good_line(rig, good)
+
+
+@pytest.mark.parametrize("extra", [[], ["--quiet"]])
+def test_a_log_that_cannot_be_written_warns_once_and_changes_no_result(
+    rig: Rig, tmp_path: Any, extra: list[str]
+) -> None:
+    configure(rig)
+    rig.state.mkdir(parents=True, mode=0o700)
+    target = tmp_path / "elsewhere"
+    target.write_text("")
+    (rig.state / "log.jsonl").symlink_to(target)
+    add_queue_row(rig, source_sql="'a'")
+    add_queue_row(rig, source_sql="'b'")
+    code, doc, err = prune(rig, *extra)
+    assert (code, doc["deleted"]) == (0, deleted(queue=2))
+    assert err == "notice-route: warning: the log could not be written\n"  # once, not per line
+    assert target.read_text() == ""
+    assert counts(rig)["queue"] == 0
+
+
+# --- an empty state.db ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dry", [[], ["--dry-run"]])
+def test_an_empty_state_db_is_no_database_and_is_not_migrated(rig: Rig, dry: list[str]) -> None:
+    configure(rig)
+    rig.state.mkdir(parents=True)
+    rig.state.chmod(0o700)
+    path = rig.state / "state.db"
+    path.write_bytes(b"")
+    path.chmod(0o600)
+    before = sorted(p.name for p in rig.state.iterdir())
+    code, doc, err = prune(rig, *dry)
+    assert (code, doc["deleted"], err) == (0, deleted(), "")
+    assert path.stat().st_size == 0
+    assert sorted(p.name for p in rig.state.iterdir()) == before
+
+
+# --- queue expiry releases dedup records -----------------------------------------------------
+
+
+def test_dedup_and_event_ids_released_by_expiry_count_under_queue_and_really_go(
+    rig: Rig,
+) -> None:
+    configure(rig)
+    did, _ = seed(rig, now=NOW - 2 * DAY, created_at=NOW - 2 * DAY)
+    add_window(rig, NOW, 100_000, "a", delivery_id=did)  # not ended: the windows count is 0
+    add_event_id(rig, NOW - 5, 1, delivery_id=did)  # young: the event ids count is 0
+    code, dry, _ = prune(rig, "--dry-run")
+    assert (code, dry["deleted"]) == (0, deleted(queue=1))
+    assert (counts(rig)["dedup"], counts(rig)["event_ids"]) == (1, 1)
+    code, run, _ = prune(rig)
+    assert (code, run["deleted"]) == (0, dry["deleted"])  # the dry run and the run agree
+    assert (counts(rig)["dedup"], counts(rig)["event_ids"], counts(rig)["queue"]) == (0, 0, 0)
+
+
+# --- cost -------------------------------------------------------------------------------------
+
+
+def test_thousands_of_pinned_history_rows_do_not_make_a_batch_quadratic(rig: Rig) -> None:
+    make_db(rig)
+    old = NOW - 90 * DAY
+    with open_store(rig.gateway()) as store, store.write() as conn:
+        conn.executemany(
+            "INSERT INTO deliveries (ts, source, level, outcome, destination)"
+            " VALUES (?, 's', 'info', 'sent', 'chat')",
+            [(old,)] * 5000,
+        )
+        conn.execute(
+            "INSERT INTO surfaced (destination, code, period, delivery_id, processed)"
+            " SELECT 'chat', 'c' || id, '2023-11-14', id, 0 FROM deliveries WHERE ts = ?",
+            (old,),
+        )
+    free = add_delivery(rig, old)  # the one old row nothing needs
+    with open_store(rig.gateway()) as store, store.write() as conn:
+        started = time.monotonic()
+        n = prune_deliveries(conn, cutoff=NOW - 30 * DAY, batch=1000)
+        elapsed = time.monotonic() - started
+    assert n == 1 and rig.query("SELECT COUNT(*) FROM deliveries WHERE id = ?", (free,)) == [(0,)]
+    assert elapsed < 1.0, elapsed  # a probe per pinned row over the whole pending index took ~4 s

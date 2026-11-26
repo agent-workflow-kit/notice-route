@@ -35,7 +35,7 @@ from __future__ import annotations
 import math
 import sqlite3
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -43,6 +43,7 @@ from . import dedup
 from . import log as logmod
 from .decide import instant
 from .gateway import Gateway, UnsafePathError
+from .history import DESTINATION, LEVELS, SOURCE
 from .queue import EXPIRY_S, Expired, Lease, count_expirable, expire_unclaimed
 from .report import worst_case_s
 from .send import Seams, SurfaceEvent
@@ -156,11 +157,12 @@ def run_prune(
     """Everything after the flags and the config. ``StoreError`` and ``HomeError`` propagate (exit
     1 and 2 in the cli)."""
     started = gateway.monotonic()
+    warnings: list[str] = []
     if opts.dry_run:
         deleted = _dry_run(gateway, config)
     else:
-        deleted = _run(gateway, config, opts, seams, started)
-    return PruneResult(0, {"dry_run": opts.dry_run, "deleted": deleted})
+        deleted = _run(gateway, config, opts, seams, started, warnings)
+    return PruneResult(0, {"dry_run": opts.dry_run, "deleted": deleted}, warnings=warnings)
 
 
 def _dry_run(gateway: Gateway, config: Config | None) -> dict[str, int]:
@@ -191,7 +193,12 @@ def _dry_run(gateway: Gateway, config: Config | None) -> dict[str, int]:
 
 
 def _run(
-    gateway: Gateway, config: Config | None, opts: PruneOptions, seams: Seams, started: float
+    gateway: Gateway,
+    config: Config | None,
+    opts: PruneOptions,
+    seams: Seams,
+    started: float,
+    warnings: list[str],
 ) -> dict[str, int]:
     out = _zero()
     try:
@@ -200,7 +207,7 @@ def _run(
         raise StoreError("unsafe") from None
     except OSError:
         raise StoreError("internal") from None
-    if files is None:
+    if files is None or _is_empty(gateway):
         return out
     history_s, event_ids_s = _retention(config)
     now = instant(gateway.wall())
@@ -217,8 +224,24 @@ def _run(
         out["history"] = _loop(
             gateway, store, lambda c: prune_deliveries(c, cutoff=now - history_s, batch=BATCH)
         )
-        out["queue"] = _expire(gateway, store, config, opts, seams, started)
+        out["queue"] = _expire(gateway, store, config, opts, seams, started, warnings)
     return out
+
+
+def _is_empty(gateway: Gateway) -> bool:
+    """A ``state.db`` that was created and never migrated is no database (as for the read-only
+    commands): nothing is migrated or created for it. An older schema is not empty: ``prune``
+    migrates it like every command that writes."""
+    try:
+        store = open_readonly(gateway)
+    except StoreError as exc:
+        if exc.reason == "older":
+            return False
+        raise
+    if store is None:
+        return True
+    store.close()
+    return False
 
 
 def _loop(gateway: Gateway, store: Store, step: Callable[[_Conn], int]) -> int:
@@ -255,6 +278,7 @@ def _expire(
     opts: PruneOptions,
     seams: Seams,
     started: float,
+    warnings: list[str],
 ) -> int:
     writer: logmod.LogWriter | None = None
     total = 0
@@ -266,21 +290,7 @@ def _expire(
         while True:
             expired = _expire_batch(gateway, store, config, seams)
             for e in expired:
-                writer.write(
-                    logmod.record(
-                        "delivery",
-                        wall=gateway.wall(),
-                        actor=opts.actor,
-                        decision_id=None,
-                        source=e.source,
-                        destination=e.destination,
-                        level=e.level,
-                        outcome="expired",
-                        code="expired",
-                        attempts=e.attempts,
-                        duration_ms=max(0, math.floor((gateway.monotonic() - started) * 1000)),
-                    )
-                )
+                _log_expired(gateway, writer, opts, e, started)
             total += len(expired)
             if len(expired) < BATCH:
                 return total
@@ -288,6 +298,63 @@ def _expire(
     finally:
         if state is not None:
             state.close()
+        if writer is not None and writer.problems:
+            warnings.append("the log could not be written")
+
+
+def _log_expired(
+    gateway: Gateway, writer: logmod.LogWriter, opts: PruneOptions, e: Expired, started: float
+) -> None:
+    """One ``delivery`` line for an expired row, or none: the columns are a file's text, so a
+    line is built only from values inside the grammar of ``schemas/log.json`` (the schema
+    requires all three), and a line that cannot be built is a problem, never an exception (the
+    rows are already expired and committed)."""
+    if not (
+        SOURCE.fullmatch(e.source)
+        and DESTINATION.fullmatch(e.destination)
+        and e.level in LEVELS
+        and type(e.attempts) is int
+        and e.attempts >= 0
+    ):
+        return  # the row is expired; its line would break the grammar of the log
+    try:
+        rec = logmod.record(
+            "delivery",
+            wall=gateway.wall(),
+            actor=opts.actor,
+            decision_id=None,
+            source=e.source,
+            destination=e.destination,
+            level=e.level,
+            outcome="expired",
+            code="expired",
+            attempts=e.attempts,
+            duration_ms=max(0, math.floor((gateway.monotonic() - started) * 1000)),
+        )
+    except (ValueError, TypeError, OverflowError):
+        writer.problems += 1
+        return
+    writer.write(rec)
+
+
+def _text(value: object) -> str:
+    """A text column as ``str``: bytes (a BLOB, or text that is not UTF-8) are decoded with
+    replacement; anything else (a number) is empty, so it never matches a grammar."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", "replace")
+    return ""
+
+
+def _clean(e: Expired) -> Expired:
+    return replace(
+        e,
+        destination=_text(e.destination),
+        kind=_text(e.kind),  # pyright: ignore[reportArgumentType]
+        level=_text(e.level),
+        source=_text(e.source),
+    )
 
 
 def _expire_batch(
@@ -298,7 +365,14 @@ def _expire_batch(
             with store.write() as conn:
                 # the lease is built after the write lock is held (queue.Lease)
                 lease = _lease(gateway, config)
-                expired = expire_unclaimed(conn, lease, limit=BATCH, max_age=EXPIRY_S)
+                # a column may hold bytes that are not UTF-8: decode with replacement, so that
+                # the row still expires
+                conn.text_factory = lambda raw: raw.decode("utf-8", "replace")
+                try:
+                    found = expire_unclaimed(conn, lease, limit=BATCH, max_age=EXPIRY_S)
+                finally:
+                    conn.text_factory = str
+                expired = tuple(_clean(e) for e in found)
                 for e in expired:
                     # surfaced only for a destination that is configured and enabled (Hooks).
                     # TODO(#27): the default seam does nothing until surfacing exists.

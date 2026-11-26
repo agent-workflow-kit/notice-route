@@ -380,7 +380,7 @@ def test_a_templated_title_is_shown_and_message_text_never_is(rig: Rig) -> None:
                 "level": "info",
                 "notify": ["chat"],
                 "title": "Deploy {{source}} {{source}} {{source}}",
-                "message": "SECRETBODY {{message}}",
+                "message": "BODYMARK {{message}}",
             },
             {"name": "pt", "match": {"level_min": "info"}, "notify": ["chat"]},
         ],
@@ -395,7 +395,7 @@ def test_a_templated_title_is_shown_and_message_text_never_is(rig: Rig) -> None:
     by_rule = {r["rule"]: r for r in rows}
     assert by_rule["templ"]["title"] == (f"Deploy {src} {src} {src}")[:100]
     assert by_rule["pt"]["title"] is None
-    assert "SECRETBODY" not in out and "hello" not in out and "passthrough" not in out
+    assert "BODYMARK" not in out and "hello" not in out and "passthrough" not in out
 
 
 def test_rows_written_by_send_validate_against_the_schema(rig: Rig) -> None:
@@ -441,6 +441,7 @@ def test_hostile_title_text_is_escaped_in_both_formats(rig: Rig) -> None:
     assert not any(ord(c) < 32 and c != "\n" for c in out) and "\x7f" not in out
     assert "\\x1b" in out and "\\x0a" in out and "\\x0d" in out and "\\x00" in out
     assert "\\\\" not in out.replace("\\\\x", "")  # nothing doubled but the escapes themselves
+    assert "\\ud83d\\ude00" in out and "\\U" not in out  # an astral character is a surrogate pair
 
 
 def test_a_title_that_is_not_utf8_never_fails_the_command(rig: Rig) -> None:
@@ -484,6 +485,13 @@ def test_a_row_with_a_column_outside_its_grammar_is_left_out_with_one_warning(ri
     assert err == "notice-route: warning: 17 unreadable history rows left out\n"
     code, out, err = rig.run("history")
     assert code == 0 and out.count("\n") == 1 and "BAD" not in out + err
+
+
+def test_the_unreadable_rows_warning_is_not_printed_under_quiet(rig: Rig) -> None:
+    add_delivery(rig, NOW - 1)
+    add_delivery(rig, NOW - 2, level="loud")
+    code, out, err = rig.run("history", "--quiet")
+    assert code == 0 and err == "" and out.count("\n") == 1
 
 
 def json_labels(n: int) -> str:

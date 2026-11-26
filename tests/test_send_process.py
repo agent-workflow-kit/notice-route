@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from notice_route import calling, cli, send
+from notice_route import store as store_module
 from notice_route.gateway import SYSTEM_TZ_DIRS, Gateway
 from notice_route.notify import CallResult
 from notice_route.queue import Lease, claim_due
@@ -482,6 +483,25 @@ def test_a_descendant_that_left_the_group_cannot_hold_the_router(rig: Rig) -> No
     assert code == 0 and only(doc)["outcome"] == "sent"
     assert doc["duration_ms"] < 8_000  # the grandchild lives 8 s of real time: not waited for
     assert time.monotonic() - started < 30
+
+
+def test_a_stall_in_the_store_open_does_not_fail_a_sped_up_send(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rig scales the busy deadlines by the clock's rate (``real_busy_waits``): a 50 ms
+    stall at rate 20 is one second on the clock, which must not read as a 0.5 s database wait."""
+    rig.clock = RigClock(rate=20.0)
+    n = rig.notifier()
+    rig.configure({"chat": {"notifier": n}})
+    real = store_module._ensure_wal  # pyright: ignore[reportPrivateUsage]
+
+    def stalled(*args: Any, **kwargs: Any) -> None:
+        time.sleep(0.05)
+        real(*args, **kwargs)
+
+    monkeypatch.setattr(store_module, "_ensure_wal", stalled)
+    code, doc, _ = rig.send("hi")
+    assert code == 0 and only(doc)["outcome"] == "sent"
 
 
 # --- signals -----------------------------------------------------------------------------------

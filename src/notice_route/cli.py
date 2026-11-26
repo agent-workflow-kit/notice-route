@@ -211,8 +211,21 @@ def _json(document: object) -> None:
 def _safe(value: object) -> str:
     """Text for a terminal: ASCII only, control characters escaped, a backslash doubled so an
     escape never reads as the text itself."""
-    text = str(value).replace("\\", "\\\\").encode("ascii", "backslashreplace").decode("ascii")
-    return "".join(c if c.isprintable() else f"\\x{ord(c):02x}" for c in text)
+    out: list[str] = []
+    for c in str(value):
+        n = ord(c)
+        if c == "\\":
+            out.append("\\\\")
+        elif c.isascii() and c.isprintable():
+            out.append(c)
+        elif n <= 0xFF:
+            out.append(f"\\x{n:02x}")
+        elif n <= 0xFFFF:
+            out.append(f"\\u{n:04x}")
+        else:  # the interface allows only \xNN and \uNNNN: a surrogate pair
+            n -= 0x10000
+            out.append(f"\\u{0xD800 + (n >> 10):04x}\\u{0xDC00 + (n & 0x3FF):04x}")
+    return "".join(out)
 
 
 def _error(code: str, message: str, details: dict[str, str] | None, *, as_json: bool) -> None:
@@ -555,7 +568,7 @@ def _run_history(args: argparse.Namespace, gateway: Gateway) -> int:
     else:
         for row in result.rows:
             _out(_history_line(row) + "\n")
-    if result.skipped:
+    if result.skipped and not args.quiet:
         _err(f"{PROG}: warning: {result.skipped} unreadable history rows left out\n")
     return EXIT_OK
 
@@ -570,6 +583,8 @@ def _run_prune(args: argparse.Namespace, gateway: Gateway) -> int:
     result = run_prune(gateway, config, PruneOptions(_default_actor(gateway), args.dry_run))
     doc = result.document
     assert doc is not None
+    for text in result.warnings:  # as send and flush: a warning is printed under --quiet too
+        _guarded(gateway, "err", lambda text=text: _err(f"{PROG}: warning: {_safe(text)}\n"))
     if args.json:
         _json(doc)
     elif not args.quiet:
@@ -708,8 +723,11 @@ def _main(argv: Sequence[str] | None, gateway: Gateway | None) -> int:
     except HomeError:
         _error("config_invalid", "invalid configuration", {"key": "home"}, as_json=args.json)
         return EXIT_USAGE
-    except (StateError, StoreError):
-        _error("internal", "state database cannot be read", None, as_json=args.json)
+    except (StateError, StoreError) as exc:
+        # a prune that ran out of lock waits says so (a cron line is then worth a rerun)
+        busy = args.command == "prune" and isinstance(exc, StoreError) and exc.reason == "busy"
+        message = "state database is busy" if busy else "state database cannot be read"
+        _error("internal", message, None, as_json=args.json)
         return EXIT_INTERNAL
     except _OutputClosed:
         raise

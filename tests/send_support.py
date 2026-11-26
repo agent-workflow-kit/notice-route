@@ -10,12 +10,16 @@ import sqlite3
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import pytest
 
+from notice_route import send as send_mod
+from notice_route import store as store_mod
 from notice_route.cli import main
 from notice_route.gateway import Gateway
 from tests.fakes import Notifier, scrubbed_env
@@ -55,6 +59,27 @@ class RigClock:
 
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds / self.rate)
+
+
+@contextmanager
+def real_busy_waits(rate: float) -> Iterator[None]:
+    """The store's busy deadlines are read from the gateway clock, which a sped-up rig runs
+    ``rate`` times too fast: scale them up so they last as long in real time as in production
+    (the product is right to follow its clock; a test that speeds the clock up must not shorten
+    what a stall may last)."""
+    if rate == 1.0:
+        yield
+        return
+    scaled = min(60.0, store_mod.DEFAULT_BUSY_S * rate)
+    open_store_defaults = store_mod.open_store.__kwdefaults__
+    open_readonly_defaults = store_mod.open_readonly.__kwdefaults__
+    assert open_store_defaults is not None and open_readonly_defaults is not None
+    with (
+        mock.patch.object(send_mod, "SEND_BUSY_S", min(60.0, send_mod.SEND_BUSY_S * rate)),
+        mock.patch.dict(open_store_defaults, {"busy_timeout": scaled}),
+        mock.patch.dict(open_readonly_defaults, {"busy_timeout": scaled}),
+    ):
+        yield
 
 
 class Rig:
@@ -134,7 +159,8 @@ class Rig:
         gateway: Gateway | None = None,
     ) -> tuple[int, str, str]:
         gw = gateway or self.gateway(stdin, env)
-        code = main(list(argv), gw)
+        with real_busy_waits(float(getattr(gw.clock, "rate", 1.0))):
+            code = main(list(argv), gw)
         captured = self.capsys.readouterr()
         return code, captured.out, captured.err
 

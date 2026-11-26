@@ -470,9 +470,11 @@ def _check_tables(conn: sqlite3.Connection) -> None:
 
 # --- bounded tables ------------------------------------------------------------------------
 
+# ``+s.processed`` keeps the planner off the ``surfaced_pending`` index: it would scan every
+# pending row for each candidate (quadratic); ``surfaced_delivery`` is the probe wanted.
 _ELIGIBLE = (
     "NOT EXISTS (SELECT 1 FROM queue q WHERE q.delivery_id = d.id)"
-    " AND NOT EXISTS (SELECT 1 FROM surfaced s WHERE s.delivery_id = d.id AND s.processed = 0)"
+    " AND NOT EXISTS (SELECT 1 FROM surfaced s WHERE s.delivery_id = d.id AND +s.processed = 0)"
 )
 _OLDEST_DROPPED = (
     "SELECT d.id FROM deliveries d WHERE d.id IS NOT ? AND d.outcome = 'dropped' AND "
