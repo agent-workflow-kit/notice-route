@@ -28,13 +28,12 @@ Choices where the interface is silent (docs/design.md C-52 has the reasons):
 - A result that cannot be recorded (``StoreError`` after one retry, or any other exception of the
   recording) is logged only, the claim lapses and ``flush`` resends (a duplicate is possible); the
   command exits 1 ``internal`` after it has handled every other destination. A result whose claim
-  was lost goes to the log and the output as classified (a queued retry is shown due now: the
-  claimant that took the row sends it).
+  was lost goes to the log and the output as classified (a queued retry is shown as classified:
+  nothing is stored for a lost claim, the claimant that took the row decides).
 - ``not_started`` (an internal fault) records nothing, is not logged (``outcome`` has no word for
   it) and ends the command with exit 1.
-- Interim seams, owned by later issues and injectable through :class:`Seams`:
-  TODO(#25) the retry schedule (:func:`interim_retry_schedule` is the schedule of the interface, to
-  be replaced by the module #25 builds); TODO(#27) surfacing a ``failed`` or ``unknown`` end
+- Seams, injectable through :class:`Seams`: the retry schedule (:mod:`notice_route.retry` by
+  default); TODO(#27) surfacing a ``failed`` or ``unknown`` end
   (:class:`SurfaceEvent`; ``rate_capped`` is already surfaced by ``decide``, ``env_missing`` and
   ``overflow`` are not yet).
 """
@@ -69,6 +68,7 @@ from .payload import Notification
 from .queue import Lease, QueueRow, insert_delivery, release_claims
 from .render import render
 from .report import worst_case_s
+from .retry import retry_schedule as default_retry_schedule
 from .store import SEND_BUSY_S, Store, StoreError, open_store
 from .validate import Config, Destination
 
@@ -79,16 +79,12 @@ __all__ = [
     "SendOptions",
     "SendResult",
     "SurfaceEvent",
-    "interim_retry_schedule",
     "record_result",
     "run_send",
     "with_retry",
 ]
 
 ADVISORY_FLUSH_AGE_S = 300
-_RETRY_OFFSETS_S = (60, 300, 1800, 7200)  # after the end of attempt 1, 2, 3 and 4
-_ATTEMPT_CAP = {"wsl-notice": 3}
-_DEFAULT_ATTEMPT_CAP = 5
 _FAILED = ("failed", "unknown")
 RECORD_RETRY_PAUSE_S = 0.2  # before the one second try to record a result (C-52)
 
@@ -117,21 +113,6 @@ class SurfaceEvent:
     attempts: int
 
 
-def interim_retry_schedule(kind: str, now: int) -> Callable[[int], int | None]:
-    """The schedule of docs/interface.md (Retries and outcomes): a retry is due 1 minute, 5
-    minutes, 30 minutes and 2 hours after the end of attempts 1 to 4, at most 5 attempts (3 for
-    ``wsl-notice``). TODO(#25): replaced by the module of #25 (this one has no tests of its own
-    beyond the pipeline's)."""
-    cap = _ATTEMPT_CAP.get(kind, _DEFAULT_ATTEMPT_CAP)
-
-    def retry_at(attempts: int) -> int | None:
-        if attempts >= cap or attempts < 1:
-            return None
-        return now + _RETRY_OFFSETS_S[attempts - 1]
-
-    return retry_at
-
-
 def _no_surface(conn: sqlite3.Connection, event: SurfaceEvent) -> None:
     """TODO(#27): insert the ``surfaced`` row for ``event`` and mark its delivery."""
 
@@ -141,7 +122,7 @@ class Seams:
     """The injectable parts: the notifier call, the retry schedule and the surfacing."""
 
     call: Callable[..., CallResult] = call_notifier
-    retry_schedule: Callable[[str, int], Callable[[int], int | None]] = interim_retry_schedule
+    retry_schedule: Callable[[str, int], Callable[[int], int | None]] = default_retry_schedule
     surface: Callable[[sqlite3.Connection, SurfaceEvent], None] = _no_surface
 
 

@@ -367,21 +367,6 @@ def test_the_retry_schedule_seam_decides_the_due_time_and_the_end(
     assert (d["outcome"], d["code"]) == ("failed", "retries_exhausted")
 
 
-@pytest.mark.parametrize(
-    ("kind", "expected"),
-    [
-        ("slack-notice", [60, 300, 1800, 7200, None]),
-        ("ha-notice", [60, 300, 1800, 7200, None]),
-        ("generic", [60, 300, 1800, 7200, None]),
-        ("wsl-notice", [60, 300, None, None, None]),
-    ],
-)
-def test_the_interim_schedule_follows_the_interface(kind: str, expected: list[int | None]) -> None:
-    retry = send.interim_retry_schedule(kind, 1000)
-    got = [retry(a) for a in range(1, 6)]
-    assert got == [None if e is None else 1000 + e for e in expected]
-
-
 def test_a_sender_killed_after_the_decision_and_before_the_call_leaves_a_claimed_row(
     rig: Rig, home: Path
 ) -> None:
@@ -432,7 +417,7 @@ def test_a_claim_lost_during_the_call_is_logged_and_shown_as_classified(rig: Rig
         "rate_limited",
         1,
     )
-    assert d["deliver_after"] == NOW  # shown due now: the claimant that took the row sends it
+    assert d["deliver_after"] == NOW  # shown as classified: nothing is stored for a lost claim
     assert "the claim was lost" in err
     assert rig.query("SELECT outcome, attempts FROM deliveries") == [("sending", 0)]
     assert [(x["outcome"], x["code"]) for x in rig.log_lines()] == [
