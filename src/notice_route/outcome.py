@@ -280,14 +280,15 @@ def apply_outcome(
 ) -> Applied:
     """Record ``outcome`` for the claimed ``row`` inside a ``Store.write`` transaction.
 
-    ``retry_at(attempts)`` is the retry schedule (:mod:`notice_route.retry`): the ``deliver_after``
-    of a retry after ``attempts`` calls (refusal retries included), or None when the attempts are used up (the row
-    then ends ``failed``, code ``retries_exhausted``, unless a second or uncurable refusal ended it
-    first with the refusal code). ``count_hour`` is the UTC hour start in which the hourly count of
-    this call was taken; when given and no call was made (``env_missing``, ``lock_busy``) the
-    count is given back (a digest passes it for one of its rows only). ``requeue_kind`` is the kind
-    of a row that goes back unchanged (a digest member stays ``held``); a refusal retry rewrites
-    the row and always makes it ``single``. Everything is fenced by ``token``."""
+    ``retry_at(attempts)`` is the retry schedule (:mod:`notice_route.retry`): the
+    ``deliver_after`` of a retry after ``attempts`` calls (refusal retries included), or None
+    when the attempts are used up (the row then ends ``failed``, code ``retries_exhausted``,
+    unless a second or uncurable refusal ended it first with the refusal code). ``count_hour``
+    is the UTC hour start in which the hourly count of this call was taken; when given and no
+    call was made (``env_missing``, ``lock_busy``) the count is given back (a digest passes it
+    for one of its rows only). ``requeue_kind`` is the kind of a row that goes back unchanged (a
+    digest member stays ``held``); a refusal retry rewrites the row and always makes it
+    ``single``. Everything is fenced by ``token``."""
     if outcome.outcome is None:
         return Applied(False, None, None, None, None, 0, None, internal=True)
     held = conn.execute(
