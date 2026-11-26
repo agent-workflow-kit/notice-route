@@ -1,0 +1,46 @@
+{
+  "outcome": "ok",
+  "dry_run": false,
+  "destinations": [
+    {
+      "name": "chat",
+      "state": "env_missing",
+      "due_single": 0,
+      "due_held": 0,
+      "sent": 0,
+      "queued_retry": 0,
+      "failed": 0,
+      "unknown": 0,
+      "dropped": 0,
+      "expired": 0,
+      "digests": 0
+    },
+    {
+      "name": "off",
+      "state": "disabled",
+      "due_single": 0,
+      "due_held": 0,
+      "sent": 0,
+      "queued_retry": 0,
+      "failed": 0,
+      "unknown": 0,
+      "dropped": 0,
+      "expired": 0,
+      "digests": 0
+    },
+    {
+      "name": "quiet",
+      "state": "quiet",
+      "due_single": 1,
+      "due_held": 0,
+      "sent": 0,
+      "queued_retry": 0,
+      "failed": 0,
+      "unknown": 0,
+      "dropped": 0,
+      "expired": 0,
+      "digests": 0
+    }
+  ],
+  "duration_ms": 0
+}

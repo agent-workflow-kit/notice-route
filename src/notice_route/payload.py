@@ -174,7 +174,7 @@ REFUSAL_MESSAGES = {
     "payload_unrecognized": "the input is neither a hook payload nor a channel notice",
     "source_mismatch": "the source does not match the payload or is reserved",
     "payload_invalid": "the input is not valid",
-    "hook_recursion": "send is refused inside a router hook",
+    "hook_recursion": "send and flush are refused inside a router hook",
 }
 USAGE_MESSAGES = {
     "flags": "the input flags cannot be combined this way",
@@ -186,6 +186,7 @@ USAGE_MESSAGES = {
     "verbose_quiet": "--verbose and --quiet cannot be combined",
     "actor": "--actor must be human:<name> or auto:<name>",
     "decision_id": "--decision-id takes one value of letters, digits and ._:-",
+    "destination": "--destination names a destination that is not configured",
 }
 # The pointers a refusal may carry: fixed strings, never built from the input.
 POINTERS = frozenset(
@@ -235,6 +236,7 @@ UsageReason = Literal[
     "verbose_quiet",
     "actor",
     "decision_id",
+    "destination",
 ]
 
 

@@ -1,0 +1,33 @@
+{
+  "outcome": "no_op",
+  "dry_run": false,
+  "destinations": [
+    {
+      "name": "chat",
+      "state": "nothing_due",
+      "due_single": 0,
+      "due_held": 0,
+      "sent": 0,
+      "queued_retry": 0,
+      "failed": 0,
+      "unknown": 0,
+      "dropped": 0,
+      "expired": 0,
+      "digests": 0
+    },
+    {
+      "name": "off",
+      "state": "disabled",
+      "due_single": 0,
+      "due_held": 0,
+      "sent": 0,
+      "queued_retry": 0,
+      "failed": 0,
+      "unknown": 0,
+      "dropped": 0,
+      "expired": 0,
+      "digests": 0
+    }
+  ],
+  "duration_ms": 0
+}

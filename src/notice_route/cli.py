@@ -26,6 +26,7 @@ from . import __version__
 from .config import ConfigError
 from .decide import instant
 from .dryrun import dry_run_document
+from .flush import FlushOptions, FlushResult, run_flush
 from .gateway import Gateway, HomeError, Interrupted, StateError
 from .payload import InputFlags, PayloadError, UsageError, load_notification
 from .report import rules_document, validate_document
@@ -113,6 +114,17 @@ def build_parser() -> argparse.ArgumentParser:
     _add_audit_flags(send)
     # Parsed only to refuse it with exit 2 `usage`: send never reads a config from a flag.
     send.add_argument("--config", metavar="PATH", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+
+    flush = commands.add_parser("flush", help="deliver the due queue rows", allow_abbrev=False)
+    _add_global_flags(flush, top=False)
+    flush.add_argument(
+        "--destination", action="append", default=[], metavar="NAME", help="only this destination"
+    )
+    flush.add_argument("--dry-run", action="store_true", help="list what is due; change nothing")
+    _add_audit_flags(flush)
+    flush.add_argument(
+        "--config", metavar="PATH", default=argparse.SUPPRESS, help=argparse.SUPPRESS
+    )
     return parser
 
 
@@ -392,6 +404,38 @@ def _run_send(args: argparse.Namespace, gateway: Gateway) -> int:
     return result.exit_code
 
 
+def _run_flush(args: argparse.Namespace, gateway: Gateway) -> int:
+    """``flush``: the flags (exit 2), the recursion guard (exit 20), the config, then the run. The
+    trap is armed for the config load; during the run it only sets a flag."""
+    started = gateway.monotonic()
+    actor, decision_id = _audit(args, gateway)
+    if gateway.env_present("NOTICE_ROUTE_HOOK"):
+        raise PayloadError("hook_recursion")
+    options = FlushOptions(
+        actor, decision_id, args.dry_run, tuple(dict.fromkeys(args.destination)), args.verbose
+    )
+    with gateway.trapped_signals() as trap:
+        trap.armed = True
+        try:
+            config = load_valid_config(gateway, None)
+            result = run_flush(gateway, config, options, started, trap)
+        except Interrupted as exc:
+            return 128 + exc.signum
+        finally:
+            trap.armed = False
+        trap.armed = True
+        try:
+            _send_output(args, gateway, result)
+        except Interrupted as exc:
+            gateway.discard_stdout()
+            gateway.discard_stderr()
+            # 128+N only when no call started: after one, the exit is the run's result
+            return result.exit_code if result.called else 128 + exc.signum
+        finally:
+            trap.armed = False
+    return result.exit_code
+
+
 def _guarded(gateway: Gateway, stream: str, write: Callable[[], None]) -> None:
     """One write after the send is done: a failure changes nothing (the exit code is the
     result's), and the stream is pointed at the null device so its buffered text cannot fail
@@ -405,7 +449,9 @@ def _guarded(gateway: Gateway, stream: str, write: Callable[[], None]) -> None:
             gateway.discard_stderr()
 
 
-def _send_output(args: argparse.Namespace, gateway: Gateway, result: SendResult) -> None:
+def _send_output(
+    args: argparse.Namespace, gateway: Gateway, result: SendResult | FlushResult
+) -> None:
     def err(text: str) -> None:
         _guarded(gateway, "err", lambda: _err(f"{PROG}: {_safe(text)}\n"))
 
@@ -417,6 +463,13 @@ def _send_output(args: argparse.Namespace, gateway: Gateway, result: SendResult)
     if args.verbose:
         for text in result.verbose:
             err(text)
+    # a clean ``flush`` under --quiet (a cron line) prints no per-destination line: only
+    # warnings and the lines of a run that failed
+    lines = (
+        []
+        if args.quiet and isinstance(result, FlushResult) and result.exit_code in (0, 22)
+        else result.lines
+    )
     if result.error is not None:
         code, message = result.error
         if args.json:
@@ -425,7 +478,7 @@ def _send_output(args: argparse.Namespace, gateway: Gateway, result: SendResult)
             }
             _guarded(gateway, "out", lambda: _json(envelope))
         else:
-            for text in result.lines:
+            for text in lines:
                 err(text)
         _guarded(gateway, "err", lambda: _err(f"{PROG}: {code}: {message}\n"))
     elif result.document is not None:
@@ -433,7 +486,7 @@ def _send_output(args: argparse.Namespace, gateway: Gateway, result: SendResult)
             document = result.document
             _guarded(gateway, "out", lambda: _json(document))
         else:
-            for text in result.lines:
+            for text in lines:
                 err(text)
 
 
@@ -498,6 +551,8 @@ def _main(argv: Sequence[str] | None, gateway: Gateway | None) -> int:
             return _run_dry_run(args, gateway)
         if args.command == "send":
             return _run_send(args, gateway)
+        if args.command == "flush":
+            return _run_flush(args, gateway)
         return _run_validate(args, gateway)
     except (PayloadError, UsageError) as exc:
         return _refused(exc, as_json=args.json)
