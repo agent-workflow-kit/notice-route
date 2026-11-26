@@ -451,10 +451,11 @@ def test_no_program_to_run_is_exit_1(rig: Rig) -> None:
     gw = rig.gateway(argv0="/x/notice_route/__main__.py")
     code, _, err = rig.run("install", gateway=gw)
     assert code == 1 and err.startswith("notice-route: internal: ")
+    assert "not found on a safe PATH entry; run it by its absolute path" in err
     assert rig.crontab.calls() == []
 
 
-def test_a_program_that_is_not_executable_is_refused(rig: Rig) -> None:
+def test_a_program_that_is_not_executable_is_an_internal_error(rig: Rig) -> None:
     rig.exe.chmod(0o644)
     code, _, _ = rig.run("install")
     assert code == 1
@@ -501,6 +502,7 @@ def test_a_failing_write_is_exit_1_and_never_echoes_crontab_text(rig: Rig) -> No
     code, out, err = rig.run("install")
     assert code == 1 and CANARY not in out + err
     assert err.startswith("notice-route: internal: ") and err.count("\n") == 1
+    assert "(it is unchanged)" in err
     assert rig.crontab.table() == b"0 0 * * * keep\n"
     code, doc = rig.run_json("install")
     assert code == 1 and doc["error"]["code"] == "internal" and CANARY not in json.dumps(doc)
@@ -534,6 +536,8 @@ def test_a_hanging_crontab_times_out_with_exit_1(
     code, _, err = rig.run("install")
     assert code == 1 and err.startswith("notice-route: internal: ")
     assert rig.crontab.table() == b"0 0 * * * keep\n"
+    if hang == "write":
+        assert "unchanged" not in err and "check it" in err
 
 
 def test_a_crontab_too_large_to_read_is_refused(rig: Rig) -> None:
@@ -764,3 +768,55 @@ def test_marker_names_match_the_documented_text() -> None:
     assert cron.START_PREFIX == "# notice-route managed v"
     assert cron.END_LINE == END
     assert cron.HEADER == START
+
+
+# --- review round 1 --------------------------------------------------------------------------
+
+
+def test_install_over_a_crlf_block_rewrites_it_and_keeps_foreign_crlf_lines(rig: Rig) -> None:
+    table = f"a\r\n{START}\r\n{END}\r\nb\r\n".encode()
+    rig.crontab.set_table(table)
+    code, doc = rig.run_json("install")
+    assert code == 0 and doc["action"] == "updated"
+    assert rig.crontab.table() == b"a\r\n" + block_of(rig) + b"b\r\n"
+
+
+@pytest.mark.parametrize(
+    ("name", "table", "shown"),
+    [
+        ("v2", "# notice-route managed v2 x\nfoo\n" + END + "\n", None),
+        ("flush5m", "# notice-route managed v1 flush=5m\nfoo\n" + END + "\n", None),
+        ("crlf", f"{START}\r\nfoo\r\n{END}\r\n", f"{START}\nfoo\n{END}\n"),
+        (
+            "trailing_blanks",
+            f"{START} \t\nfoo \n{END} \t\n",
+            f"{START}\nfoo\n{END}\n",
+        ),
+    ],
+)
+def test_uninstall_output_is_schema_valid_for_any_block_version_or_line_ending(
+    rig: Rig, name: str, table: str, shown: str | None
+) -> None:
+    rig.crontab.set_table(table)
+    code, doc = rig.run_json("uninstall", "--dry-run")
+    assert code == 0 and doc["action"] == "removed", name
+    assert schema_errors(doc, "cron-uninstall.json") == [], name
+    assert "\r" not in doc["block"]
+    if shown is not None:
+        assert doc["block"] == shown
+
+
+def test_uninstall_shows_non_utf8_bytes_as_replacement_characters(rig: Rig) -> None:
+    rig.crontab.set_table(f"{START}\n".encode() + b"x \xff y\n" + f"{END}\n".encode())
+    code, doc = rig.run_json("uninstall")
+    assert code == 0 and "\ufffd" in doc["block"]
+    assert schema_errors(doc, "cron-uninstall.json") == []
+
+
+def test_an_untrusted_program_directory_is_left_out_of_the_path_line(rig: Rig) -> None:
+    rig.exe.parent.chmod(0o777)
+    code, doc = rig.run_json("install")
+    assert code == 0
+    lines = doc["block"].splitlines()
+    assert lines[1] == "PATH=/usr/local/bin:/usr/bin:/bin"
+    assert f"'{os.path.realpath(rig.exe)}' flush --quiet" in lines[2]

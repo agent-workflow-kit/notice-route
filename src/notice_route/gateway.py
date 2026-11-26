@@ -1033,6 +1033,8 @@ class Gateway:
                 found = self._find_executable(PROGRAM_NAME, self.environ().get("PATH", ""))
             if found is None:
                 return None
+            # todo(#32): realpath bakes a versioned Homebrew path (Cellar/<version>) into the cron
+            # line; macOS support should consider the stable symlink path instead
             real = os.path.realpath(found)
             if os.path.isfile(real) and os.access(real, os.X_OK):
                 return real

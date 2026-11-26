@@ -1,10 +1,15 @@
-"""The suite's guard against the real ``crontab``: it refuses before anything starts."""
+"""The suite's guard against the real ``crontab``: it refuses before anything starts.
+
+Every test here replaces the guard's table of real start functions (``Guard.real``) with
+recorders that start nothing, so a regression of the guard cannot reach the real ``crontab``.
+"""
 
 from __future__ import annotations
 
 import os
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -14,16 +19,20 @@ from tests.fakecron import FakeCrontab
 
 
 @pytest.fixture
-def spawned(monkeypatch: pytest.MonkeyPatch, crontab_guard_fixture: Guard) -> list[object]:
-    """Replace the base ``Popen.__init__`` (what the guard calls once it lets a call through)
-    with a recorder that starts nothing: a refused call must never reach it."""
+def spawned(crontab_guard_fixture: Guard) -> list[object]:
+    """Replace every real start function the guard lets a call through to with a recorder that
+    starts nothing: a refused call must never reach it."""
     seen: list[object] = []
 
-    def record(self: object, args: object, *rest: object, **kwargs: object) -> None:
-        seen.append(args)
-        raise OSError("not started (test recorder)")
+    def recorder(name: str) -> Any:
+        def record(*args: object, **kwargs: object) -> Any:
+            seen.append((name, args[1:] if name == "Popen.__init__" else args))
+            raise OSError("not started (test recorder)")
 
-    monkeypatch.setattr(crontab_guard_fixture.base_popen, "__init__", record)
+        return record
+
+    for name in list(crontab_guard_fixture.real):
+        crontab_guard_fixture.real[name] = recorder(name)
     return seen
 
 
@@ -75,6 +84,80 @@ def test_other_ways_to_start_a_program_are_guarded(
         os.system("/usr/bin/crontab -l")
     with pytest.raises(RealCrontabAttempt):
         os.posix_spawn("/usr/bin/crontab", ["crontab", "-l"], {})
+    assert spawned == []
+
+
+@pytest.mark.parametrize(
+    "env",
+    [{}, {"LC_ALL": "C"}, {b"PATH": b"/usr/bin"}],
+    ids=["empty", "no_path", "bytes_path"],
+)
+def test_a_child_environment_without_the_fake_on_its_path_is_refused(
+    crontab_guard_fixture: Guard, spawned: list[object], env: dict[Any, Any]
+) -> None:
+    """subprocess searches the child's own ``PATH`` (or the default), never the parent's: with
+    the fake first on the parent's ``PATH`` the name must not resolve to the fake."""
+    crontab_guard_fixture.expected = True
+    with pytest.raises(RealCrontabAttempt):
+        subprocess.run(["crontab", "-l"], env=env, check=False)
+    assert spawned == []
+
+
+def test_a_shell_command_with_a_crontab_word_is_refused(
+    crontab_guard_fixture: Guard, spawned: list[object]
+) -> None:
+    crontab_guard_fixture.expected = True
+    for command in (
+        "true && /usr/bin/crontab -l",
+        "true; crontab -l",
+        "echo hi | '/usr/bin/crontab' -l",
+    ):
+        with pytest.raises(RealCrontabAttempt):
+            subprocess.run(command, shell=True, env={}, check=False)
+    assert spawned == []
+
+
+def test_an_interpreter_started_with_a_crontab_argument_is_refused(
+    crontab_guard_fixture: Guard, spawned: list[object]
+) -> None:
+    crontab_guard_fixture.expected = True
+    for argv in (
+        ["sh", "-c", "/usr/bin/crontab -l"],
+        ["/bin/sh", "-c", "true && crontab -l"],
+        ["env", "crontab", "-l"],
+        ["python3", "-c", "import os; os.execv('/usr/bin/crontab', [])"],
+    ):
+        with pytest.raises(RealCrontabAttempt):
+            subprocess.run(argv, env={"PATH": "/usr/bin:/bin"}, check=False)
+    assert spawned == []
+
+
+def test_a_harmless_shell_command_is_not_refused(
+    crontab_guard_fixture: Guard, spawned: list[object]
+) -> None:
+    with pytest.raises(OSError, match="test recorder"):
+        subprocess.run("echo hi && true", shell=True, check=False)
+    assert len(spawned) == 1
+    assert crontab_guard_fixture.attempts == []
+
+
+@pytest.mark.parametrize(
+    "name", ["spawnv", "spawnve", "spawnvp", "spawnvpe", "spawnl", "spawnle", "spawnlp", "spawnlpe"]
+)
+def test_the_spawn_family_is_guarded(
+    crontab_guard_fixture: Guard, spawned: list[object], name: str
+) -> None:
+    crontab_guard_fixture.expected = True
+    call = getattr(os, name)
+    program = "/usr/bin/crontab"
+    if name.startswith("spawnv"):
+        extra = ({},) if name.endswith("e") else ()
+        args: tuple[Any, ...] = (os.P_WAIT, program, [program, "-l"], *extra)
+    else:
+        extra = ({},) if name.endswith("e") else ()
+        args = (os.P_WAIT, program, program, "-l", *extra)
+    with pytest.raises(RealCrontabAttempt):
+        call(*args)
     assert spawned == []
 
 

@@ -44,7 +44,7 @@
         "properties": {
           "block": {
             "type": "string",
-            "pattern": "^# notice-route managed v1 flush=1m\\n[\\s\\S]*# notice-route managed end\\n?(?![\\s\\S])"
+            "pattern": "^# notice-route managed v[^\\n]*\\n[\\s\\S]*# notice-route managed end\\n?(?![\\s\\S])"
           }
         }
       },

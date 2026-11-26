@@ -27,7 +27,10 @@ Judgment calls where the interface is silent (the conservative reading in each c
   broken or the program has moved.
 - An emptied crontab is written as an empty table through ``crontab -`` (never ``crontab -r``).
 - The ``PATH=`` line is the three system directories first, then the program's directory when it
-  is not one of them (a directory ahead of them could shadow a system tool).
+  is not one of them and is a trusted directory (the ``clean_path`` rule: owned by the user or
+  root, not group- or world-writable). A directory ahead of them could shadow a system tool.
+- ``uninstall`` shows the removed lines with trailing spaces, tabs and carriage returns removed,
+  and non-UTF-8 bytes as U+FFFD.
 - A block line longer than 999 bytes (cron reads a line into 1000 bytes) is refused (exit 2).
 - The program must be an executable file; it is not otherwise checked, because the cron line runs
   what the user ran, and its path must match ``[A-Za-z0-9_./+-]+``.
@@ -87,9 +90,11 @@ class CronResult:
 # --- the block -------------------------------------------------------------------------------
 
 
-def path_line(program_dir: str) -> str:
+def path_line(program_dir: str | None) -> str:
+    """``PATH=`` with the system directories, then ``program_dir`` unless it is None (not a
+    trusted directory) or already one of them."""
     dirs: list[str] = list(SYSTEM_DIRS)
-    if program_dir not in dirs:
+    if program_dir is not None and program_dir not in dirs:
         dirs.append(program_dir)
     return "PATH=" + ":".join(dirs)
 
@@ -98,9 +103,10 @@ def _plain(value: str) -> bool:
     return VALUE.fullmatch(value) is not None
 
 
-def build_block(program: str, env_file: str | None) -> list[str]:
+def build_block(program: str, env_file: str | None, *, dir_trusted: bool = True) -> list[str]:
     """The block's lines. ``program`` is the resolved absolute path; ``program`` and ``env_file``
-    must match ``[A-Za-z0-9_./+-]+`` (else ``CronError`` usage), so quoting them with single
+    must match ``[A-Za-z0-9_./+-]+`` (else ``CronError`` usage); the program's directory goes into
+    ``PATH=`` only when ``dir_trusted``. Quoting them with single
     quotes is enough and nothing needs cron's ``%`` escape."""
     if not program.startswith("/") or not _plain(program):
         raise CronError(
@@ -112,7 +118,7 @@ def build_block(program: str, env_file: str | None) -> list[str]:
     source = f"set -a && . '{env_file}' && set +a && " if env_file is not None else ""
     lines = [
         HEADER,
-        path_line(program_dir),
+        path_line(program_dir if dir_trusted else None),
         f"* * * * * {source}'{program}' flush --quiet",
         f"17 3 * * * {source}'{program}' prune --quiet",
         END_LINE,
@@ -209,7 +215,9 @@ def _read(gateway: Gateway) -> bytes:
 def _write(gateway: Gateway, table: bytes) -> None:
     result = gateway.run_crontab(["-"], stdin=table)
     if not (result.status == "exited" and result.returncode == 0):
-        raise _failed("cannot write the crontab (it is unchanged)", result)
+        if result.status == "exited":
+            raise _failed("cannot write the crontab (it is unchanged)", result)
+        raise _failed("cannot write the crontab (it may have changed; check it)", result)
 
 
 def _commit(gateway: Gateway, before: bytes, after: bytes) -> None:
@@ -241,10 +249,16 @@ def _install(gateway: Gateway, config: Config | None, dry_run: bool) -> CronResu
     env_file = config.cron_env_file if config is not None else None
     program = gateway.program_path()
     if program is None:
-        raise CronError("internal", "cannot find the notice-route executable")
+        raise CronError(
+            "internal",
+            "cannot find the notice-route executable: not found on a safe PATH entry; "
+            "run it by its absolute path",
+        )
     if env_file is not None and not (_plain(env_file) and gateway.check_env_file(env_file)):
         raise CronError("usage", "cron.env_file is missing, unsafe or has unusable characters")
-    block = build_block(program, env_file)
+    program_dir = program.rsplit("/", 1)[0] or "/"
+    trusted = gateway.clean_path(program_dir) == program_dir
+    block = build_block(program, env_file, dir_trusted=trusted)
     before = _read(gateway)
     after, existed = _install_table(before, block)
     if after == before:
@@ -271,7 +285,7 @@ def _uninstall(gateway: Gateway, dry_run: bool) -> CronResult:
         )
     if not dry_run:
         _commit(gateway, before, after)
-    shown = "\n".join(line.decode("utf-8", "replace") for line in removed) + "\n"
+    shown = "\n".join(_norm(line).decode("utf-8", "replace") for line in removed) + "\n"
     return CronResult(
         {"action": "removed", "block": shown, "dry_run": dry_run}, ["removed" + suffix]
     )

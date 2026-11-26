@@ -11,15 +11,31 @@ The suite must never read or write the user's real crontab, so every test runs u
   recorded. The fixture fails the test at teardown when an attempt was recorded and not
   expected.
 - The guard sits in front of ``subprocess.Popen`` (so ``subprocess.run`` and the gateway),
-  ``os.system``, the ``os.exec*`` family and ``os.posix_spawn(p)``.
+  the ``os.exec*`` and ``os.spawn*`` families and ``os.posix_spawn(p)``; ``os.system`` is
+  refused for every command. A bare name is searched the way the call itself would search it
+  (``os.get_exec_path`` of the child's ``env``, so a child ``env`` without ``PATH`` uses the
+  default path, never the parent's). With ``shell=True`` and for an interpreter or launcher
+  (``sh``, ``bash``, ``dash``, ``zsh``, ``env``, ``xargs``, ``python*``) every word of every
+  argument is checked too.
+- The real start functions are kept in ``Guard.real`` (a table the wrappers call at call
+  time), so a test of the guard replaces the entries with recorders and can never reach the
+  real function if the guard regresses.
+
+What the guard does NOT cover: it lives in this interpreter only. A child process is not
+guarded (one that resets ``PATH``, uses an absolute path or an empty environment escapes;
+today no test child can reach cron). Also unguarded: ``ctypes``/``cffi`` calls,
+``_posixsubprocess.fork_exec``, a copied or hard-linked ``crontab`` binary (its realpath is not a
+system path and its name may differ) and code that runs at import time before the fixture.
 """
 
 from __future__ import annotations
 
 import os
+import re
+import shlex
 import shutil
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +57,9 @@ SYSTEM_CRONTABS = frozenset(
     }
 )
 
+LAUNCHERS = frozenset({"sh", "bash", "dash", "zsh", "env", "xargs"})
+_WORD_BREAKS = re.compile(r"[\s;&|()<>`'\"$]+")
+
 
 class RealCrontabAttempt(BaseException):  # noqa: N818 - must not be caught by ``except Exception``
     """Something tried to run a crontab that is not a registered fake."""
@@ -51,32 +70,71 @@ class Guard:
         self.allowed: set[str] = set()  # realpaths of the fake stubs
         self.attempts: list[str] = []  # what was refused
         self.expected = False  # the guard's own test sets this
-        self.base_popen: type[Any] = subprocess.Popen  # what the guard lets a call through to
+        # the real start functions a call is let through to, by name; ``install`` fills it
+        self.real: dict[str, Callable[..., Any]] = {}
 
     def allow(self, stub: str | os.PathLike[str]) -> None:
         self.allowed.add(os.path.realpath(stub))
 
-    def check(self, program: object, search_path: str | None = None) -> None:
-        """Refuse ``program`` when it is a crontab that is not a registered fake."""
+    def _refuse(self, name: str) -> None:
+        self.attempts.append(name)
+        raise RealCrontabAttempt(f"refused to run a crontab that is not a test fake: {name!r}")
+
+    def check(self, program: object, search: Sequence[str] | None = None) -> None:
+        """Refuse ``program`` when it is a crontab that is not a registered fake. ``search`` is
+        the list of directories a bare name is looked up in (default: this process's)."""
         try:
             name = os.fsdecode(program)  # type: ignore[arg-type]
         except TypeError:
             return
-        real = _resolve(name, search_path)
+        real = _resolve(name, search)
         by_name = os.path.basename(name) == "crontab" or os.path.basename(real) == "crontab"
         if real in self.allowed:
             return
         if by_name or real in SYSTEM_CRONTABS:
-            self.attempts.append(name)
-            raise RealCrontabAttempt(f"refused to run a crontab that is not a test fake: {name!r}")
+            self._refuse(name)
+
+    def check_words(self, text: object, search: Sequence[str] | None = None) -> None:
+        """Check every word of a command line or an interpreter argument."""
+        try:
+            raw = os.fsdecode(text)  # type: ignore[arg-type]
+        except TypeError:
+            return
+        try:
+            words = shlex.split(raw)
+        except ValueError:
+            words = raw.split()
+        for word in [raw, *words]:
+            for piece in _WORD_BREAKS.split(word):
+                if piece and ("/" in piece or os.path.basename(piece) == "crontab"):
+                    self.check(piece, search)
+
+    def check_launch(
+        self, program: object, argv: Sequence[object], search: Sequence[str] | None
+    ) -> None:
+        self.check(program, search)
+        try:
+            base = os.path.basename(os.path.realpath(_resolve(os.fsdecode(program), search)))  # type: ignore[arg-type]
+        except TypeError:
+            return
+        if base in LAUNCHERS or base.startswith("python"):
+            for arg in argv[1:]:
+                self.check_words(arg, search)
 
 
-def _resolve(name: str, search_path: str | None) -> str:
+def _exec_dirs(env: Mapping[Any, Any] | None) -> list[str]:
+    """The directories ``subprocess`` and ``exec*p`` search: ``os.get_exec_path(env)``."""
+    try:
+        return os.get_exec_path(env)  # type: ignore[arg-type]
+    except (ValueError, TypeError):
+        return os.get_exec_path({})
+
+
+def _resolve(name: str, search: Sequence[str] | None) -> str:
     if "/" in name:
         return os.path.realpath(name)
-    found = shutil.which(
-        name, path=search_path if search_path is not None else os.environ.get("PATH")
-    )
+    dirs = list(search) if search is not None else _exec_dirs(None)
+    found = shutil.which(name, path=os.pathsep.join(d for d in dirs if d))
     return os.path.realpath(found) if found else name
 
 
@@ -91,52 +149,77 @@ def _argv_program(args: object, executable: object) -> object:
 
 def install(monkeypatch: pytest.MonkeyPatch, guard: Guard) -> None:
     original_popen = subprocess.Popen
+    guard.real["Popen.__init__"] = original_popen.__init__
 
     class GuardedPopen(original_popen):  # type: ignore[type-arg,misc]
         def __init__(self, args: Any, *rest: Any, **kwargs: Any) -> None:
-            env = kwargs.get("env")
-            search = env.get("PATH") if env is not None else None
-            program = _argv_program(args, kwargs.get("executable"))
-            if kwargs.get("shell") and isinstance(args, str):
-                program = args.split()[0] if args.split() else ""
-            guard.check(program, search)
-            super().__init__(args, *rest, **kwargs)
+            search = _exec_dirs(kwargs.get("env"))
+            if kwargs.get("shell"):
+                words = (
+                    args
+                    if isinstance(args, (str, bytes, os.PathLike))
+                    else " ".join(os.fsdecode(a) for a in args)
+                )
+                guard.check_words(words, search)
+            else:
+                program = _argv_program(args, kwargs.get("executable"))
+                argv = [args] if isinstance(args, (str, bytes, os.PathLike)) else list(args)
+                guard.check_launch(program, argv, search)
+            guard.real["Popen.__init__"](self, args, *rest, **kwargs)
 
     monkeypatch.setattr(subprocess, "Popen", GuardedPopen)
 
     def guarded_system(command: Any) -> int:
-        words = os.fsdecode(command).split()
-        for word in words:
-            guard.check(word)
-        raise AssertionError("os.system is not used by the router or its tests")
+        guard.check_words(command)
+        raise AssertionError("os.system is refused: the router and its tests never use it")
 
     monkeypatch.setattr(os, "system", guarded_system)
 
-    def wrap_exec(name: str) -> None:
-        real = getattr(os, name)
+    def wrap(name: str, *, skip: int = 0) -> None:
+        """Wrap ``os.<name>``; ``skip`` leading arguments (the spawn mode) precede the path."""
+        guard.real[name] = getattr(os, name)
+        letter_e = name.endswith("e") or name.endswith("pe")
+        suffix = name.removeprefix("exec").removeprefix("spawn").removeprefix("posix_spawn")
+        searched = "p" in suffix
 
-        def guarded(path: Any, *args: Any, **kwargs: Any) -> Any:
-            guard.check(path)
-            return real(path, *args, **kwargs)
+        def guarded(*args: Any, **kwargs: Any) -> Any:
+            path = args[skip]
+            rest = args[skip + 1 :]
+            env: Mapping[Any, Any] | None = None
+            if "v" in name or name.startswith("posix_spawn"):
+                argv = list(rest[0]) if rest else []
+                if letter_e and len(rest) > 1:
+                    env = rest[1]
+                if name.startswith("posix_spawn") and len(rest) > 1:
+                    env = rest[1]
+            else:
+                argv = list(rest[:-1] if letter_e and rest else rest)
+                if letter_e and rest:
+                    env = rest[-1]
+            search = _exec_dirs(env) if searched else None
+            guard.check_launch(path, argv or [path], search)
+            return guard.real[name](*args, **kwargs)
 
         monkeypatch.setattr(os, name, guarded)
 
     for name in ("execv", "execve", "execvp", "execvpe", "execl", "execle", "execlp", "execlpe"):
         if hasattr(os, name):
-            wrap_exec(name)
-
-    def wrap_spawn(name: str) -> None:
-        real: Callable[..., Any] = getattr(os, name)
-
-        def guarded(path: Any, *args: Any, **kwargs: Any) -> Any:
-            guard.check(path)
-            return real(path, *args, **kwargs)
-
-        monkeypatch.setattr(os, name, guarded)
-
+            wrap(name)
+    for name in (
+        "spawnv",
+        "spawnve",
+        "spawnvp",
+        "spawnvpe",
+        "spawnl",
+        "spawnle",
+        "spawnlp",
+        "spawnlpe",
+    ):
+        if hasattr(os, name):
+            wrap(name, skip=1)
     for name in ("posix_spawn", "posix_spawnp"):
         if hasattr(os, name):
-            wrap_spawn(name)
+            wrap(name)
 
 
 def private_path(fake_dir: Path, current: str) -> str:
