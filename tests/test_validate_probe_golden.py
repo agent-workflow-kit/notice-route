@@ -36,7 +36,10 @@ def test_golden_ok_disabled_and_skipped(rig: Rig) -> None:
         {
             "chat": {"notifier": rig.notifier("chat")},
             "phone": {"notifier": rig.notifier("phone", tool="ha-notice"), "kind": "ha-notice"},
-            "off": {"notifier": rig.notifier("off", disabled=True)},
+            "off": {
+                "notifier": rig.notifier("off", tool="ha-notice", disabled=True),
+                "kind": "ha-notice",
+            },
             "plain": {"notifier": rig.notifier("plain"), "kind": "generic"},
             "nocred": {"notifier": rig.notifier("nocred"), "env": ["CRED_ONE"]},
         }

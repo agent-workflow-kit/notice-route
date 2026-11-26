@@ -783,6 +783,9 @@ class Run:
             args = parse_argv(argv)
         except Usage:
             return self.emit_error({"code": "usage"}, None)
+        if args.command == "validate" and "--probe" in args.flags and self.tool == "slack-notice":
+            # the real slack-notice grammar is ``validate [--test-message]``
+            return self.emit_error({"code": "usage"}, None)
         self.key = args.values.get("--dedupe-key")
         if args.early == "--version":
             write_fd(1, f"{self.tool} {VERSION}\n".encode())
@@ -864,7 +867,8 @@ class Run:
         """``validate [--probe] [--json]``: reads no stdin, sends nothing. The scripted effects
         (hang, sleep, grandchild, output, exit, signal death) apply as for ``send``."""
         b = self.b
-        if b.get("disabled"):
+        self.drain_stdin()
+        if b.get("disabled") and self.answers_disabled_with_22(args):
             write_fd(1, dumps({"outcome": "disabled"})) if self.json_mode else write_fd(
                 2, b"disabled in config\n"
             )
@@ -881,6 +885,33 @@ class Run:
             self.pause(float(b["linger"]))
         self.maybe_die()
         return code
+
+    def answers_disabled_with_22(self, args: Args) -> bool:
+        """A disabled tool answers ``validate`` with exit 22 only for ``--probe`` or
+        ``--test-message``, or when it is not slack-notice; plain slack-notice ``validate`` is
+        exit 0 with ``enabled`` false and its checks."""
+        return self.tool != "slack-notice" or bool({"--probe", "--test-message"} & args.flags)
+
+    def drain_stdin(self) -> None:
+        """Read whatever is already on fd 0 without ever waiting (validate takes no input) and
+        log it as a ``stdin`` event, so a test can tell that a caller wrote to it."""
+        chunks: list[bytes] = []
+        size = 0
+        os.set_blocking(0, False)
+        try:
+            while size <= MAX_STDIN:
+                data = os.read(0, 65536)
+                if not data:
+                    break
+                chunks.append(data)
+                size += len(data)
+        except OSError:  # nothing more to read right now (or no usable fd 0)
+            pass
+        raw = b"".join(chunks)
+        fields: dict[str, Any] = {"size": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+        if len(raw) <= 65536:
+            fields["text"] = raw.decode("utf-8", errors="replace")
+        self.log.write("stdin", **fields)
 
     def answer_validate(self, args: Args) -> int:
         b = self.b
@@ -899,7 +930,7 @@ class Run:
         else:
             body: dict[str, Any] = {
                 "ok": True,
-                "enabled": True,
+                "enabled": not b.get("disabled"),
                 "checks": [{"name": "config", "ok": True, "message": "configuration is valid"}],
             }
             if self.tool == "ha-notice" and "--probe" in args.flags:

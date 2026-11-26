@@ -42,7 +42,7 @@ from .history import (
     run_history,
 )
 from .payload import InputFlags, PayloadError, UsageError, load_notification
-from .probe import Probes, run_probes
+from .probe import run_probes
 from .prune import PruneOptions, run_prune
 from .report import rules_document, validate_document
 from .send import SendOptions, SendResult, run_send
@@ -352,7 +352,7 @@ def _run_validate(args: argparse.Namespace, gateway: Gateway) -> int:
         try:
             config = load_valid_config(gateway, None)
             trap.armed = False  # a call that started finishes; a signal only sets the flag
-            probes = Probes({}) if config is None else run_probes(gateway, config, trap)
+            probes = run_probes(gateway, config, trap)
             if probes.signal is not None:
                 return 128 + probes.signal
             doc, code = validate_document(config, gateway, probes.results)
@@ -360,7 +360,9 @@ def _run_validate(args: argparse.Namespace, gateway: Gateway) -> int:
             return 128 + exc.signum
         finally:
             trap.armed = False
-        trap.armed = True
+        # Once a call ran, the report is printed whatever arrives (the flag is set and the exit
+        # code is the report's); with no call, a signal still exits 128+N and prints nothing.
+        trap.armed = not probes.started
         try:
             return _validate_output(args, config, doc, code)
         except Interrupted as exc:

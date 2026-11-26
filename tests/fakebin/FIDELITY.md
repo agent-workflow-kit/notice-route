@@ -94,18 +94,27 @@ The sources are the notifiers' interfaces (`Calling from automation`, `Exit code
 
 - `validate [--probe] [--json]` (#29) reads no stdin and sends nothing; the scripted effects
   (`hang`, `sleep`, `grandchild`, output, `exit`, `error`, `disabled`, `die_by_signal`) apply.
-  Default output `{ok, enabled, checks: [config]}` plus `probe: {api_ok}` for `ha-notice` with
-  `--probe`. It is built from the interface text: no pinned `validate` schema exists under
-  `tests/sibling-schemas/`, no check list beyond `config`, and `disabled` answers exit 22 for
-  plain `validate` as well (the real `slack-notice` answers exit 0 with `enabled` false; the
-  real `ha-notice` answers 22 only with `--probe` or `--test-message`). Use `result` to script
-  `enabled`.
+  It also reads fd 0 without waiting and logs what it got as a `stdin` event (size 0 when the
+  caller wrote nothing). Default output `{ok, enabled, checks: [config]}` plus `probe: {api_ok}`
+  for `ha-notice` with `--probe`; `enabled` is false when `disabled` is set. No pinned
+  `validate` schema exists under `tests/sibling-schemas/`, and the check list is only `config`.
+  `disabled` answers exit 22 with `{"outcome":"disabled"}` only for `--probe` or
+  `--test-message`, or for a tool that is not `slack-notice`; plain `slack-notice validate`
+  answers exit 0 with `enabled` false and its checks. `slack-notice` rejects `--probe` (exit 2
+  usage; its grammar is `validate [--test-message]`). The fake has no wsl-notice tool: tests
+  give a wsl-notice destination the `ha-notice` tool, which shares the `--probe` grammar.
+  Verified from the published documents (read by path, nothing copied): `schemas/cli/validate.json`
+  of `slack-notice`, `ha-notice` and `desktop-notice` all document a boolean `enabled`, and
+  their `validate` paragraphs say a failed check prints `{ok: false, enabled, checks}` and exits
+  with the failing check's code (2 for `config`, 12 for every other check), not an error
+  envelope; an unloadable config prints the error envelope and exits 2.
 
 ## Unverified (for the live-verification issue, #31)
 
-- `validate --json [--probe]` of the real trio: the exact stdout (`enabled` present as a
-  boolean on exit 0, `{"outcome":"disabled"}` on exit 22), the exit codes of failed checks, and
-  the real `wsl-notice` `--probe` grammar (the router passes `validate --json --probe` for it).
+- `validate --json [--probe]` of the real trio, from an actual run (the documents above are
+  verified only as text and schema): the exact stdout on exit 0, 2, 12 and 22 (`enabled` present
+  as a boolean, `{"outcome":"disabled"}` on exit 22), and the real `wsl-notice` `--probe` grammar
+  (the router passes `validate --json --probe` for it).
 
 - wsl-notice: its repository is `desktop-notice` (design 0.1.0, schemas in `schemas/cli`); this
   fake assumes the same call shape, exit codes and envelope as the other two and has no

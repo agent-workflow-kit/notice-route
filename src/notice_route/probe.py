@@ -15,8 +15,9 @@ Classification (interface: validate): exit 0 is ``ok``, exit 22 is ``disabled``,
 ``failed``. ``exit`` is the exit code, or null when the call was killed at its deadline, killed for
 its output size, ended by a signal, never started (``cmd[0]`` check, spawn failure, a busy or
 unusable lock, a signal that came before its turn) or was lost. ``enabled`` is the notifier's own
-value: the boolean ``enabled`` of a stdout that parses as one strict JSON object, with exit 0 or
-22; for exit 22 whose object says ``{"outcome": "disabled"}`` it is false; null otherwise.
+value: the boolean ``enabled`` of a stdout that parses as one strict JSON object, whatever the
+exit code of the call (a failed check prints the full document too); for exit 22 whose object says
+``{"outcome": "disabled"}`` and has no boolean it is false; null otherwise.
 
 The notifier's stdout and stderr are never echoed, stored or logged: only the three fixed fields
 leave this module, so a hostile or secret-bearing answer cannot reach the output.
@@ -28,7 +29,8 @@ Choices where the interface is silent (the narrower reading):
 - Destinations are probed one after the other in config order (a send runs them in parallel).
   A signal ends the wait for a lock and stops later probes; the call in progress finishes within
   its own deadline. Probes that never got their turn are ``failed`` with a null exit; when no call
-  started at all the command exits 128+N with no output.
+  started at all (also with nothing to probe, or no config) the command exits 128+N with no
+  output; once a call started, the run ends with the report and its own exit code.
 - ``NOTICE_ROUTE_HOOK`` does not refuse a probe: the recursion guard is that of ``send`` and
   ``flush`` (it never leaves the router's environment into the call either way).
 """
@@ -38,7 +40,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from .gateway import STDOUT_LIMIT, Gateway, SignalTrap
+from .gateway import STDOUT_LIMIT, Gateway, SignalTrap, StateError, UnsafePathError
 from .notify import PROBED_KINDS, CallResult, build_env, probe_notifier
 from .payload import StrictJsonError, parse_json_object
 from .sendlock import send_lock
@@ -67,11 +69,12 @@ NOT_RUN = ProbeResult("failed", None, None)
 @dataclass(frozen=True)
 class Probes:
     """``results`` by destination name (a destination that is not probed has no entry);
-    ``signal`` is the signal number to exit with (128+N) when one arrived before any call
-    started, else None."""
+    ``started`` is whether any call was made; ``signal`` is the signal number to exit with
+    (128+N) when one arrived and no call started, else None."""
 
     results: dict[str, ProbeResult]
     signal: int | None = None
+    started: bool = False
 
 
 def _enabled(stdout: bytes, rc: int) -> bool | None:
@@ -93,11 +96,12 @@ def classify_probe(call: CallResult) -> ProbeResult:
     if call.status != "ran" or run is None or run.status != "exited" or run.returncode is None:
         return NOT_RUN  # not started, lost, killed, overflowed or ended by a signal
     rc = run.returncode
+    enabled = _enabled(run.stdout, rc)
     if rc == EXIT_OK:
-        return ProbeResult("ok", rc, _enabled(run.stdout, rc))
+        return ProbeResult("ok", rc, enabled)
     if rc == EXIT_DISABLED:
-        return ProbeResult("disabled", rc, _enabled(run.stdout, rc))
-    return ProbeResult("failed", rc, None)
+        return ProbeResult("disabled", rc, enabled)
+    return ProbeResult("failed", rc, enabled)
 
 
 def probe_targets(config: Config, gateway: Gateway) -> list[Destination]:
@@ -115,17 +119,23 @@ def probe_targets(config: Config, gateway: Gateway) -> list[Destination]:
     return out
 
 
-def run_probes(gateway: Gateway, config: Config, trap: SignalTrap) -> Probes:
-    targets = probe_targets(config, gateway)
-    if not targets:
-        return Probes({})  # no state directory is opened for nothing
+def run_probes(gateway: Gateway, config: Config | None, trap: SignalTrap) -> Probes:
+    """Probe every target of ``config`` (None: no config, nothing to probe). The one place that
+    decides the signal exit: a signal that arrived while no call had started is ``signal``."""
+    targets = [] if config is None else probe_targets(config, gateway)
+    if config is None or not targets:
+        return Probes({}, trap.received)  # no state directory is opened for nothing
     results: dict[str, ProbeResult] = {}
     started = False
 
     def stop() -> bool:
         return trap.received is not None
 
-    with gateway.open_state_dir() as state:
+    try:
+        state_dir = gateway.open_state_dir()
+    except (UnsafePathError, OSError, ValueError):
+        raise StateError("unsafe state directory") from None  # as the plain validate reports it
+    with state_dir as state:
         for d in targets:
             if stop():
                 results[d.name] = NOT_RUN
@@ -140,6 +150,4 @@ def run_probes(gateway: Gateway, config: Config, trap: SignalTrap) -> Probes:
                 call = probe_notifier(gateway, d)
                 started = started or call.status in ("ran", "lost")
             results[d.name] = classify_probe(call)
-    if trap.received is not None and not started:
-        return Probes(results, trap.received)
-    return Probes(results)
+    return Probes(results, None if started else trap.received, started)

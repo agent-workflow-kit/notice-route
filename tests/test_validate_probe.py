@@ -66,7 +66,8 @@ def hold_lock(rig: Rig, name: str) -> Any:
     [
         ("slack-notice", "slack-notice", ["validate", "--json"]),
         ("ha-notice", "ha-notice", ["validate", "--json", "--probe"]),
-        ("wsl-notice", "slack-notice", ["validate", "--json", "--probe"]),
+        # the fake has no wsl-notice tool: ha-notice shares the ``--probe`` grammar
+        ("wsl-notice", "ha-notice", ["validate", "--json", "--probe"]),
     ],
 )
 def test_each_known_kind_is_probed_with_its_own_argv_and_never_a_test_message(
@@ -79,7 +80,10 @@ def test_each_known_kind_is_probed_with_its_own_argv_and_never_a_test_message(
     assert only(doc)["probe"] == {"status": "ok", "exit": 0, "enabled": True}
     (call,) = invokes(n)
     assert call["argv"] == tail  # exactly this: no --test-message, no send, no --actor
-    assert n.events("stdin") == []  # nothing is written to a probe's stdin
+    assert ("--probe" in call["argv"]) is (kind != "slack-notice")
+    # the fake reads fd 0 on validate and logs what it got: nothing is written to a probe's stdin
+    (stdin,) = n.events("stdin")
+    assert stdin["size"] == 0 and stdin["text"] == ""
 
 
 def test_the_cmd_extra_arguments_come_before_validate(rig: Rig) -> None:
@@ -119,7 +123,7 @@ def test_the_call_has_its_own_session_an_empty_cwd_and_exactly_the_allow_list_en
 
 
 def test_a_wsl_destination_gets_the_wsl_names_too(rig: Rig) -> None:
-    n = rig.notifier("wsl-notice")
+    n = rig.notifier("wsl-notice", tool="ha-notice")
     rig.configure({"w": {"notifier": n, "kind": "wsl-notice"}})
     code, _ = probe(rig, env={"WSL_INTEROP": "/run/x", "WSL_DISTRO_NAME": "d", "OTHER": "1"})
     assert code == 0
@@ -190,11 +194,34 @@ def test_a_missing_cmd_is_a_failed_probe(rig: Rig, tmp_path: Path) -> None:
 
 
 def test_exit_22_is_disabled_information_and_the_run_still_passes(rig: Rig) -> None:
-    n = rig.notifier(disabled=True)
-    rig.configure({"d": {"notifier": n}})
+    n = rig.notifier(tool="ha-notice", disabled=True)  # ha-notice answers 22 with --probe
+    rig.configure({"d": {"notifier": n, "kind": "ha-notice"}})
     code, doc = probe(rig)
     assert (code, doc["outcome"]) == (0, "ok")
     assert only(doc)["probe"] == {"status": "disabled", "exit": 22, "enabled": False}
+
+
+def test_a_disabled_slack_notice_answers_plain_validate_with_exit_0_and_enabled_false(
+    rig: Rig,
+) -> None:
+    n = rig.notifier(disabled=True)
+    rig.configure({"d": {"notifier": n}})
+    code, doc = probe(rig)
+    assert code == 0 and only(doc)["probe"] == {"status": "ok", "exit": 0, "enabled": False}
+
+
+def test_exit_0_with_the_disabled_outcome_and_no_enabled_key_is_enabled_null(rig: Rig) -> None:
+    n = rig.notifier(stdout='{"outcome": "disabled"}')
+    rig.configure({"d": {"notifier": n}})
+    code, doc = probe(rig)
+    assert code == 0 and only(doc)["probe"] == {"status": "ok", "exit": 0, "enabled": None}
+
+
+def test_exit_22_with_an_explicit_enabled_boolean_reports_it(rig: Rig) -> None:
+    n = rig.notifier(tool="ha-notice", exit=22, stdout='{"enabled": true}')
+    rig.configure({"d": {"notifier": n, "kind": "ha-notice"}})
+    code, doc = probe(rig)
+    assert code == 0 and only(doc)["probe"] == {"status": "disabled", "exit": 22, "enabled": True}
 
 
 def test_the_notifiers_own_enabled_value_is_reported_on_exit_0(rig: Rig) -> None:
@@ -226,11 +253,31 @@ def test_an_enabled_value_that_is_not_a_clean_boolean_is_null(rig: Rig, stdout: 
 
 @pytest.mark.parametrize("exit_code", [1, 2, 10, 12, 20, 21, 23, 64, 129, 143, 255])
 def test_any_other_exit_is_failed_with_its_code_and_run_exit_12(rig: Rig, exit_code: int) -> None:
-    n = rig.notifier(exit=exit_code, stdout=json.dumps({"enabled": True}))
+    n = rig.notifier(exit=exit_code, stdout=json.dumps({"ok": False, "enabled": True}))
     rig.configure({"d": {"notifier": n}})
     code, doc = probe(rig)
     assert (code, doc["outcome"]) == (12, "failed")
+    # a failed check still prints the document with the notifier's own boolean (spec clarification)
+    assert only(doc)["probe"] == {"status": "failed", "exit": exit_code, "enabled": True}
+
+
+@pytest.mark.parametrize("stdout", ["not json", "[]", '{"enabled": "no"}', '{"enabled": 1}', ""])
+@pytest.mark.parametrize("exit_code", [2, 12])
+def test_a_failed_check_with_a_hostile_or_unreadable_body_is_enabled_null(
+    rig: Rig, exit_code: int, stdout: str
+) -> None:
+    n = rig.notifier(exit=exit_code, stdout=stdout)
+    rig.configure({"d": {"notifier": n}})
+    code, doc = probe(rig)
+    assert code == 12
     assert only(doc)["probe"] == {"status": "failed", "exit": exit_code, "enabled": None}
+
+
+def test_a_failed_check_with_enabled_false_reports_false(rig: Rig) -> None:
+    n = rig.notifier(exit=2, stdout='{"ok": false, "enabled": false, "checks": []}')
+    rig.configure({"d": {"notifier": n}})
+    code, doc = probe(rig)
+    assert code == 12 and only(doc)["probe"] == {"status": "failed", "exit": 2, "enabled": False}
 
 
 def test_a_failed_check_envelope_is_failed_and_its_text_is_not_echoed(rig: Rig) -> None:
@@ -344,7 +391,7 @@ def test_a_held_lock_of_another_destination_does_not_block_a_probe(rig: Rig) -> 
 
 
 def test_wsl_destinations_probe_one_after_the_other_under_the_shared_lock(rig: Rig) -> None:
-    n = rig.notifier("wsl-notice", sleep=0.2)
+    n = rig.notifier("wsl-notice", tool="ha-notice", sleep=0.2)
     rig.configure(
         {"a": {"notifier": n, "kind": "wsl-notice"}, "b": {"notifier": n, "kind": "wsl-notice"}},
         lock_wait="10s",
@@ -356,7 +403,11 @@ def test_wsl_destinations_probe_one_after_the_other_under_the_shared_lock(rig: R
 
 
 def test_the_shared_wsl_lock_blocks_every_wsl_destination_and_only_those(rig: Rig) -> None:
-    w1, w2, s = rig.notifier("w1"), rig.notifier("w2"), rig.notifier("s")
+    w1, w2, s = (
+        rig.notifier("w1", tool="ha-notice"),
+        rig.notifier("w2", tool="ha-notice"),
+        rig.notifier("s"),
+    )
     rig.configure(
         {
             "a": {"notifier": w1, "kind": "wsl-notice"},
@@ -406,10 +457,21 @@ def test_validate_with_config_but_without_probe_is_unchanged(rig: Rig, tmp_path:
 
 
 def test_probe_is_accepted_only_by_validate_and_abbreviations_are_refused(rig: Rig) -> None:
-    rig.configure({"d": {"notifier": rig.notifier()}})
-    for argv in (("validate", "--prob"), ("flush", "--probe"), ("send", "--probe")):
+    n = rig.notifier()
+    rig.configure({"d": {"notifier": n}})
+    for argv in (("validate", "--prob"), ("flush", "--probe")):
         code, _, _ = rig.run(*argv, "--json")
         assert code == 2
+    # send is given valid input, so the refusal can only come from --probe
+    code, out, _ = rig.run(
+        "send", "--stdin-json", "--probe", "--json", stdin=b'{"message": "hello"}'
+    )
+    doc = json.loads(out)
+    assert code == 2 and doc["error"]["code"] == "usage"
+    assert doc["error"]["message"] == "the command line cannot be used"
+    assert invokes(n) == []
+    ok, _, _ = rig.run("send", "--stdin-json", "--json", stdin=b'{"message": "hello"}')
+    assert ok == 0
 
 
 def test_text_output_names_the_probe_without_notifier_text(rig: Rig) -> None:
@@ -418,7 +480,7 @@ def test_text_output_names_the_probe_without_notifier_text(rig: Rig) -> None:
     code, out, err = rig.run("validate", "--probe")
     assert code == 0 and CANARY not in out + err
     assert "probe=ok" in out and "exit=0" in out and "enabled=true" in out
-    bad = rig.notifier("bad", exit=12)
+    bad = rig.notifier("bad", exit=12, stdout="not json")
     rig.configure({"d": {"notifier": bad}})
     code, out, _ = rig.run("validate", "--probe")
     assert code == 12 and "probe=failed" in out and "exit=12" in out and "enabled=unknown" in out
@@ -564,3 +626,72 @@ def test_a_wall_clock_step_changes_nothing(rig: Rig) -> None:
     rig.clock.jump_wall(-86400 * 400)
     code, doc = probe(rig)
     assert code == 0 and only(doc)["probe"]["status"] == "ok"
+
+
+def test_an_unsafe_state_directory_is_the_same_error_as_plain_validate(rig: Rig) -> None:
+    n = rig.notifier()
+    rig.configure({"d": {"notifier": n}})
+    rig.state.mkdir(parents=True)
+    rig.state.chmod(0o777)
+    plain_code, plain_out, _ = rig.run("validate", "--json")
+    code, out, err = rig.run(*PROBE)
+    assert (code, json.loads(out)["error"]) == (plain_code, json.loads(plain_out)["error"])
+    assert code == 1 and json.loads(out)["error"]["message"] == "state database cannot be read"
+    assert "Traceback" not in out + err and invokes(n) == []
+
+
+def _signal_inside(monkeypatch: pytest.MonkeyPatch, module: Any, name: str, *, after: bool) -> None:
+    real = getattr(module, name)
+
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if not after:
+            os.kill(os.getpid(), signal.SIGTERM)
+        result = real(*args, **kwargs)
+        if after:
+            os.kill(os.getpid(), signal.SIGTERM)
+        return result
+
+    monkeypatch.setattr(module, name, wrapper)
+
+
+def test_a_signal_during_the_output_after_a_call_ran_still_exits_with_the_report_code(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from notice_route import cli
+
+    n = rig.notifier(exit=12)
+    rig.configure({"d": {"notifier": n}})
+    _signal_inside(monkeypatch, cli, "_json", after=False)
+    code, out, _ = rig.run(*PROBE)
+    assert code == 12  # not 128+N: a call ran
+    assert only(json.loads(out))["probe"]["exit"] == 12
+    assert len(invokes(n)) == 1
+
+
+def test_a_signal_during_the_output_when_no_call_started_exits_128_plus_n_with_no_output(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from notice_route import cli
+
+    rig.configure({"g": {"notifier": rig.notifier(), "kind": "generic"}})
+    _signal_inside(monkeypatch, cli, "_json", after=False)
+    code, out, _ = rig.run(*PROBE)
+    assert (code, out) == (128 + signal.SIGTERM, "")
+
+
+@pytest.mark.parametrize("case", ["no_config", "nothing_to_probe", "all_skipped"])
+def test_a_signal_after_the_config_load_and_before_any_call_exits_128_plus_n(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    from notice_route import cli
+
+    n = rig.notifier()
+    if case == "nothing_to_probe":
+        rig.configure({"g": {"notifier": n, "kind": "generic"}})
+    elif case == "all_skipped":
+        n.stub.chmod(0o777)  # cmd[0] fails the check: never started
+        rig.configure({"d": {"notifier": n}})
+    _signal_inside(monkeypatch, cli, "run_probes", after=False)
+    code, out, _ = rig.run(*PROBE)
+    assert (code, out) == (128 + signal.SIGTERM, "")
+    assert invokes(n) == []
