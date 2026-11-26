@@ -73,7 +73,11 @@ def test_a_live_claim_survives_a_prune_and_a_flush_running_together(rig: Rig) ->
     did, qid = seed(
         rig, now=t - 3 * DAY, created_at=t - 3 * DAY, claim="holder", claim_expires=t + 20
     )
-    procs = [rig.spawn("prune", "--json"), rig.spawn("flush", "--json"), rig.spawn("prune", "--json")]
+    procs = [
+        rig.spawn("prune", "--json"),
+        rig.spawn("flush", "--json"),
+        rig.spawn("prune", "--json"),
+    ]
     for p in procs:
         p.communicate(timeout=120)
     assert [p.returncode for p in procs][0] == 0

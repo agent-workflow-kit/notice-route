@@ -33,7 +33,6 @@ from .history import (
     DESTINATION,
     LABEL,
     LEVELS,
-    MAX_LABELS,
     MAX_LIMIT,
     OUTCOMES,
     SOURCE,
@@ -538,11 +537,14 @@ def _history_line(row: dict[str, Any]) -> str:
 
     reason = "" if row["reason"] is None else f"/{row['reason']}"
     title = "" if row["title"] is None else ' "' + _safe(row["title"]).replace('"', '\\"') + '"'
-    return _safe(
-        f"{row['id']} {row['ts']} {row['outcome']}{reason} {row['source']}"
-        f" {show(row['destination'])} {show(row['level'])} rule={show(row['rule'])}"
-        f" attempts={row['attempts']} count={row['count']}"
-    ) + title
+    return (
+        _safe(
+            f"{row['id']} {row['ts']} {row['outcome']}{reason} {row['source']}"
+            f" {show(row['destination'])} {show(row['level'])} rule={show(row['rule'])}"
+            f" attempts={row['attempts']} count={row['count']}"
+        )
+        + title
+    )
 
 
 def _run_history(args: argparse.Namespace, gateway: Gateway) -> int:

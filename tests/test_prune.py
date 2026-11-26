@@ -9,7 +9,8 @@ from typing import Any
 
 import pytest
 
-from notice_route import cli, prune as prune_mod
+from notice_route import cli
+from notice_route import prune as prune_mod
 from notice_route.send import Seams, SurfaceEvent
 from tests.flush_support import checked_log, seed
 from tests.prune_support import (
@@ -196,15 +197,17 @@ def test_queue_expiry_boundary_and_what_the_delivery_becomes(rig: Rig) -> None:
     code, doc, _ = prune(rig)
     assert (code, doc["deleted"]) == (0, deleted(queue=1))
     assert [r[0] for r in rig.query("SELECT delivery_id FROM queue")] == [young]
-    assert rig.query("SELECT outcome, code, reason, deliver_after FROM deliveries WHERE id = ?", (did,)) == [
-        ("expired", "expired", "quiet", None)
-    ]
+    assert rig.query(
+        "SELECT outcome, code, reason, deliver_after FROM deliveries WHERE id = ?", (did,)
+    ) == [("expired", "expired", "quiet", None)]
     assert rig.query("SELECT COUNT(*) FROM dedup") == [(0,)]  # released with the delivery
 
 
 def test_a_live_claim_survives_however_old_the_row_is(rig: Rig) -> None:
     configure(rig)
-    _, live = seed(rig, now=NOW - 9 * DAY, created_at=NOW - 9 * DAY, claim="t", claim_expires=NOW + 1)
+    _, live = seed(
+        rig, now=NOW - 9 * DAY, created_at=NOW - 9 * DAY, claim="t", claim_expires=NOW + 1
+    )
     _, lapsed = seed(rig, now=NOW - 9 * DAY, created_at=NOW - 9 * DAY, claim="t", claim_expires=NOW)
     code, doc, _ = prune(rig)
     assert (code, doc["deleted"]) == (0, deleted(queue=1))
@@ -278,14 +281,16 @@ def test_expired_rows_are_logged_and_surfaced_only_for_a_configured_enabled_dest
     real = prune_mod.run_prune
     seams = Seams(surface=lambda conn, event: events.append(event))
     monkeypatch.setattr(cli, "run_prune", lambda *a, **k: real(*a, **{**k, "seams": seams}))
-    chat, _ = seed(rig, "chat", now=NOW - 2 * DAY, created_at=NOW - 2 * DAY, source="alpha", level="warn")
+    chat, _ = seed(
+        rig, "chat", now=NOW - 2 * DAY, created_at=NOW - 2 * DAY, source="alpha", level="warn"
+    )
     seed(rig, "off", now=NOW - 2 * DAY, created_at=NOW - 2 * DAY)
     seed(rig, "gone", now=NOW - 2 * DAY, created_at=NOW - 2 * DAY)
     code, doc, _ = prune(rig)
     assert (code, doc["deleted"]["queue"]) == (0, 3)
-    assert [(e.delivery_id, e.destination, e.kind, e.source, e.level, e.outcome, e.code) for e in events] == [
-        (chat, "chat", "slack-notice", "alpha", "warn", "expired", "expired")
-    ]
+    assert [
+        (e.delivery_id, e.destination, e.kind, e.source, e.level, e.outcome, e.code) for e in events
+    ] == [(chat, "chat", "slack-notice", "alpha", "warn", "expired", "expired")]
     lines = checked_log(rig)
     assert sorted(x["destination"] for x in lines) == ["chat", "gone", "off"]
     assert {x["outcome"] for x in lines} == {"expired"}
@@ -325,11 +330,15 @@ def populate(rig: Rig) -> None:
 def test_dry_run_counts_exactly_what_the_real_run_deletes_and_writes_nothing(rig: Rig) -> None:
     populate(rig)
     before_counts = counts(rig)
-    before_files = {p.name: p.read_bytes() for p in rig.state.glob("state.db*") if p.suffix != ".shm"}
+    before_files = {
+        p.name: p.read_bytes() for p in rig.state.glob("state.db*") if p.suffix != ".shm"
+    }
     code, dry, _ = prune(rig, "--dry-run")
     assert code == 0 and dry["dry_run"] is True
     assert counts(rig) == before_counts
-    after_files = {p.name: p.read_bytes() for p in rig.state.glob("state.db*") if p.suffix != ".shm"}
+    after_files = {
+        p.name: p.read_bytes() for p in rig.state.glob("state.db*") if p.suffix != ".shm"
+    }
     assert after_files == before_files
     assert rig.log_lines() == []
     code, real, _ = prune(rig)

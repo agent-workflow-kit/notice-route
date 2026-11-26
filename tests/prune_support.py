@@ -46,7 +46,9 @@ def add_delivery(
     names = ", ".join(values)
     marks = ", ".join("?" for _ in values)
     with open_store(rig.gateway()) as store, store.write() as conn:
-        cur = conn.execute(f"INSERT INTO deliveries ({names}) VALUES ({marks})", tuple(values.values()))
+        cur = conn.execute(
+            f"INSERT INTO deliveries ({names}) VALUES ({marks})", tuple(values.values())
+        )
         assert cur.lastrowid is not None
         return cur.lastrowid
 
@@ -78,7 +80,9 @@ def add_many_event_ids(rig: Rig, count: int, seen_at: int) -> None:
         )
 
 
-def add_window(rig: Rig, start: int, length: int, key: str = "a", delivery_id: int | None = None) -> None:
+def add_window(
+    rig: Rig, start: int, length: int, key: str = "a", delivery_id: int | None = None
+) -> None:
     digest = (key * 64)[:64]
     with open_store(rig.gateway()) as store, store.write() as conn:
         conn.execute(
@@ -89,7 +93,12 @@ def add_window(rig: Rig, start: int, length: int, key: str = "a", delivery_id: i
 
 
 def add_surfaced(
-    rig: Rig, period: str, *, processed: int = 1, code: str = "failed", delivery_id: int | None = None
+    rig: Rig,
+    period: str,
+    *,
+    processed: int = 1,
+    code: str = "failed",
+    delivery_id: int | None = None,
 ) -> None:
     with open_store(rig.gateway()) as store, store.write() as conn:
         conn.execute(
@@ -99,7 +108,9 @@ def add_surfaced(
         )
 
 
-def add_rate(rig: Rig, hour: int, *, destination: str = "chat", cls: str = "other", n: int = 3) -> None:
+def add_rate(
+    rig: Rig, hour: int, *, destination: str = "chat", cls: str = "other", n: int = 3
+) -> None:
     with open_store(rig.gateway()) as store, store.write() as conn:
         conn.execute(
             "INSERT INTO rate (destination, hour, class, count) VALUES (?, ?, ?, ?)",
@@ -111,7 +122,9 @@ def counts(rig: Rig) -> dict[str, int]:
     return {name: rig.query(sql)[0][0] for name, sql in _COUNT_SQL.items()}
 
 
-def prune(rig: Rig, *extra: str, env: dict[str, str] | None = None) -> tuple[int, dict[str, Any], str]:
+def prune(
+    rig: Rig, *extra: str, env: dict[str, str] | None = None
+) -> tuple[int, dict[str, Any], str]:
     """``prune --json``; the document is validated against its schema."""
     code, out, err = rig.run("prune", "--json", *extra, env=env)
     assert out.endswith("\n") and out.count("\n") == 1, out

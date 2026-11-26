@@ -41,7 +41,7 @@ from typing import Any
 
 from . import dedup
 from . import log as logmod
-from .decide import HOUR, instant
+from .decide import instant
 from .gateway import Gateway, UnsafePathError
 from .queue import EXPIRY_S, Expired, Lease, count_expirable, expire_unclaimed
 from .report import worst_case_s
@@ -103,7 +103,9 @@ _RATE_OLD = "hour + 3600 < ?"
 def _count_surfaced(conn: _Conn, day: str | None) -> int:
     if day is None:
         return 0
-    return int(conn.execute("SELECT COUNT(*) FROM surfaced WHERE " + _SURFACED_OLD, (day,)).fetchone()[0])
+    return int(
+        conn.execute("SELECT COUNT(*) FROM surfaced WHERE " + _SURFACED_OLD, (day,)).fetchone()[0]
+    )
 
 
 def _prune_surfaced(conn: _Conn, day: str | None, batch: int) -> int:
@@ -117,7 +119,9 @@ def _prune_surfaced(conn: _Conn, day: str | None, batch: int) -> int:
 
 
 def _count_rate(conn: _Conn, cutoff: int) -> int:
-    return int(conn.execute("SELECT COUNT(*) FROM rate WHERE " + _RATE_OLD, (cutoff,)).fetchone()[0])
+    return int(
+        conn.execute("SELECT COUNT(*) FROM rate WHERE " + _RATE_OLD, (cutoff,)).fetchone()[0]
+    )
 
 
 def _prune_rate(conn: _Conn, cutoff: int, batch: int) -> int:
@@ -203,7 +207,9 @@ def _run(
     surfaced_day = _day(now, SURFACED_KEEP_S)
     with open_store(gateway) as store:
         out["event_ids"] = _loop(
-            gateway, store, lambda c: dedup.prune_event_ids(c, now=now, retention=event_ids_s, batch=BATCH)
+            gateway,
+            store,
+            lambda c: dedup.prune_event_ids(c, now=now, retention=event_ids_s, batch=BATCH),
         )
         out["dedup"] = _loop(gateway, store, lambda c: dedup.prune_windows(c, now=now, batch=BATCH))
         out["surfaced"] = _loop(gateway, store, lambda c: _prune_surfaced(c, surfaced_day, BATCH))

@@ -148,7 +148,8 @@ def test_limit_default_is_100_and_the_cap_is_1000(rig: Rig) -> None:
 
 
 @pytest.mark.parametrize(
-    "value", ["0", "1001", "-1", "+5", "05", " 5", "5 ", "1e2", "5.0", "", "x", "٣", "99999", "0x10"]
+    "value",
+    ["0", "1001", "-1", "+5", "05", " 5", "5 ", "1e2", "5.0", "", "x", "٣", "99999", "0x10"],
 )
 def test_a_limit_outside_1_to_1000_is_exit_2(rig: Rig, value: str) -> None:
     dataset(rig)
@@ -171,8 +172,20 @@ CASES: dict[str, list[str]] = {
     "limit": ["--limit", "3"],
     "combined": ["--source", "alpha", "--level", "info", "--since", "4d", "--label", "repo=a"],
     "combined_all": [
-        "--since", "3d", "--source", "alpha", "--destination", "chat", "--level", "info",
-        "--outcome", "sent", "--label", "repo=a", "--limit", "5",
+        "--since",
+        "3d",
+        "--source",
+        "alpha",
+        "--destination",
+        "chat",
+        "--level",
+        "info",
+        "--outcome",
+        "sent",
+        "--label",
+        "repo=a",
+        "--limit",
+        "5",
     ],  # fmt: skip
     "none": ["--source", "nobody"],
 }
@@ -405,7 +418,10 @@ def test_rows_written_by_send_validate_against_the_schema(rig: Rig) -> None:
     sent = [r for r in doc if r["outcome"] == "sent"]
     assert len(sent) == 1 and sent[0]["labels"] == ["repo=a"] and sent[0]["rule"] == "pt"
     assert history(rig, "--label", "repo=a")[1] == sent
-    assert [r["reason"] for r in history(rig, "--outcome", "dropped")[1]] == ["no_rule", "rule_drop"]
+    assert [r["reason"] for r in history(rig, "--outcome", "dropped")[1]] == [
+        "no_rule",
+        "rule_drop",
+    ]
 
 
 # --- hostile rows ----------------------------------------------------------------------------
@@ -455,7 +471,7 @@ def test_a_row_with_a_column_outside_its_grammar_is_left_out_with_one_warning(ri
     add_delivery(rig, NOW - 9, count=0)
     add_delivery(rig, NOW - 10, dedupe="xyz")
     add_delivery(rig, NOW - 11, labels='["bad label"]')
-    add_delivery(rig, NOW - 12, labels='[1]')
+    add_delivery(rig, NOW - 12, labels="[1]")
     add_delivery(rig, NOW - 13, labels=json_labels(17))
     add_delivery(rig, NOW - 14, event_id="[1]")
     add_delivery(rig, NOW - 15, event_id="not json")
@@ -488,7 +504,9 @@ def test_the_text_form_shows_one_line_per_row(rig: Rig) -> None:
     code, out, err = rig.run("history", "--limit", "3")
     assert (code, err) == (0, "")
     assert out.splitlines() == [
-        '8 2023-11-14T22:13:10.000Z sent alpha chat info rule=- attempts=0 count=3 "' + "t" * 100 + '"',
+        '8 2023-11-14T22:13:10.000Z sent alpha chat info rule=- attempts=0 count=3 "'
+        + "t" * 100
+        + '"',
         "7 2023-11-14T22:11:40.000Z sending gamma chat warn rule=- attempts=0 count=1",
         "6 2023-11-14T22:11:40.000Z expired gamma chat warn rule=- attempts=0 count=1",
     ]

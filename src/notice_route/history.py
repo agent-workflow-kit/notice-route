@@ -153,7 +153,13 @@ def _query(f: HistoryFilters) -> tuple[str, tuple[object, ...]]:
         clauses.append(_LABEL_CLAUSE)
         params.append(label)
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
-    sql = "SELECT " + _COLUMNS + " FROM deliveries d" + where + " ORDER BY d.ts DESC, d.id DESC LIMIT ?"
+    sql = (
+        "SELECT "
+        + _COLUMNS
+        + " FROM deliveries d"
+        + where
+        + " ORDER BY d.ts DESC, d.id DESC LIMIT ?"
+    )
     params.append(f.limit)
     return sql, tuple(params)
 
@@ -325,4 +331,3 @@ def _labels(value: object) -> list[str] | None:
             return None
         out.append(item)
     return out
-
