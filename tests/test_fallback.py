@@ -540,3 +540,30 @@ def test_a_fallback_row_never_reaches_a_destination_twice_in_a_chain(rig: Rig) -
     for _ in range(3):
         flush(rig)
     assert len(a.events("invoke")) == 1 and len(b.events("invoke")) == 1
+
+
+def test_a_sibling_that_already_failed_the_same_notification_is_not_asked_again(rig: Rig) -> None:
+    """Both destinations of a rule fail; whichever records its failure first, the other's
+    fallback must not ask it a second time (a failure released its repeat window)."""
+    from notice_route.fallback import _asked_directly  # pyright: ignore[reportPrivateUsage]
+
+    def delivery(conn: sqlite3.Connection, destination: str, *, ts: int, digest: str) -> int:
+        return insert_delivery(
+            conn,
+            ts=ts,
+            source="s",
+            level="info",
+            outcome="failed",
+            destination=destination,
+            dedupe=digest * 32,
+        )
+
+    with open_store(rig.gateway()) as store, store.write() as conn:
+        a = delivery(conn, "a", ts=NOW, digest="ab")
+        delivery(conn, "b", ts=NOW, digest="ab")
+        c = delivery(conn, "a", ts=NOW + 1, digest="ab")  # another decision, same text
+        d = delivery(conn, "a", ts=NOW, digest="cd")  # same time, other text
+        assert _asked_directly(conn, a, "b") is True
+        assert _asked_directly(conn, a, "c") is False
+        assert _asked_directly(conn, c, "b") is False
+        assert _asked_directly(conn, d, "b") is False

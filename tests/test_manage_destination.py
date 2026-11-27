@@ -390,7 +390,8 @@ def test_disable_migrates_an_older_database_and_keeps_its_rows(rig: Rig) -> None
     assert code == 0
     assert rig.query("PRAGMA user_version") == [(SCHEMA_VERSION,)]
     after = rig.query("SELECT * FROM queue") + [
-        r[:-1] for r in rig.query("SELECT * FROM deliveries")  # migration 4 added fallback_of
+        r[:-1]
+        for r in rig.query("SELECT * FROM deliveries")  # migration 4 added fallback_of
     ]
     assert after == rows_before
     assert rig.query("PRAGMA integrity_check") == [("ok",)]

@@ -15,7 +15,8 @@ Run-time loop guard (the config is validated acyclic, but it can change between 
 chain of ``fallback_of`` ids of the failed row is read (at most :data:`MAX_FALLBACK_HOPS` steps).
 No further delivery is made when the chain already has that many hops, when the fallback
 destination is on it, or when a row of it is missing (the narrower reading: unknown history means
-no more delivery).
+no more delivery). A fallback destination that the same decision already asked to deliver the
+notification (a sibling destination of the rule) is not asked again, whatever became of it.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from .decide import Kind, Notice, decide_fallback
 from .gateway import Gateway
 from .outcome import FallbackRoute
 from .queue import Lease, QueueRow
-from .validate import LEVELS, MAX_FALLBACK_HOPS, Config, Destination
+from .validate import LEVELS, MAX_FALLBACK_HOPS, MAX_NOTIFY, Config, Destination
 
 __all__ = ["FallbackSeam", "chain_allows", "make_seam", "route_failed"]
 
@@ -62,6 +63,21 @@ def chain_allows(conn: sqlite3.Connection, delivery_id: int, target: str) -> boo
     else:
         return False  # more parents than a chain may have
     return len(seen) - 1 < MAX_FALLBACK_HOPS and target not in seen
+
+
+def _asked_directly(conn: sqlite3.Connection, delivery_id: int, target: str) -> bool:
+    """Whether ``target`` was itself asked to deliver this notification in the decision that made
+    the failed row (a sibling destination of the same rule: the same digest and decision time,
+    and an id within :data:`MAX_NOTIFY` of the failed row's, since one decision writes its rows
+    in one transaction). Whatever became of that delivery, a fallback would ask it twice."""
+    found = conn.execute(
+        "SELECT 1 FROM deliveries x JOIN deliveries f ON f.id = ?"
+        " WHERE x.id BETWEEN ? AND ? AND x.id <> f.id AND x.destination = ?"
+        " AND x.dedupe = f.dedupe AND x.ts = f.ts AND x.fallback_of IS NULL"
+        " AND f.fallback_of IS NULL LIMIT 1",
+        (delivery_id, delivery_id - MAX_NOTIFY, delivery_id + MAX_NOTIFY, target),
+    ).fetchone()
+    return found is not None
 
 
 def _labels(text: object) -> tuple[tuple[str, str], ...]:
@@ -139,6 +155,8 @@ def route_failed(
     if target is None or target not in config.destinations:
         return None
     if not chain_allows(conn, row.delivery_id, target):
+        return None
+    if _asked_directly(conn, row.delivery_id, target):
         return None
     notice = _notice(conn, config, row)
     if notice is None:
