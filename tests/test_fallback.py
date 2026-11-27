@@ -567,3 +567,54 @@ def test_a_sibling_that_already_failed_the_same_notification_is_not_asked_again(
         assert _asked_directly(conn, a, "c") is False
         assert _asked_directly(conn, c, "b") is False
         assert _asked_directly(conn, d, "b") is False
+
+
+def test_a_later_hop_does_not_ask_a_destination_the_same_decision_already_asked(rig: Rig) -> None:
+    """a falls back to b and b to c; the rule notifies a and c, so c is asked directly and must
+    not be asked again by b's failure."""
+    a, b, c = (rig.notifier(n, **BAD) for n in "abc")
+    rig.configure(
+        {
+            "a": {"notifier": a, "fallback": "b"},
+            "b": {"notifier": b, "fallback": "c"},
+            "c": {"notifier": c},
+        },
+        [{"name": "r", "match": {"level_min": "info"}, "notify": ["a", "c"]}],
+    )
+    rig.send("hello")
+    for _ in range(4):
+        flush(rig)
+    assert [len(n.events("invoke")) for n in (a, b, c)] == [1, 1, 1]
+
+
+def test_a_stored_row_that_cannot_be_read_back_is_a_fault_and_is_not_called_again(
+    rig: Rig,
+) -> None:
+    bad, good = pair(rig)
+    seed(rig, "a")
+    conn = sqlite3.connect(rig.state / "state.db")
+    conn.execute("UPDATE deliveries SET event_id = ? WHERE id = 1", ("[" * 200000,))
+    conn.commit()
+    conn.close()
+    code, _, err = flush(rig)
+    assert code == 12 and err.count("a fallback could not be routed") == 1
+    assert rows(rig)[0][2] == "failed" and fallback_rows(rig) == []
+    flush(rig)
+    assert len(bad.events("invoke")) == 1 and good.events("invoke") == []
+
+
+def test_two_failed_fallbacks_of_one_send_give_one_warning(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    a, c, x = rig.notifier("a", **BAD), rig.notifier("c", **BAD), rig.notifier("x")
+    rig.configure(
+        {
+            "a": {"notifier": a, "fallback": "x"},
+            "c": {"notifier": c, "fallback": "x"},
+            "x": {"notifier": x},
+        },
+        [{"name": "r", "match": {"level_min": "info"}, "notify": ["a", "c"]}],
+    )
+    boom_after_insert(monkeypatch)
+    _, _, err = rig.send("hello")
+    assert err.count("a fallback could not be routed") == 1

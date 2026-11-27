@@ -48,7 +48,7 @@ def hook_log(rig: Rig) -> list[tuple[str, str]]:
 
 
 def test_the_outbox_is_migration_three_and_a_required_table() -> None:
-    assert SCHEMA_VERSION == len(MIGRATIONS) >= 3
+    assert SCHEMA_VERSION == len(MIGRATIONS) == 4
     assert "hook_outbox" in TABLES
 
 

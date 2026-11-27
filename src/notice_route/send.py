@@ -739,7 +739,8 @@ def _log_fallback(ctx: _Context, result: SendResult, route: FallbackRoute) -> No
     """The log line of a fallback decision, for the fallback destination (the ``--json`` document
     lists only the rule's destinations). A suppressed fallback writes nothing."""
     if route.decision == "fault":
-        result.warnings.append("a fallback could not be routed")
+        if "a fallback could not be routed" not in result.warnings:
+            result.warnings.append("a fallback could not be routed")
     elif route.outcome is not None and route.decision != "suppress":
         code = "overflow" if route.reason == "overflow" else None
         ctx.log(_entry(route.destination, route.outcome, reason=route.reason, code=code))

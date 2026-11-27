@@ -67,9 +67,19 @@ def chain_allows(conn: sqlite3.Connection, delivery_id: int, target: str) -> boo
 
 def _asked_directly(conn: sqlite3.Connection, delivery_id: int, target: str) -> bool:
     """Whether ``target`` was itself asked to deliver this notification in the decision that made
-    the failed row (a sibling destination of the same rule: the same digest and decision time,
-    and an id within :data:`MAX_NOTIFY` of the failed row's, since one decision writes its rows
-    in one transaction). Whatever became of that delivery, a fallback would ask it twice."""
+    the chain of the failed row. The check runs from the root of the chain, so every hop is
+    guarded: a sibling destination of the same rule has the same digest and decision time and an
+    id within :data:`MAX_NOTIFY` of the root's, since one decision writes its rows in one
+    transaction. Whatever became of that delivery, a fallback would ask it twice."""
+    for _ in range(MAX_FALLBACK_HOPS + 1):  # up to the root of the chain (chain_allows bounded it)
+        parent = conn.execute(
+            "SELECT fallback_of FROM deliveries WHERE id = ?", (delivery_id,)
+        ).fetchone()
+        if parent is None or parent[0] is None:
+            break
+        if type(parent[0]) is not int:
+            return True
+        delivery_id = parent[0]
     found = conn.execute(
         "SELECT 1 FROM deliveries x JOIN deliveries f ON f.id = ?"
         " WHERE x.id BETWEEN ? AND ? AND x.id <> f.id AND x.destination = ?"
@@ -154,16 +164,19 @@ def route_failed(
     target = dest.fallback
     if target is None or target not in config.destinations:
         return None
-    if not chain_allows(conn, row.delivery_id, target):
-        return None
-    if _asked_directly(conn, row.delivery_id, target):
-        return None
-    notice = _notice(conn, config, row)
-    if notice is None:
-        return None
-    kind: Kind = "held" if row.kind == "held" else "single"
     conn.execute("SAVEPOINT fallback")
     try:
+        if not chain_allows(conn, row.delivery_id, target):
+            conn.execute("RELEASE fallback")
+            return None
+        if _asked_directly(conn, row.delivery_id, target):
+            conn.execute("RELEASE fallback")
+            return None
+        notice = _notice(conn, config, row)
+        if notice is None:
+            conn.execute("RELEASE fallback")
+            return None
+        kind: Kind = "held" if row.kind == "held" else "single"
         d = decide_fallback(
             conn, gateway, config, notice, target, lease, kind=kind, fallback_of=row.delivery_id
         )
