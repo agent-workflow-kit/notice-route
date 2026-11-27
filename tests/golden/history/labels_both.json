@@ -21,6 +21,7 @@
     ],
     "surfaced": false,
     "deliver_after": null,
-    "title": "Build ok"
+    "title": "Build ok",
+    "fallback_of": null
   }
 ]

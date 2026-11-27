@@ -18,7 +18,8 @@
     "labels": [],
     "surfaced": false,
     "deliver_after": null,
-    "title": null
+    "title": null,
+    "fallback_of": null
   },
   {
     "id": 6,
@@ -39,7 +40,8 @@
     "labels": [],
     "surfaced": false,
     "deliver_after": null,
-    "title": null
+    "title": null,
+    "fallback_of": null
   },
   {
     "id": 2,
@@ -62,6 +64,7 @@
     ],
     "surfaced": false,
     "deliver_after": 1699913600,
-    "title": null
+    "title": null,
+    "fallback_of": null
   }
 ]

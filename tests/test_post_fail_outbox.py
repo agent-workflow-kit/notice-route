@@ -48,7 +48,7 @@ def hook_log(rig: Rig) -> list[tuple[str, str]]:
 
 
 def test_the_outbox_is_migration_three_and_a_required_table() -> None:
-    assert SCHEMA_VERSION == len(MIGRATIONS) == 3
+    assert SCHEMA_VERSION == len(MIGRATIONS) == 4
     assert "hook_outbox" in TABLES
 
 
@@ -60,6 +60,7 @@ def test_a_version_two_database_is_migrated_by_a_flush_and_keeps_its_rows(
     s.fail("boom")
     s.flush()
     write(rig, "DROP TABLE hook_outbox")
+    write(rig, "ALTER TABLE deliveries DROP COLUMN fallback_of")
     write(rig, "PRAGMA user_version=2")
     code, doc, err = s.flush()
     assert code == 22, (doc, err)
@@ -705,6 +706,7 @@ def test_a_read_only_command_refuses_a_version_two_database_until_a_writer_migra
     s.fail("boom")
     s.flush()
     write(rig, "DROP TABLE hook_outbox")
+    write(rig, "ALTER TABLE deliveries DROP COLUMN fallback_of")
     write(rig, "PRAGMA user_version=2")
     code, _, _ = rig.run("history", "--json")
     assert code == 1

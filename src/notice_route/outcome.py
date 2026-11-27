@@ -235,6 +235,21 @@ def _classify_envelope(rc: int, env: _Envelope | None, kind: str, has_dedupe_key
 
 
 @dataclass(frozen=True)
+class FallbackRoute:
+    """What the fallback seam did for a delivery that ended ``failed`` (docs/design.md C-63):
+    ``destination`` is the fallback destination and ``decision`` the decision of its step
+    (``defer``, ``drop``, ``disabled``, ``suppress``, or ``fault`` when the seam failed and was
+    rolled back: the failure is recorded without a fallback). ``outcome`` and ``reason`` are the
+    ``deliveries`` ones; ``delivery_id`` is the new row (``None`` for ``suppress``, ``fault``)."""
+
+    destination: str
+    decision: str
+    outcome: str | None
+    reason: str | None
+    delivery_id: int | None
+
+
+@dataclass(frozen=True)
 class Applied:
     """What :func:`apply_outcome` did. ``applied`` is false when the recorder no longer holds
     the claim (nothing changed: log only) or the outcome was an internal fault (nothing to
@@ -251,6 +266,7 @@ class Applied:
     released: bool = False
     evicted: tuple[Evicted, ...] = ()
     internal: bool = False
+    fallback: FallbackRoute | None = None
 
 
 _NOT_APPLIED = Applied(False, None, None, None, None, 0, None)

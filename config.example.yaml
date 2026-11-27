@@ -42,6 +42,10 @@ destinations:
       - HA_TOKEN
     # enabled (default true): false skips the destination with outcome disabled.
     enabled: true
+    # fallback (default none): the name of another destination that receives a notification when
+    # a delivery here ends failed (not unknown, and not while it is only being retried). It may
+    # not be this destination or part of a cycle, and a chain has at most 3 hops. Uncomment to try:
+    # fallback: team-chat
 
   team-chat:
     kind: slack-notice

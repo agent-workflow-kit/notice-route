@@ -20,7 +20,8 @@
     ],
     "surfaced": false,
     "deliver_after": null,
-    "title": "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt"
+    "title": "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt",
+    "fallback_of": null
   },
   {
     "id": 1,
@@ -44,6 +45,7 @@
     ],
     "surfaced": false,
     "deliver_after": null,
-    "title": "Build ok"
+    "title": "Build ok",
+    "fallback_of": null
   }
 ]

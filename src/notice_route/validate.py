@@ -65,6 +65,7 @@ KINDS: tuple[Kind, ...] = ("slack-notice", "ha-notice", "wsl-notice", "generic")
 DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 MAX_DESTINATIONS = 32
+MAX_FALLBACK_HOPS = 3  # a chain has at most 4 destinations (docs/design.md C-63)
 MAX_RULES = 256
 MAX_NOTIFY = 8
 MAX_INCLUDE_TEXT = 16
@@ -128,6 +129,7 @@ class Destination:
     max_per_hour: int
     env: tuple[str, ...]
     enabled: bool
+    fallback: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -335,7 +337,7 @@ def _literal_url(value: Any, path: Path, high: int = MAX_LINK) -> str:
 # --- destinations and quiet hours ------------------------------------------------------------
 
 _DESTINATION_KEYS = frozenset(
-    {"kind", "cmd", "timeout", "floor", "quiet", "max_per_hour", "env", "enabled"}
+    {"kind", "cmd", "timeout", "floor", "quiet", "max_per_hour", "env", "enabled", "fallback"}
 )
 _WINDOW_KEYS = frozenset({"timezone", "days", "start", "end"})
 
@@ -377,8 +379,11 @@ def _destination(name: Any, body: Any, windows: dict[str, QuietWindow]) -> Desti
         raise _bad(env_path)
 
     enabled = _boolean(node.get("enabled", True), (*path, "enabled"))
+    fallback: str | None = None
+    if "fallback" in node:  # resolved against the other destinations in _destinations
+        fallback = _pattern(node["fallback"], (*path, "fallback"), _DESTINATION_NAME)
     return Destination(
-        name, cast(Kind, kind), cmd, timeout, floor, quiet, max_per_hour, env, enabled
+        name, cast(Kind, kind), cmd, timeout, floor, quiet, max_per_hour, env, enabled, fallback
     )
 
 
@@ -386,7 +391,28 @@ def _destinations(value: Any, windows: dict[str, QuietWindow]) -> dict[str, Dest
     node = _mapping(value, ("destinations",))
     if len(node) > MAX_DESTINATIONS:
         raise _bad(("destinations",))
-    return {name: _destination(name, body, windows) for name, body in node.items()}
+    built = {name: _destination(name, body, windows) for name, body in node.items()}
+    _check_fallbacks(built)
+    return built
+
+
+def _check_fallbacks(built: dict[str, Destination]) -> None:
+    """A fallback names another defined destination, and the chains it makes have no cycle and at
+    most :data:`MAX_FALLBACK_HOPS` hops. The key is the first destination, in config order, whose
+    chain is wrong."""
+    for name, dest in built.items():
+        if dest.fallback is not None and (dest.fallback == name or dest.fallback not in built):
+            raise _bad(("destinations", _entry(name), "fallback"))
+    for name, dest in built.items():
+        seen = [name]
+        current = dest
+        while current.fallback is not None:
+            if current.fallback in seen:  # a cycle (a self reference was refused above)
+                raise _bad(("destinations", _entry(name), "fallback"))
+            seen.append(current.fallback)
+            current = built[current.fallback]
+        if len(seen) - 1 > MAX_FALLBACK_HOPS:
+            raise _bad(("destinations", _entry(name), "fallback"))
 
 
 def _clock(value: Any, path: Path) -> int:

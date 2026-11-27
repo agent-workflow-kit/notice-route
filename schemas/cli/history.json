@@ -157,6 +157,18 @@
         "maxLength": 100,
         "x-untrusted": true,
         "description": "Untrusted. The rendered title of a templated rule cut to 100 characters; null for a pass-through row."
+      },
+      "fallback_of": {
+        "oneOf": [
+          {
+            "type": "integer",
+            "minimum": 1
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "The id of the failed row that this row, a fallback delivery, replaces (docs/interface.md, Fallback chain); null for every other row."
       }
     },
     "additionalProperties": false,
@@ -179,7 +191,8 @@
       "labels",
       "surfaced",
       "deliver_after",
-      "title"
+      "title",
+      "fallback_of"
     ],
     "description": "One history row. Holds the rendered title of a templated rule (cut to 100 characters) and never message text.",
     "allOf": [

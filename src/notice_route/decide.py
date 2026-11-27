@@ -61,7 +61,7 @@ import json
 import math
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from . import dedup
@@ -84,6 +84,7 @@ __all__ = [
     "count_call",
     "decide_alert",
     "decide_and_record",
+    "decide_fallback",
     "env_unset",
     "give_back",
     "hour_start",
@@ -447,6 +448,46 @@ def decide_alert(
     return _decide_all(conn, gateway, config, notice, destinations, lease, {}, True)
 
 
+def decide_fallback(
+    conn: _Conn,
+    gateway: Gateway,
+    config: Config,
+    notice: Notice,
+    destination: str,
+    lease: Lease,
+    *,
+    kind: Kind,
+    fallback_of: int,
+) -> DestinationDecision:
+    """The decision of a fallback delivery for ``destination`` (docs/design.md C-63), inside the
+    caller's ``Store.write`` transaction: steps 1 to 6 as for a failure alert, then an unclaimed
+    row due now, of the failed row's ``kind`` (``held`` stays ``held``, so failed digest members
+    fold into one digest at the fallback). The new ``deliveries`` row carries ``fallback_of``. A
+    suppressed notification (a redelivery or a repeat the destination already knows) writes
+    nothing."""
+    retention = math.ceil(config.retention_event_ids)
+    plan = _classify(
+        lambda: conn,
+        write=True,
+        config=config,
+        dest=config.destinations[destination],
+        notice=notice,
+        now=lease.now,
+        environ={},
+        retention=retention,
+        alert=True,
+        overridden=bool(disabled_among(conn, (destination,))),
+    )
+    if plan.decision == "suppress":
+        return DestinationDecision(destination, "suppress", "suppressed", plan.reason)
+    if plan.decision == "defer" and plan.reason is None and kind == "held":
+        plan = replace(plan, kind="held")
+    return _record(
+        conn, gateway, plan, config.destinations[destination], notice, lease, retention,
+        fallback_of,
+    )  # fmt: skip
+
+
 def _decide_all(
     conn: _Conn,
     gateway: Gateway,
@@ -501,6 +542,7 @@ def _record(
     notice: Notice,
     lease: Lease,
     retention: int,
+    fallback_of: int | None = None,
 ) -> DestinationDecision:
     now = lease.now
     event_text = dedup.event_id_text(notice.event_id)
@@ -522,6 +564,7 @@ def _record(
         title=None if notice.pass_through else notice.title[:_TITLE_CHARS],
         title_sha256=_sha16(notice.title),
         message_sha256=_sha16(notice.message),
+        fallback_of=fallback_of,
     )
     assert plan.kind is not None or plan.decision in ("disabled", "drop")
     if plan.kind is None:  # disabled or dropped: a row, and no dedup record

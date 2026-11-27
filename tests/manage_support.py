@@ -62,7 +62,20 @@ def make_v1_database(rig: Rig) -> None:
     try:
         conn.execute("DROP TABLE destination_overrides")
         conn.execute("DROP TABLE hook_outbox")
+        conn.execute("ALTER TABLE deliveries DROP COLUMN fallback_of")
         conn.execute("PRAGMA user_version=1")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def make_v3_database(rig: Rig) -> None:
+    """A database as release 0.30 left it: migrations 1 to 3 (no ``fallback_of`` column)."""
+    open_store(rig.gateway()).close()
+    conn = sqlite3.connect(rig.state / "state.db")
+    try:
+        conn.execute("ALTER TABLE deliveries DROP COLUMN fallback_of")
+        conn.execute("PRAGMA user_version=3")
         conn.commit()
     finally:
         conn.close()

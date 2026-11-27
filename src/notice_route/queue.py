@@ -400,6 +400,7 @@ def insert_delivery(
     title: str | None = None,
     title_sha256: str | None = None,
     message_sha256: str | None = None,
+    fallback_of: int | None = None,
     cap: int = DELIVERIES_CAP,
 ) -> int:
     """Insert a ``deliveries`` row and trim the table to ``cap`` in the same transaction, never
@@ -410,8 +411,8 @@ def insert_delivery(
     cur = conn.execute(
         "INSERT INTO deliveries (ts, source, hook, object_id, rule, destination, level, outcome,"
         " reason, code, attempts, count, event_id, dedupe, labels, surfaced, deliver_after,"
-        " title, title_sha256, message_sha256)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " title, title_sha256, message_sha256, fallback_of)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             ts,
             source,
@@ -433,6 +434,7 @@ def insert_delivery(
             title,
             title_sha256,
             message_sha256,
+            fallback_of,
         ),
     )
     new_id = cur.lastrowid

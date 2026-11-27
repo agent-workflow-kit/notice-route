@@ -359,7 +359,7 @@ def test_a_row_holds_every_field_and_a_title_cut_to_100_characters(rig: Rig) -> 
     assert set(row[1]) == {
         "id", "ts", "source", "hook", "object_id", "rule", "destination", "level", "outcome",
         "reason", "code", "attempts", "count", "event_id", "dedupe", "labels", "surfaced",
-        "deliver_after", "title",
+        "deliver_after", "title", "fallback_of",
     }  # fmt: skip
 
 
@@ -560,3 +560,16 @@ def test_history_changes_nothing(rig: Rig) -> None:
     assert rig.log_lines() == []
     write_config(rig.home, {"destinations": {}, "rules": []})  # a broken config does not matter
     assert history(rig)[0] == 0
+
+
+def test_a_fallback_row_shows_the_id_it_replaces_and_a_bad_value_leaves_the_row_out(
+    rig: Rig,
+) -> None:
+    first = add_delivery(rig, NOW - 1, outcome="failed")
+    add_delivery(rig, NOW - 2, fallback_of=first)
+    add_delivery(rig, NOW - 3, fallback_of="x")
+    add_delivery(rig, NOW - 4, fallback_of=0)
+    add_delivery(rig, NOW - 5, fallback_of=-3)
+    code, doc, err = history(rig)
+    assert code == 0 and [(r["id"], r["fallback_of"]) for r in doc] == [(1, None), (2, 1)]
+    assert err == "notice-route: warning: 3 unreadable history rows left out\n"

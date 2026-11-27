@@ -247,6 +247,10 @@
             "type": "boolean",
             "default": true,
             "description": "When false the destination is skipped with outcome disabled."
+          },
+          "fallback": {
+            "$ref": "#/$defs/destination_name",
+            "description": "Name of another destination (the name grammar of a destination) that receives a notification when a delivery to this one ends failed. It must be defined, not this destination and not part of a cycle, and a chain has at most 3 hops; those cross-references are checked by the router, not by this schema. None by default."
           }
         },
         "required": [

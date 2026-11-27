@@ -70,7 +70,7 @@ from .decide import claim_call, count_call, give_back, hour_start, instant
 from .digest import Digest, build, record_digest, record_escaped_digest
 from .gateway import DirHandle, Gateway, SignalTrap
 from .hooks import run_hook, start_detached
-from .outcome import LOCK_BUSY, Applied, Outcome, classify, record_escaped
+from .outcome import LOCK_BUSY, Applied, FallbackRoute, Outcome, classify, record_escaped
 from .overrides import disabled_among
 from .payload import LEVELS, UsageError
 from .queue import (
@@ -89,7 +89,7 @@ from .queue import (
     release_claims,
 )
 from .report import env_unset, worst_case_s
-from .send import Seams, SurfaceEvent, escaped_surface, record_result, with_retry
+from .send import Seams, SurfaceEvent, escaped_surface, record_result, with_fallback, with_retry
 from .sendlock import flush_lock
 from .store import Store, StoreError, open_readonly, open_store
 from .surfacing import ALERT_SOURCE, surface_evictions
@@ -99,6 +99,7 @@ from .window import in_window
 __all__ = ["FlushOptions", "FlushResult", "run_flush"]
 
 _STOPPING = ("sent", "disabled")  # the classified outcomes after which the run goes on
+_FALLBACK_FAULT = "a fallback could not be routed"
 _ROW_FAULT = "a queue row could not be used"  # fixed texts of an exit 1 (never an exception's)
 _ROUTING_FAULT = "a failure alert could not be routed"
 _LOCK_FAULT = "a flush lock cannot be used"
@@ -243,6 +244,31 @@ class _Run:
                 )
             )
 
+    def log_fallback(self, row: QueueRow, route: FallbackRoute | None, t: _Tally) -> None:
+        """The log line of a fallback decision, for the fallback destination (a suppressed one
+        writes nothing; a fault is one fixed warning)."""
+        if route is None:
+            return
+        if route.decision == "fault":
+            if _FALLBACK_FAULT not in t.warnings:
+                t.warnings.append(_FALLBACK_FAULT)
+            return
+        if route.decision == "suppress" or route.outcome is None:
+            return
+        self.log(
+            source=row.source,
+            rule=row.rule,
+            destination=route.destination,
+            level=row.level,
+            outcome=route.outcome,
+            reason=route.reason,
+            code="overflow" if route.reason == "overflow" else None,
+            attempts=0,
+            title_sha256=logmod.sha16(row.title or ""),
+            message_sha256=logmod.sha16(row.message),
+            dedupe_key_sha256=None if row.dedupe is None else row.dedupe[:16],
+        )
+
     def log_row(
         self,
         row: QueueRow,
@@ -301,6 +327,7 @@ def run_flush(
     selected = [d for d in config.destinations.values() if not chosen or d.name in chosen]
     trap.armed = False
     gate = Gate(trap, strict=True)
+    seams = with_fallback(seams, gateway, config)
     run = _Run(gateway, config, opts, trap, gate, seams, worst_case_s(config), started)
     if opts.dry_run:
         tallies = _dry_run(run, selected)
@@ -812,7 +839,7 @@ def _claim(
     """A transaction that claims the next due row of ``kind`` for one call: the hourly count is
     taken (a row whose class is at ``max_per_hour`` is left alone), a fresh token is written
     and, for a row whose attempts are used up, the row ends without a call."""
-    exhausted: list[tuple[QueueRow, int]] = []
+    exhausted: list[tuple[QueueRow, int, FallbackRoute | None]] = []
     claim: _Claim | None = None
     with store.write() as conn:
         lease = Lease.at(run.gateway.wall(), run.worst)
@@ -855,16 +882,17 @@ def _claim(
             )
             retry_at = run.seams.retry_schedule(dest.kind, lease.now)
             if prior >= 1 and retry_at(prior) is None:
-                _exhaust(conn, run, dest, claimed, token, prior, hour, lease.now)
-                exhausted.append((claimed, prior))
+                route = _exhaust(conn, run, dest, claimed, token, prior, hour, lease)
+                exhausted.append((claimed, prior, route))
                 break
             claim = _Claim(claimed, token, hour, prior)
             break
-    for row, prior in exhausted:
+    for row, prior, route in exhausted:
         t.failed += 1
         t.acted = True
         run.say(t, f"row {row.id} failed (retries_exhausted)")
         run.log_row(row, outcome="failed", reason=None, code="retries_exhausted", attempts=prior)
+        run.log_fallback(row, route, t)
         return _Exhausted()
     return claim
 
@@ -877,10 +905,11 @@ def _exhaust(
     token: str,
     prior: int,
     hour: int | None,
-    now: int,
-) -> None:
+    lease: Lease,
+) -> FallbackRoute | None:
     """End a claimed row ``failed``/``retries_exhausted`` without a call; ``hour`` is where its
-    hourly count is given back (``None``: it took none, a digest member)."""
+    hourly count is given back (``None``: it took none, a digest member). Returns what the
+    fallback seam did (docs/design.md C-63), if there is one."""
     complete_row(conn, row.id, token)
     conn.execute(
         "UPDATE deliveries SET outcome = 'failed', code = 'retries_exhausted',"
@@ -901,9 +930,12 @@ def _exhaust(
             "failed",
             "retries_exhausted",
             prior,
-            now,
+            lease.now,
         ),
     )
+    if run.seams.fallback is None:
+        return None
+    return run.seams.fallback(conn, dest, row, lease)
 
 
 def _send_held(run: _Run, store: Store, dest: Destination, t: _Tally) -> None:
@@ -940,7 +972,7 @@ def _claim_digest(
     call in the class of the highest level (no cap check: a digest is never held by the cap). A
     member whose attempts are used up ends ``failed`` without a call and is left out. ``None``
     when fewer than two members are left (their claims are released)."""
-    spent: list[tuple[QueueRow, int]] = []
+    spent: list[tuple[QueueRow, int, FallbackRoute | None]] = []
     result: _DigestClaim | None = None
     with store.write() as conn:
         lease = Lease.at(run.gateway.wall(), run.worst)
@@ -970,8 +1002,8 @@ def _claim_digest(
                 ).fetchone()[0]
             )
             if prior >= 1 and retry_at(prior) is None:
-                _exhaust(conn, run, dest, claimed, token, prior, None, lease.now)
-                spent.append((claimed, prior))
+                route = _exhaust(conn, run, dest, claimed, token, prior, None, lease)
+                spent.append((claimed, prior, route))
             else:
                 live.append(claimed)
                 priors[claimed.delivery_id] = prior
@@ -987,11 +1019,12 @@ def _claim_digest(
             result = _DigestClaim(digest, token, hour_start(lease.now), sent_as, priors)
         else:
             surface_evictions(conn, release_claims(conn, token, lease).evicted, lease.now)
-    for row, prior in spent:
+    for row, prior, route in spent:
         t.failed += 1
         t.acted = True
         run.say(t, f"row {row.id} failed (retries_exhausted)")
         run.log_row(row, outcome="failed", reason=None, code="retries_exhausted", attempts=prior)
+        run.log_fallback(row, route, t)
     if result is not None:
         run.say(t, f"digest of {len(result.digest.rows)} rows")
         return result
@@ -1088,6 +1121,7 @@ def _call_digest(
             continue
         _tally(t, a.outcome, 0)
         run.log_row(m, outcome=a.outcome, reason=a.reason, code=a.code, attempts=a.attempts)
+        run.log_fallback(m, a.fallback, t)
     others = done.evicted_ids - {m.delivery_id for m in members}
     t.dropped += len(others)
     if lost:
@@ -1219,6 +1253,7 @@ def _call_and_record(run: _Run, store: Store, dest: Destination, t: _Tally, clai
             code=applied.code,
             attempts=applied.attempts,
         )
+        run.log_fallback(row, applied.fallback, t)
     run.say(t, f"row {row.id} {outcome.outcome or 'unknown'}")
     stop = outcome.outcome not in _STOPPING
     if stop:
